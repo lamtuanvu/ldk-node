@@ -85,6 +85,7 @@ mod builder;
 mod chain;
 pub mod config;
 mod connection;
+pub mod custom_gossip;
 mod data_store;
 pub mod entropy;
 mod error;
@@ -134,6 +135,7 @@ use config::{
 	RGS_SYNC_INTERVAL,
 };
 use connection::ConnectionManager;
+use custom_gossip::CustomGossipMessageHandler;
 pub use error::Error as NodeError;
 use error::Error;
 pub use event::Event;
@@ -235,6 +237,7 @@ pub struct Node {
 	gossip_source: Arc<GossipSource>,
 	pathfinding_scores_sync_url: Option<String>,
 	liquidity_source: Option<Arc<LiquiditySource<Arc<Logger>>>>,
+	custom_gossip_handler: Option<Arc<CustomGossipMessageHandler<Arc<Logger>>>>,
 	kv_store: Arc<DynStore>,
 	logger: Arc<Logger>,
 	_router: Arc<Router>,
@@ -1066,6 +1069,30 @@ impl Node {
 				Err(_) => Err(Error::LnurlAuthTimeout),
 			}
 		})
+	}
+
+	/// Returns a custom gossip handler allowing to send and receive custom gossip messages.
+	///
+	/// This returns `None` if custom gossip was not enabled during node construction.
+	/// To enable custom gossip, call [`Builder::enable_custom_gossip`] before building the node.
+	///
+	/// Custom gossip messages can contain arbitrary metadata up to 4096 bytes in length
+	/// and use message type 32769 to extend the Lightning gossip protocol.
+	#[cfg(not(feature = "uniffi"))]
+	pub fn custom_gossip(&self) -> Option<&CustomGossipMessageHandler<Arc<Logger>>> {
+		self.custom_gossip_handler.as_ref().map(|h| h.as_ref())
+	}
+
+	/// Returns a custom gossip handler allowing to send and receive custom gossip messages.
+	///
+	/// This returns `None` if custom gossip was not enabled during node construction.
+	/// To enable custom gossip, call [`Builder::enable_custom_gossip`] before building the node.
+	///
+	/// Custom gossip messages can contain arbitrary metadata up to 4096 bytes in length
+	/// and use message type 32769 to extend the Lightning gossip protocol.
+	#[cfg(feature = "uniffi")]
+	pub fn custom_gossip(&self) -> Option<Arc<CustomGossipMessageHandler<Arc<Logger>>>> {
+		self.custom_gossip_handler.clone()
 	}
 
 	/// Returns a liquidity handler allowing to request channels via the [bLIP-51 / LSPS1] protocol.

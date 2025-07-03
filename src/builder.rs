@@ -71,6 +71,7 @@ use crate::io::{
 use crate::liquidity::{
 	LSPS1ClientConfig, LSPS2ClientConfig, LSPS2ServiceConfig, LiquiditySourceBuilder,
 };
+use crate::custom_gossip::CustomGossipMessageHandler;
 use crate::lnurl_auth::LnurlAuth;
 use crate::logger::{log_error, LdkLogger, LogLevel, LogWriter, Logger};
 use crate::message_handler::NodeCustomMessageHandler;
@@ -292,6 +293,7 @@ pub struct NodeBuilder {
 	runtime_handle: Option<tokio::runtime::Handle>,
 	pathfinding_scores_sync_config: Option<PathfindingScoresSyncConfig>,
 	recovery_mode: bool,
+	custom_gossip_enabled: bool,
 }
 
 impl NodeBuilder {
@@ -310,6 +312,7 @@ impl NodeBuilder {
 		let runtime_handle = None;
 		let pathfinding_scores_sync_config = None;
 		let recovery_mode = false;
+		let custom_gossip_enabled = false;
 		Self {
 			config,
 			chain_data_source_config,
@@ -320,6 +323,7 @@ impl NodeBuilder {
 			async_payments_role: None,
 			pathfinding_scores_sync_config,
 			recovery_mode,
+			custom_gossip_enabled,
 		}
 	}
 
@@ -497,6 +501,18 @@ impl NodeBuilder {
 		let liquidity_source_config =
 			self.liquidity_source_config.get_or_insert(LiquiditySourceConfig::default());
 		liquidity_source_config.lsps2_service = Some(service_config);
+		self
+	}
+
+	/// Enables custom gossip message support for the [`Node`] instance.
+	///
+	/// When enabled, the node will be able to send and receive custom gossip messages
+	/// containing metadata extensions to the standard Lightning gossip protocol.
+	/// 
+	/// Custom gossip messages use message type 32769 and can contain arbitrary metadata
+	/// up to 4096 bytes in length.
+	pub fn enable_custom_gossip(&mut self) -> &mut Self {
+		self.custom_gossip_enabled = true;
 		self
 	}
 
@@ -863,6 +879,7 @@ impl NodeBuilder {
 			self.chain_data_source_config.as_ref(),
 			self.gossip_source_config.as_ref(),
 			self.liquidity_source_config.as_ref(),
+			self.custom_gossip_enabled,
 			self.pathfinding_scores_sync_config.as_ref(),
 			self.async_payments_role,
 			self.recovery_mode,
@@ -1068,6 +1085,17 @@ impl ArcedNodeBuilder {
 	/// [LSPS2]: https://github.com/BitcoinAndLightningLayerSpecs/lsp/blob/main/LSPS2/README.md
 	pub fn set_liquidity_provider_lsps2(&self, service_config: LSPS2ServiceConfig) {
 		self.inner.write().expect("lock").set_liquidity_provider_lsps2(service_config);
+	}
+
+	/// Enables custom gossip message support for the [`Node`] instance.
+	///
+	/// When enabled, the node will be able to send and receive custom gossip messages
+	/// containing metadata extensions to the standard Lightning gossip protocol.
+	/// 
+	/// Custom gossip messages use message type 32769 and can contain arbitrary metadata
+	/// up to 4096 bytes in length.
+	pub fn enable_custom_gossip(&self) {
+		self.inner.write().unwrap().enable_custom_gossip();
 	}
 
 	/// Sets the used storage directory path.
@@ -1358,6 +1386,7 @@ fn build_with_store_internal(
 	config: Arc<Config>, chain_data_source_config: Option<&ChainDataSourceConfig>,
 	gossip_source_config: Option<&GossipSourceConfig>,
 	liquidity_source_config: Option<&LiquiditySourceConfig>,
+	custom_gossip_enabled: bool,
 	pathfinding_scores_sync_config: Option<&PathfindingScoresSyncConfig>,
 	async_payments_role: Option<AsyncPaymentsRole>, recovery_mode: bool, seed_bytes: [u8; 64],
 	runtime: Arc<Runtime>, logger: Arc<Logger>, kv_store: Arc<DynStore>,
@@ -1975,55 +2004,130 @@ fn build_with_store_internal(
 		},
 	};
 
-	let (liquidity_source, custom_message_handler) =
-		if let Some(lsc) = liquidity_source_config.as_ref() {
-			let mut liquidity_source_builder = LiquiditySourceBuilder::new(
-				Arc::clone(&wallet),
-				Arc::clone(&channel_manager),
-				Arc::clone(&keys_manager),
-				Arc::clone(&tx_broadcaster),
-				Arc::clone(&kv_store),
-				Arc::clone(&config),
-				Arc::clone(&logger),
-			);
+	let (liquidity_source, custom_message_handler) = {
+		let has_liquidity = liquidity_source_config.is_some();
+		let has_custom_gossip = custom_gossip_enabled;
 
-			lsc.lsps1_client.as_ref().map(|config| {
-				liquidity_source_builder.lsps1_client(
-					config.node_id,
-					config.address.clone(),
-					config.token.clone(),
-				)
-			});
-
-			lsc.lsps2_client.as_ref().map(|config| {
-				liquidity_source_builder.lsps2_client(
-					config.node_id,
-					config.address.clone(),
-					config.token.clone(),
-				)
-			});
-
-			let promise_secret = {
-				let lsps_xpriv = derive_xprv(
+		match (has_liquidity, has_custom_gossip) {
+			(true, true) => {
+				// Both liquidity and custom gossip enabled
+				let lsc = liquidity_source_config.as_ref().unwrap();
+				let mut liquidity_source_builder = LiquiditySourceBuilder::new(
+					Arc::clone(&wallet),
+					Arc::clone(&channel_manager),
+					Arc::clone(&keys_manager),
+					Arc::clone(&tx_broadcaster),
+					Arc::clone(&kv_store),
 					Arc::clone(&config),
-					&seed_bytes,
-					LSPS_HARDENED_CHILD_INDEX,
 					Arc::clone(&logger),
-				)?;
-				lsps_xpriv.private_key.secret_bytes()
-			};
-			lsc.lsps2_service.as_ref().map(|config| {
-				liquidity_source_builder.lsps2_service(promise_secret, config.clone())
-			});
+				);
 
-			let liquidity_source = runtime
-				.block_on(async move { liquidity_source_builder.build().await.map(Arc::new) })?;
-			let custom_message_handler =
-				Arc::new(NodeCustomMessageHandler::new_liquidity(Arc::clone(&liquidity_source)));
-			(Some(liquidity_source), custom_message_handler)
-		} else {
-			(None, Arc::new(NodeCustomMessageHandler::new_ignoring()))
-		};
+				lsc.lsps1_client.as_ref().map(|config| {
+					liquidity_source_builder.lsps1_client(
+						config.node_id,
+						config.address.clone(),
+						config.token.clone(),
+					)
+				});
+
+				lsc.lsps2_client.as_ref().map(|config| {
+					liquidity_source_builder.lsps2_client(
+						config.node_id,
+						config.address.clone(),
+						config.token.clone(),
+					)
+				});
+
+				let promise_secret = {
+					let lsps_xpriv = derive_xprv(
+						Arc::clone(&config),
+						&seed_bytes,
+						LSPS_HARDENED_CHILD_INDEX,
+						Arc::clone(&logger),
+					)?;
+					lsps_xpriv.private_key.secret_bytes()
+				};
+				lsc.lsps2_service.as_ref().map(|config| {
+					liquidity_source_builder.lsps2_service(promise_secret, config.clone())
+				});
+
+				let liquidity_source = runtime.block_on(async move {
+					liquidity_source_builder.build().await.map(Arc::new)
+				})?;
+				let gossip_handler = Arc::new(CustomGossipMessageHandler::new(Arc::clone(&logger)));
+				let custom_message_handler = Arc::new(NodeCustomMessageHandler::new_combined(
+					Arc::clone(&liquidity_source),
+					gossip_handler,
+				));
+				(Some(liquidity_source), custom_message_handler)
+			},
+			(true, false) => {
+				// Only liquidity enabled
+				let lsc = liquidity_source_config.as_ref().unwrap();
+				let mut liquidity_source_builder = LiquiditySourceBuilder::new(
+					Arc::clone(&wallet),
+					Arc::clone(&channel_manager),
+					Arc::clone(&keys_manager),
+					Arc::clone(&tx_broadcaster),
+					Arc::clone(&kv_store),
+					Arc::clone(&config),
+					Arc::clone(&logger),
+				);
+
+				lsc.lsps1_client.as_ref().map(|config| {
+					liquidity_source_builder.lsps1_client(
+						config.node_id,
+						config.address.clone(),
+						config.token.clone(),
+					)
+				});
+
+				lsc.lsps2_client.as_ref().map(|config| {
+					liquidity_source_builder.lsps2_client(
+						config.node_id,
+						config.address.clone(),
+						config.token.clone(),
+					)
+				});
+
+				let promise_secret = {
+					let lsps_xpriv = derive_xprv(
+						Arc::clone(&config),
+						&seed_bytes,
+						LSPS_HARDENED_CHILD_INDEX,
+						Arc::clone(&logger),
+					)?;
+					lsps_xpriv.private_key.secret_bytes()
+				};
+				lsc.lsps2_service.as_ref().map(|config| {
+					liquidity_source_builder.lsps2_service(promise_secret, config.clone())
+				});
+
+				let liquidity_source = runtime.block_on(async move {
+					liquidity_source_builder.build().await.map(Arc::new)
+				})?;
+				let custom_message_handler = Arc::new(NodeCustomMessageHandler::new_liquidity(
+					Arc::clone(&liquidity_source)
+				));
+				(Some(liquidity_source), custom_message_handler)
+			},
+			(false, true) => {
+				// Only custom gossip enabled
+				let gossip_handler = Arc::new(CustomGossipMessageHandler::new(Arc::clone(&logger)));
+				let custom_message_handler = Arc::new(NodeCustomMessageHandler::new_custom_gossip(
+					gossip_handler
+				));
+				(None, custom_message_handler)
+			},
+			(false, false) => {
+				// Neither enabled
+				(None, Arc::new(NodeCustomMessageHandler::new_ignoring()))
+			}
+		}
+	};
+
+	// Extract custom gossip handler for later use
+	let custom_gossip_handler = custom_message_handler.custom_gossip_handler();
 
 	let msg_handler = match gossip_source.as_gossip_sync() {
 		GossipSync::P2P(p2p_gossip_sync) => MessageHandler {
@@ -2173,6 +2277,7 @@ fn build_with_store_internal(
 		gossip_source,
 		pathfinding_scores_sync_url,
 		liquidity_source,
+		custom_gossip_handler,
 		kv_store,
 		logger,
 		_router: router,
