@@ -53,6 +53,7 @@ use crate::config::{
 	DEFAULT_MAX_PROBE_AMOUNT_MSAT, DEFAULT_MIN_PROBE_AMOUNT_MSAT,
 };
 use crate::connection::ConnectionManager;
+use crate::custom_gossip::CustomGossipMessageHandler;
 use crate::entropy::NodeEntropy;
 use crate::event::EventQueue;
 use crate::fee_estimator::OnchainFeeEstimator;
@@ -316,6 +317,7 @@ pub struct NodeBuilder {
 	runtime_handle: Option<tokio::runtime::Handle>,
 	pathfinding_scores_sync_config: Option<PathfindingScoresSyncConfig>,
 	probing_config: Option<ProbingConfig>,
+	custom_gossip_enabled: bool,
 }
 
 impl NodeBuilder {
@@ -334,6 +336,7 @@ impl NodeBuilder {
 		let runtime_handle = None;
 		let pathfinding_scores_sync_config = None;
 		let probing_config = None;
+		let custom_gossip_enabled = false;
 		Self {
 			config,
 			chain_data_source_config,
@@ -344,6 +347,7 @@ impl NodeBuilder {
 			async_payments_role: None,
 			pathfinding_scores_sync_config,
 			probing_config,
+			custom_gossip_enabled,
 		}
 	}
 
@@ -536,6 +540,18 @@ impl NodeBuilder {
 		let liquidity_source_config =
 			self.liquidity_source_config.get_or_insert(LiquiditySourceConfig::default());
 		liquidity_source_config.lsps2_service = Some(lsps2_service_config);
+		self
+	}
+
+	/// Enables custom gossip message support for the [`Node`] instance.
+	///
+	/// When enabled, the node will be able to send and receive custom gossip messages
+	/// containing metadata extensions to the standard Lightning gossip protocol.
+	/// 
+	/// Custom gossip messages use message type 32769 and can contain arbitrary metadata
+	/// up to 4096 bytes in length.
+	pub fn enable_custom_gossip(&mut self) -> &mut Self {
+		self.custom_gossip_enabled = true;
 		self
 	}
 
@@ -919,6 +935,7 @@ impl NodeBuilder {
 			self.pathfinding_scores_sync_config.as_ref(),
 			self.probing_config.as_ref(),
 			self.async_payments_role,
+			self.custom_gossip_enabled,
 			seed_bytes,
 			runtime,
 			logger,
@@ -1129,6 +1146,17 @@ impl ArcedNodeBuilder {
 	/// [LSPS2]: https://github.com/BitcoinAndLightningLayerSpecs/lsp/blob/main/LSPS2/README.md
 	pub fn enable_liquidity_provider(&self, lsps2_service_config: LSPS2ServiceConfig) {
 		self.inner.write().expect("lock").enable_liquidity_provider(lsps2_service_config);
+	}
+
+	/// Enables custom gossip message support for the [`Node`] instance.
+	///
+	/// When enabled, the node will be able to send and receive custom gossip messages
+	/// containing metadata extensions to the standard Lightning gossip protocol.
+	/// 
+	/// Custom gossip messages use message type 32769 and can contain arbitrary metadata
+	/// up to 4096 bytes in length.
+	pub fn enable_custom_gossip(&self) {
+		self.inner.write().unwrap().enable_custom_gossip();
 	}
 
 	/// Sets the used storage directory path.
@@ -1421,7 +1449,8 @@ fn build_with_store_internal(
 	liquidity_source_config: Option<&LiquiditySourceConfig>,
 	pathfinding_scores_sync_config: Option<&PathfindingScoresSyncConfig>,
 	probing_config: Option<&ProbingConfig>, async_payments_role: Option<AsyncPaymentsRole>,
-	seed_bytes: [u8; 64], runtime: Arc<Runtime>, logger: Arc<Logger>, kv_store: Arc<DynStore>,
+	custom_gossip_enabled: bool, seed_bytes: [u8; 64], runtime: Arc<Runtime>, logger: Arc<Logger>,
+	kv_store: Arc<DynStore>,
 ) -> Result<Node, BuildError> {
 	optionally_install_rustls_cryptoprovider();
 
@@ -2157,11 +2186,23 @@ fn build_with_store_internal(
 
 		let liquidity_source = runtime
 			.block_on(async move { liquidity_source_builder.build().await.map(Arc::new) })?;
-		let custom_message_handler =
-			Arc::new(NodeCustomMessageHandler::new(Arc::clone(&liquidity_source)));
+
+		// The liquidity handler is always wired up; custom gossip rides alongside it when enabled.
+		let custom_message_handler = if custom_gossip_enabled {
+			let gossip_handler = Arc::new(CustomGossipMessageHandler::new(Arc::clone(&logger)));
+			Arc::new(NodeCustomMessageHandler::new_combined(
+				Arc::clone(&liquidity_source),
+				gossip_handler,
+			))
+		} else {
+			Arc::new(NodeCustomMessageHandler::new_liquidity(Arc::clone(&liquidity_source)))
+		};
 
 		(liquidity_source, custom_message_handler)
 	};
+
+	// Extract custom gossip handler for later use
+	let custom_gossip_handler = custom_message_handler.custom_gossip_handler();
 
 	let msg_handler = match gossip_source.as_gossip_sync() {
 		GossipSync::P2P(p2p_gossip_sync) => MessageHandler {
@@ -2356,6 +2397,7 @@ fn build_with_store_internal(
 		gossip_source,
 		pathfinding_scores_sync_url,
 		liquidity_source,
+		custom_gossip_handler,
 		kv_store,
 		logger,
 		_router: router,
