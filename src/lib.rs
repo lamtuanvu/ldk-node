@@ -887,6 +887,13 @@ impl Node {
 		self.config.node_alias
 	}
 
+	/// Expose the process_events method from the peer manager.
+	///
+	/// This is used to process events from the peer manager.
+	pub fn process_events(&self) {
+		self.peer_manager.process_events();
+	}
+
 	/// Returns a payment handler allowing to create and pay [BOLT 11] invoices.
 	///
 	/// [BOLT 11]: https://github.com/lightning/bolts/blob/master/11-payment-encoding.md
