@@ -833,6 +833,11 @@ impl Node {
 		self.config.node_alias
 	}
 
+	pub fn process_events(&self) -> Arc<PeerManager> {
+		self.peer_manager.process_events();
+		Arc::clone(&self.peer_manager)
+	}
+
 	/// Returns a payment handler allowing to create and pay [BOLT 11] invoices.
 	///
 	/// [BOLT 11]: https://github.com/lightning/bolts/blob/master/11-payment-encoding.md
