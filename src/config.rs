@@ -308,6 +308,15 @@ pub(crate) fn default_user_config(config: &Config) -> UserConfig {
 	user_config.manually_accept_inbound_channels = true;
 	user_config.channel_handshake_config.negotiate_anchors_zero_fee_htlc_tx =
 		config.anchor_channels_config.is_some();
+	// Allow full-capacity HTLCs. LDK's
+	// `max_inbound_htlc_value_in_flight_percent_of_channel` defaults to 10%,
+	// which rejects `temporary_channel_failure` on any forward larger than
+	// a tenth of the channel. Onboarding sweep needs to push ~70% of a
+	// single-channel capacity through its LSP in one HTLC, so we raise the
+	// cap to 100% for every channel this node negotiates (both as opener
+	// and as accepting peer). This matches the override already applied
+	// when we are an LSPS2 client/service (see `Builder::build_with_store`).
+	user_config.channel_handshake_config.max_inbound_htlc_value_in_flight_percent_of_channel = 100;
 
 	if may_announce_channel(config).is_err() {
 		user_config.accept_forwards_to_priv_channels = false;

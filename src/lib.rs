@@ -833,6 +833,7 @@ impl Node {
 		self.config.node_alias
 	}
 
+	/// Processes pending peer manager events and returns a handle to the peer manager.
 	pub fn process_events(&self) -> Arc<PeerManager> {
 		self.peer_manager.process_events();
 		Arc::clone(&self.peer_manager)
@@ -847,6 +848,7 @@ impl Node {
 			Arc::clone(&self.runtime),
 			Arc::clone(&self.channel_manager),
 			Arc::clone(&self.connection_manager),
+			Arc::clone(&self.keys_manager),
 			self.liquidity_source.clone(),
 			Arc::clone(&self.payment_store),
 			Arc::clone(&self.peer_store),
@@ -864,6 +866,7 @@ impl Node {
 			Arc::clone(&self.runtime),
 			Arc::clone(&self.channel_manager),
 			Arc::clone(&self.connection_manager),
+			Arc::clone(&self.keys_manager),
 			self.liquidity_source.clone(),
 			Arc::clone(&self.payment_store),
 			Arc::clone(&self.peer_store),
@@ -1282,43 +1285,52 @@ impl Node {
 	///
 	/// [`EsploraSyncConfig::background_sync_config`]: crate::config::EsploraSyncConfig::background_sync_config
 	pub fn sync_wallets(&self) -> Result<(), Error> {
+		// PATCH (econ-v1 / sweep-flow E2E): this previously constructed a brand-new
+		// `tokio::runtime::Builder::new_multi_thread()` inside `block_in_place`.
+		// When `sync_wallets` is called from a non-tokio host thread (e.g. the
+		// cdylib FFI handler thread that our node-app builtin dispatch uses), the
+		// `block_in_place` panics because that API requires a tokio runtime
+		// context on the current thread — and the panic is silently swallowed
+		// since the cdylib boundary eats non-unwinding panics. The result is
+		// that `sync_wallets` hangs forever from the caller's perspective.
+		//
+		// Fix: reuse the node's already-initialized runtime (which is what the
+		// `start()` method at the top of this file does for its own sync call).
+		// `runtime.block_on(...)` is valid from any thread, with or without a
+		// surrounding tokio context, and it drives the chain-sync futures on
+		// the runtime's existing worker pool instead of constructing a parallel
+		// one per call.
 		let rt_lock = self.runtime.read().unwrap();
-		if rt_lock.is_none() {
-			return Err(Error::NotRunning);
-		}
+		let runtime = rt_lock.as_ref().ok_or(Error::NotRunning)?;
 
 		let chain_source = Arc::clone(&self.chain_source);
 		let sync_cman = Arc::clone(&self.channel_manager);
 		let sync_cmon = Arc::clone(&self.chain_monitor);
 		let sync_sweeper = Arc::clone(&self.output_sweeper);
-		tokio::task::block_in_place(move || {
-			tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap().block_on(
-				async move {
-					match chain_source.as_ref() {
-						ChainSource::Esplora { .. } => {
-							chain_source.update_fee_rate_estimates().await?;
-							chain_source
-								.sync_lightning_wallet(sync_cman, sync_cmon, sync_sweeper)
-								.await?;
-							chain_source.sync_onchain_wallet().await?;
-						},
-						ChainSource::Electrum { .. } => {
-							chain_source.update_fee_rate_estimates().await?;
-							chain_source
-								.sync_lightning_wallet(sync_cman, sync_cmon, sync_sweeper)
-								.await?;
-							chain_source.sync_onchain_wallet().await?;
-						},
-						ChainSource::Bitcoind { .. } => {
-							chain_source.update_fee_rate_estimates().await?;
-							chain_source
-								.poll_and_update_listeners(sync_cman, sync_cmon, sync_sweeper)
-								.await?;
-						},
-					}
-					Ok(())
+		runtime.block_on(async move {
+			match chain_source.as_ref() {
+				ChainSource::Esplora { .. } => {
+					chain_source.update_fee_rate_estimates().await?;
+					chain_source
+						.sync_lightning_wallet(sync_cman, sync_cmon, sync_sweeper)
+						.await?;
+					chain_source.sync_onchain_wallet().await?;
 				},
-			)
+				ChainSource::Electrum { .. } => {
+					chain_source.update_fee_rate_estimates().await?;
+					chain_source
+						.sync_lightning_wallet(sync_cman, sync_cmon, sync_sweeper)
+						.await?;
+					chain_source.sync_onchain_wallet().await?;
+				},
+				ChainSource::Bitcoind { .. } => {
+					chain_source.update_fee_rate_estimates().await?;
+					chain_source
+						.poll_and_update_listeners(sync_cman, sync_cmon, sync_sweeper)
+						.await?;
+				},
+			}
+			Ok(())
 		})
 	}
 
