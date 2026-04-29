@@ -1013,6 +1013,7 @@ impl Node {
 		self.config.node_alias
 	}
 
+	/// Processes pending peer manager events and returns a handle to the peer manager.
 	pub fn process_events(&self) -> Arc<PeerManager> {
 		self.peer_manager.process_events();
 		Arc::clone(&self.peer_manager)
@@ -1027,6 +1028,7 @@ impl Node {
 			Arc::clone(&self.runtime),
 			Arc::clone(&self.channel_manager),
 			Arc::clone(&self.connection_manager),
+			Arc::clone(&self.keys_manager),
 			Arc::clone(&self.liquidity_source),
 			Arc::clone(&self.payment_store),
 			Arc::clone(&self.peer_store),
@@ -1045,6 +1047,7 @@ impl Node {
 			Arc::clone(&self.runtime),
 			Arc::clone(&self.channel_manager),
 			Arc::clone(&self.connection_manager),
+			Arc::clone(&self.keys_manager),
 			Arc::clone(&self.liquidity_source),
 			Arc::clone(&self.payment_store),
 			Arc::clone(&self.peer_store),

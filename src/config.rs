@@ -428,6 +428,17 @@ pub(crate) fn default_user_config(config: &Config) -> UserConfig {
 	user_config.channel_handshake_config.negotiate_anchor_zero_fee_commitments =
 		config.anchor_channels_config.enable_zero_fee_commitments;
 	user_config.reject_inbound_splices = false;
+	// Allow full-capacity HTLCs. LDK's max-inbound-HTLC-in-flight percentages default well below
+	// 100%, which fails any forward larger than that fraction of the channel with
+	// `temporary_channel_failure`. Onboarding sweep needs to push ~70% of a single-channel
+	// capacity through its LSP in one HTLC, so we raise the cap to 100% for every channel this
+	// node negotiates (both as opener and as accepting peer).
+	user_config
+		.channel_handshake_config
+		.announced_channel_max_inbound_htlc_value_in_flight_percentage = 100;
+	user_config
+		.channel_handshake_config
+		.unannounced_channel_max_inbound_htlc_value_in_flight_percentage = 100;
 
 	if may_announce_channel(config).is_err() {
 		user_config.accept_forwards_to_priv_channels = false;

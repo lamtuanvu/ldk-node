@@ -10,17 +10,23 @@
 //! [BOLT 11]: https://github.com/lightning/bolts/blob/master/11-payment-encoding.md
 
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use bitcoin::hashes::sha256::Hash as Sha256;
 use bitcoin::hashes::Hash;
+use bitcoin::secp256k1::Secp256k1;
 use lightning::impl_writeable_tlv_based;
 use lightning::ln::channelmanager::{
 	Bolt11InvoiceParameters, OptionalBolt11PaymentParams, PaymentId,
+	MIN_FINAL_CLTV_EXPIRY_DELTA,
 };
 use lightning::ln::outbound_payment::{Bolt11PaymentError, Retry, RetryableSendFailure};
-use lightning::routing::router::{PaymentParameters, RouteParameters, RouteParametersConfig};
+use lightning::routing::router::{
+	PaymentParameters, RouteHint, RouteParameters, RouteParametersConfig,
+};
 use lightning_invoice::{
 	Bolt11Invoice as LdkBolt11Invoice, Bolt11InvoiceDescription as LdkBolt11InvoiceDescription,
+	InvoiceBuilder,
 };
 use lightning_types::payment::{PaymentHash, PaymentPreimage};
 
@@ -37,7 +43,8 @@ use crate::payment::store::{
 };
 use crate::peer_store::{PeerInfo, PeerStore};
 use crate::runtime::Runtime;
-use crate::types::{ChannelManager, PaymentStore};
+use crate::types::{ChannelManager, KeysManager, PaymentStore};
+
 
 #[cfg(not(feature = "uniffi"))]
 type Bolt11Invoice = LdkBolt11Invoice;
@@ -70,6 +77,7 @@ pub struct Bolt11Payment {
 	runtime: Arc<Runtime>,
 	channel_manager: Arc<ChannelManager>,
 	connection_manager: Arc<ConnectionManager<Arc<Logger>>>,
+	keys_manager: Arc<KeysManager>,
 	liquidity_source: Arc<LiquiditySource<Arc<Logger>>>,
 	payment_store: Arc<PaymentStore>,
 	peer_store: Arc<PeerStore<Arc<Logger>>>,
@@ -82,6 +90,7 @@ impl Bolt11Payment {
 	pub(crate) fn new(
 		runtime: Arc<Runtime>, channel_manager: Arc<ChannelManager>,
 		connection_manager: Arc<ConnectionManager<Arc<Logger>>>,
+		keys_manager: Arc<KeysManager>,
 		liquidity_source: Arc<LiquiditySource<Arc<Logger>>>, payment_store: Arc<PaymentStore>,
 		peer_store: Arc<PeerStore<Arc<Logger>>>, config: Arc<Config>,
 		is_running: Arc<RwLock<bool>>, logger: Arc<Logger>,
@@ -90,6 +99,7 @@ impl Bolt11Payment {
 			runtime,
 			channel_manager,
 			connection_manager,
+			keys_manager,
 			liquidity_source,
 			payment_store,
 			peer_store,
@@ -653,6 +663,147 @@ impl Bolt11Payment {
 		let description = maybe_try_convert_enum(description)?;
 		let invoice = self.receive_inner(None, &description, expiry_secs, Some(payment_hash))?;
 		Ok(maybe_wrap(invoice))
+	}
+
+	/// Returns a payable invoice whose route hints are supplied by the caller, bypassing
+	/// `ChannelManager::create_bolt11_invoice`'s filter that drops any inbound channel whose
+	/// counterparty has not yet sent a `channel_update` (i.e. `forwarding_info = None`).
+	///
+	/// This is required for topologies where a leaf LSP keeps the channel private and never
+	/// issues a unicast `channel_update`, making the default invoice builder return an empty
+	/// route-hint list. The caller is responsible for building hints that match the peer's
+	/// actual forwarding policy.
+	pub fn receive_with_hints(
+		&self, amount_msat: u64, description: &Bolt11InvoiceDescription, expiry_secs: u32,
+		route_hints: Vec<RouteHint>,
+	) -> Result<Bolt11Invoice, Error> {
+		let description = maybe_try_convert_enum(description)?;
+		let invoice =
+			self.receive_with_hints_inner(Some(amount_msat), &description, expiry_secs, None, route_hints)?;
+		Ok(maybe_wrap(invoice))
+	}
+
+	/// HODL variant of [`receive_with_hints`] — registers a caller-supplied `payment_hash`
+	/// so the caller can later release the preimage via [`claim_for_hash`].
+	///
+	/// [`claim_for_hash`]: Self::claim_for_hash
+	pub fn receive_for_hash_with_hints(
+		&self, amount_msat: u64, description: &Bolt11InvoiceDescription, expiry_secs: u32,
+		payment_hash: PaymentHash, route_hints: Vec<RouteHint>,
+	) -> Result<Bolt11Invoice, Error> {
+		let description = maybe_try_convert_enum(description)?;
+		let invoice = self.receive_with_hints_inner(
+			Some(amount_msat),
+			&description,
+			expiry_secs,
+			Some(payment_hash),
+			route_hints,
+		)?;
+		Ok(maybe_wrap(invoice))
+	}
+
+	pub(crate) fn receive_with_hints_inner(
+		&self, amount_msat: Option<u64>, invoice_description: &LdkBolt11InvoiceDescription,
+		expiry_secs: u32, manual_claim_payment_hash: Option<PaymentHash>,
+		route_hints: Vec<RouteHint>,
+	) -> Result<LdkBolt11Invoice, Error> {
+		let min_final_cltv_expiry_delta = MIN_FINAL_CLTV_EXPIRY_DELTA;
+
+		let (payment_hash_ldk, payment_secret, mut payment_metadata) = if let Some(manual_hash) =
+			manual_claim_payment_hash
+		{
+			let (secret, metadata) = self
+				.channel_manager
+				.create_inbound_payment_for_hash(
+					manual_hash,
+					amount_msat,
+					expiry_secs,
+					Some(min_final_cltv_expiry_delta),
+					None,
+				)
+				.map_err(|e| {
+					log_error!(
+						self.logger,
+						"Failed to register inbound payment for hash: {:?}",
+						e
+					);
+					Error::InvoiceCreationFailed
+				})?;
+			(manual_hash, secret, metadata)
+		} else {
+			self.channel_manager
+				.create_inbound_payment(
+					amount_msat,
+					expiry_secs,
+					Some(min_final_cltv_expiry_delta),
+					None,
+				)
+				.map_err(|e| {
+					log_error!(self.logger, "Failed to register inbound payment: {:?}", e);
+					Error::InvoiceCreationFailed
+				})?
+		};
+
+		let currency = self.config.network.into();
+		let mut invoice_builder = InvoiceBuilder::new(currency)
+			.invoice_description(invoice_description.clone())
+			.payment_hash(payment_hash_ldk)
+			.payment_secret(payment_secret)
+			.current_timestamp()
+			.min_final_cltv_expiry_delta(min_final_cltv_expiry_delta.into())
+			.expiry_time(Duration::from_secs(expiry_secs.into()));
+
+		for hint in route_hints {
+			invoice_builder = invoice_builder.private_route(hint);
+		}
+
+		if let Some(amount_msat) = amount_msat {
+			invoice_builder =
+				invoice_builder.amount_milli_satoshis(amount_msat).basic_mpp();
+		}
+
+		let invoice = invoice_builder
+			.build_signed(|hash| {
+				Secp256k1::new()
+					.sign_ecdsa_recoverable(hash, &self.keys_manager.get_node_secret_key())
+			})
+			.map_err(|e| {
+				log_error!(self.logger, "Failed to build and sign invoice: {}", e);
+				Error::InvoiceCreationFailed
+			})?;
+
+		log_info!(self.logger, "Invoice (with manual route hints) created: {}", invoice);
+
+		let payment_hash = invoice.payment_hash();
+		let id = PaymentId(payment_hash.0);
+		let preimage = if manual_claim_payment_hash.is_none() {
+			self.channel_manager
+				.get_payment_preimage_decrypt_metadata(
+					payment_hash,
+					invoice.payment_secret().clone(),
+					payment_metadata.as_deref_mut(),
+				)
+				.ok()
+		} else {
+			None
+		};
+		let kind = PaymentKind::Bolt11 {
+			hash: payment_hash,
+			preimage,
+			secret: Some(invoice.payment_secret().clone()),
+			counterparty_skimmed_fee_msat: None,
+		};
+		let payment = PaymentDetails::new(
+			id,
+			kind,
+			amount_msat,
+			None,
+			PaymentDirection::Inbound,
+			PaymentStatus::Pending,
+		);
+		self.runtime.block_on(self.payment_store.insert(payment))?;
+
+		Ok(invoice)
 	}
 
 	/// Returns a payable invoice that can be used to request a payment of the amount given and
