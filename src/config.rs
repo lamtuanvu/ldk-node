@@ -308,9 +308,32 @@ pub(crate) fn default_user_config(config: &Config) -> UserConfig {
 	user_config.manually_accept_inbound_channels = true;
 	user_config.channel_handshake_config.negotiate_anchors_zero_fee_htlc_tx =
 		config.anchor_channels_config.is_some();
+	// Allow full-capacity HTLCs. LDK's
+	// `max_inbound_htlc_value_in_flight_percent_of_channel` defaults to 10%,
+	// which rejects `temporary_channel_failure` on any forward larger than
+	// a tenth of the channel. Onboarding sweep needs to push ~70% of a
+	// single-channel capacity through its LSP in one HTLC, so we raise the
+	// cap to 100% for every channel this node negotiates (both as opener
+	// and as accepting peer). This matches the override already applied
+	// when we are an LSPS2 client/service (see `Builder::build_with_store`).
+	user_config.channel_handshake_config.max_inbound_htlc_value_in_flight_percent_of_channel = 100;
+	// Permit forwarding HTLCs over private channels regardless of whether
+	// this node has a publicly-announceable identity. Onboarding's HODL-peer
+	// flow relies on a private last hop (Alice→Bob inbound channel kept
+	// private so the buyer's invoice carries a route hint). Without this,
+	// ChannelManager's `can_forward_htlc_to_outgoing_channel` short-circuits
+	// with `unknown_next_peer (0x400a)` whenever an HTLC is targeted at a
+	// private channel — this is by design in upstream LDK to hide
+	// private-channel existence from forwarders, but it breaks any
+	// leaf-LSP topology that relies on private channels as forwardable
+	// hops. The two settings (forwarding-over-private-channels vs
+	// announcing-our-own-channels) are conceptually independent, so we
+	// leave this enabled even when `may_announce_channel` reports the
+	// node is missing alias/addresses; only the gossip-related toggles
+	// are gated on announceability.
+	user_config.accept_forwards_to_priv_channels = true;
 
 	if may_announce_channel(config).is_err() {
-		user_config.accept_forwards_to_priv_channels = false;
 		user_config.channel_handshake_config.announce_for_forwarding = false;
 		user_config.channel_handshake_limits.force_announced_channel_preference = true;
 	}

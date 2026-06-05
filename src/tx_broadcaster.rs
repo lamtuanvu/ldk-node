@@ -16,7 +16,15 @@ use tokio::sync::{Mutex, MutexGuard};
 
 use std::ops::Deref;
 
-const BCAST_PACKAGE_QUEUE_SIZE: usize = 50;
+// Bumped from 50 to 500 because LDK's onchain claim-bump logic floods the
+// queue with rebroadcasts of stuck force-close commitment TXs (each new
+// block triggers another retry). Once the queue fills up, new broadcasts —
+// including one-shot sweep/funding TXs the onboarding flow depends on —
+// are silently dropped with `try_send` returning `Full`. 500 is generous
+// enough that legitimate sweep/funding broadcasts always make it through
+// even when an old monitor's commitment-tx is stuck looping against
+// bitcoind's "Transaction outputs already in utxo set" rejection.
+const BCAST_PACKAGE_QUEUE_SIZE: usize = 500;
 
 pub(crate) struct TransactionBroadcaster<L: Deref>
 where
