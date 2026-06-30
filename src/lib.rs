@@ -119,8 +119,6 @@ pub use bitcoin;
 use bitcoin::secp256k1::PublicKey;
 #[cfg(feature = "uniffi")]
 pub use bitcoin::FeeRate;
-#[cfg(not(feature = "uniffi"))]
-use bitcoin::FeeRate;
 use bitcoin::{Address, Amount, BlockHash, Network};
 #[cfg(feature = "uniffi")]
 pub use builder::ArcedNodeBuilder as Builder;
@@ -138,7 +136,9 @@ pub use error::Error as NodeError;
 use error::Error;
 pub use event::Event;
 use event::{EventHandler, EventQueue};
-use fee_estimator::{ConfirmationTarget, FeeEstimator, OnchainFeeEstimator};
+use fee_estimator::{
+	max_funding_feerate, rbf_splice_feerates, ConfirmationTarget, FeeEstimator, OnchainFeeEstimator,
+};
 #[cfg(feature = "uniffi")]
 use ffi::*;
 use gossip::GossipSource;
@@ -162,7 +162,7 @@ pub use lightning_invoice;
 pub use lightning_liquidity;
 pub use lightning_types;
 use lightning_types::features::NodeFeatures as LdkNodeFeatures;
-use liquidity::{LSPS1Liquidity, LiquiditySource};
+use liquidity::LiquiditySource;
 use lnurl_auth::LnurlAuth;
 use logger::{log_debug, log_error, log_info, log_trace, LdkLogger, Logger};
 use payment::asynchronous::om_mailbox::OnionMessageMailbox;
@@ -179,10 +179,13 @@ use types::{
 	HRNResolver, KeysManager, OnionMessenger, PaymentStore, PeerManager, Router, Scorer, Sweeper,
 	Wallet,
 };
-pub use types::{ChannelDetails, CustomTlvRecord, PeerDetails, UserChannelId};
+pub use types::{
+	ChannelCounterparty, ChannelDetails, CustomTlvRecord, PeerDetails, ReserveType, UserChannelId,
+};
 pub use vss_client;
 
 use crate::ffi::maybe_wrap;
+use crate::liquidity::Liquidity;
 use crate::scoring::setup_background_pathfinding_scores_sync;
 use crate::wallet::FundingAmount;
 
@@ -234,7 +237,7 @@ pub struct Node {
 	network_graph: Arc<Graph>,
 	gossip_source: Arc<GossipSource>,
 	pathfinding_scores_sync_url: Option<String>,
-	liquidity_source: Option<Arc<LiquiditySource<Arc<Logger>>>>,
+	liquidity_source: Arc<LiquiditySource<Arc<Logger>>>,
 	kv_store: Arc<DynStore>,
 	logger: Arc<Logger>,
 	_router: Arc<Router>,
@@ -273,6 +276,8 @@ impl Node {
 			self.node_id(),
 			self.config.network
 		);
+
+		self.runtime.allow_cancellable_background_task_spawns();
 
 		// Start up any runtime-dependant chain sources (e.g. Electrum)
 		self.chain_source.start(Arc::clone(&self.runtime)).map_err(|e| {
@@ -598,7 +603,7 @@ impl Node {
 			Arc::clone(&self.connection_manager),
 			Arc::clone(&self.output_sweeper),
 			Arc::clone(&self.network_graph),
-			self.liquidity_source.clone(),
+			Arc::clone(&self.liquidity_source),
 			Arc::clone(&self.payment_store),
 			Arc::clone(&self.peer_store),
 			Arc::clone(&self.keys_manager),
@@ -617,8 +622,7 @@ impl Node {
 		let background_chan_man = Arc::clone(&self.channel_manager);
 		let background_gossip_sync = self.gossip_source.as_gossip_sync();
 		let background_peer_man = Arc::clone(&self.peer_manager);
-		let background_liquidity_man_opt =
-			self.liquidity_source.as_ref().map(|ls| ls.liquidity_manager());
+		let background_liquidity_man = self.liquidity_source.liquidity_manager();
 		let background_sweeper = Arc::clone(&self.output_sweeper);
 		let background_onion_messenger = Arc::clone(&self.onion_messenger);
 		let background_logger = Arc::clone(&self.logger);
@@ -654,7 +658,7 @@ impl Node {
 				Some(background_onion_messenger),
 				background_gossip_sync,
 				background_peer_man,
-				background_liquidity_man_opt,
+				Some(background_liquidity_man),
 				Some(background_sweeper),
 				background_logger,
 				Some(background_scorer),
@@ -675,25 +679,74 @@ impl Node {
 			});
 		});
 
-		if let Some(liquidity_source) = self.liquidity_source.as_ref() {
-			let mut stop_liquidity_handler = self.stop_sender.subscribe();
-			let liquidity_handler = Arc::clone(&liquidity_source);
-			let liquidity_logger = Arc::clone(&self.logger);
-			self.runtime.spawn_background_task(async move {
-				loop {
-					tokio::select! {
-						_ = stop_liquidity_handler.changed() => {
-							log_debug!(
-								liquidity_logger,
-								"Stopping processing liquidity events.",
+		let mut stop_liquidity_handler = self.stop_sender.subscribe();
+		let liquidity_handler = Arc::clone(&self.liquidity_source);
+		let liquidity_logger = Arc::clone(&self.logger);
+		let discovery_cm = Arc::clone(&self.connection_manager);
+		self.runtime.spawn_background_task(async move {
+			// Spawn discovery for configured LSPs in parallel.
+			let discovery_logger = Arc::clone(&liquidity_logger);
+			let mut discovery_set = tokio::task::JoinSet::new();
+			for (node_id, address) in liquidity_handler.get_all_lsp_details() {
+				let cm = Arc::clone(&discovery_cm);
+				let logger = Arc::clone(&discovery_logger);
+				let ls = Arc::clone(&liquidity_handler);
+				discovery_set.spawn(async move {
+					if let Err(e) = cm.connect_peer_if_necessary(node_id, address.clone()).await {
+						log_error!(
+							logger,
+							"Failed to connect to LSP {} for protocol discovery: {}",
+							node_id,
+							e
+						);
+						return;
+					}
+					match ls.discover_lsp_protocols(&node_id).await {
+						Ok(protocols) => {
+							log_info!(
+								logger,
+								"Discovered protocols for LSP {}: {:?}",
+								node_id,
+								protocols
 							);
-							return;
+						},
+						Err(e) => {
+							log_error!(
+								logger,
+								"Failed to discover protocols for LSP {}: {:?}",
+								node_id,
+								e
+							);
+						},
+					}
+				});
+			}
+
+			let mut discovery_done = false;
+			loop {
+				tokio::select! {
+					  _ = stop_liquidity_handler.changed() => {
+						  log_debug!(
+							  liquidity_logger,
+							  "Stopping processing liquidity events.",
+						  );
+						   discovery_set.shutdown().await;
+						  return;
+					  }
+					  _ = liquidity_handler.handle_next_event() => {}
+					  res = discovery_set.join_next(), if !discovery_done => {
+						if res.is_none() {
+							liquidity_handler.mark_discovery_done();
+							discovery_done = true;
+							log_info!(
+								liquidity_logger,
+								"LSP protocols discovery complete.",
+							);
 						}
-						_ = liquidity_handler.handle_next_event() => {}
 					}
 				}
-			});
-		}
+			}
+		});
 
 		log_info!(self.logger, "Startup complete.");
 		*is_running_lock = true;
@@ -893,7 +946,7 @@ impl Node {
 			Arc::clone(&self.runtime),
 			Arc::clone(&self.channel_manager),
 			Arc::clone(&self.connection_manager),
-			self.liquidity_source.clone(),
+			Arc::clone(&self.liquidity_source),
 			Arc::clone(&self.payment_store),
 			Arc::clone(&self.peer_store),
 			Arc::clone(&self.config),
@@ -911,7 +964,7 @@ impl Node {
 			Arc::clone(&self.runtime),
 			Arc::clone(&self.channel_manager),
 			Arc::clone(&self.connection_manager),
-			self.liquidity_source.clone(),
+			Arc::clone(&self.liquidity_source),
 			Arc::clone(&self.payment_store),
 			Arc::clone(&self.peer_store),
 			Arc::clone(&self.config),
@@ -1068,37 +1121,37 @@ impl Node {
 		})
 	}
 
-	/// Returns a liquidity handler allowing to request channels via the [bLIP-51 / LSPS1] protocol.
-	///
-	/// [bLIP-51 / LSPS1]: https://github.com/lightning/blips/blob/master/blip-0051.md
+	/// Returns a liquidity handler allowing to manage LSP connections and request channels.
 	#[cfg(not(feature = "uniffi"))]
-	pub fn lsps1_liquidity(&self) -> LSPS1Liquidity {
-		LSPS1Liquidity::new(
+	pub fn liquidity(&self) -> Liquidity {
+		Liquidity::new(
 			Arc::clone(&self.runtime),
 			Arc::clone(&self.wallet),
 			Arc::clone(&self.connection_manager),
-			self.liquidity_source.clone(),
+			Arc::clone(&self.liquidity_source),
 			Arc::clone(&self.logger),
 		)
 	}
 
-	/// Returns a liquidity handler allowing to request channels via the [bLIP-51 / LSPS1] protocol.
-	///
-	/// [bLIP-51 / LSPS1]: https://github.com/lightning/blips/blob/master/blip-0051.md
+	/// Returns a liquidity handler allowing to manage LSP connections and request channels.
 	#[cfg(feature = "uniffi")]
-	pub fn lsps1_liquidity(&self) -> Arc<LSPS1Liquidity> {
-		Arc::new(LSPS1Liquidity::new(
+	pub fn liquidity(&self) -> Arc<Liquidity> {
+		Arc::new(Liquidity::new(
 			Arc::clone(&self.runtime),
 			Arc::clone(&self.wallet),
 			Arc::clone(&self.connection_manager),
-			self.liquidity_source.clone(),
+			Arc::clone(&self.liquidity_source),
 			Arc::clone(&self.logger),
 		))
 	}
 
 	/// Retrieve a list of known channels.
 	pub fn list_channels(&self) -> Vec<ChannelDetails> {
-		self.channel_manager.list_channels().into_iter().map(|c| c.into()).collect()
+		self.channel_manager
+			.list_channels()
+			.into_iter()
+			.map(|c| ChannelDetails::from_ldk(c, self.config.anchor_channels_config.as_ref()))
+			.collect()
 	}
 
 	/// Connect to a node on the peer-to-peer network.
@@ -1531,7 +1584,7 @@ impl Node {
 		{
 			let min_feerate =
 				self.fee_estimator.estimate_fee_rate(ConfirmationTarget::ChannelFunding);
-			let max_feerate = FeeRate::from_sat_per_kwu(min_feerate.to_sat_per_kwu() * 3 / 2);
+			let max_feerate = max_funding_feerate(min_feerate);
 
 			let splice_amount_sats = match splice_amount_sats {
 				FundingAmount::Exact { amount_sats } => amount_sats,
@@ -1600,16 +1653,26 @@ impl Node {
 			if funding_template.prior_contribution().is_some() {
 				log_error!(
 					self.logger,
-					"Failed to splice channel: a prior splice contribution is pending"
+					"Failed to splice channel: a prior splice contribution is pending; use bump_channel_funding_fee to bump its fee"
 				);
 				return Err(Error::ChannelSplicingFailed);
 			}
+
+			// When contributing to a pending splice, the funding template requires at least the RBF
+			// minimum feerate to replace the in-flight transaction. Use it in place of our funding
+			// feerate estimate when it's higher, as long as it stays within our max.
+			let feerate = match funding_template.min_rbf_feerate() {
+				Some(min_rbf_feerate) if min_rbf_feerate <= max_feerate => {
+					min_feerate.max(min_rbf_feerate)
+				},
+				_ => min_feerate,
+			};
 
 			let contribution = self
 				.runtime
 				.block_on(funding_template.splice_in(
 					Amount::from_sat(splice_amount_sats),
-					min_feerate,
+					feerate,
 					max_feerate,
 					Arc::clone(&self.wallet),
 				))
@@ -1700,7 +1763,9 @@ impl Node {
 		if let Some(channel_details) =
 			open_channels.iter().find(|c| c.user_channel_id == user_channel_id.0)
 		{
-			if splice_amount_sats > channel_details.outbound_capacity_msat {
+			let splice_amount_msat =
+				splice_amount_sats.checked_mul(1_000).ok_or(Error::ChannelSplicingFailed)?;
+			if splice_amount_msat > channel_details.outbound_capacity_msat {
 				return Err(Error::ChannelSplicingFailed);
 			}
 
@@ -1708,7 +1773,7 @@ impl Node {
 
 			let min_feerate =
 				self.fee_estimator.estimate_fee_rate(ConfirmationTarget::ChannelFunding);
-			let max_feerate = FeeRate::from_sat_per_kwu(min_feerate.to_sat_per_kwu() * 3 / 2);
+			let max_feerate = max_funding_feerate(min_feerate);
 
 			let funding_template = self
 				.channel_manager
@@ -1721,17 +1786,27 @@ impl Node {
 			if funding_template.prior_contribution().is_some() {
 				log_error!(
 					self.logger,
-					"Failed to splice channel: a prior splice contribution is pending"
+					"Failed to splice channel: a prior splice contribution is pending; use bump_channel_funding_fee to bump its fee"
 				);
 				return Err(Error::ChannelSplicingFailed);
 			}
+
+			// When contributing to a pending splice, the funding template requires at least the RBF
+			// minimum feerate to replace the in-flight transaction. Use it in place of our funding
+			// feerate estimate when it's higher, as long as it stays within our max.
+			let feerate = match funding_template.min_rbf_feerate() {
+				Some(min_rbf_feerate) if min_rbf_feerate <= max_feerate => {
+					min_feerate.max(min_rbf_feerate)
+				},
+				_ => min_feerate,
+			};
 
 			let outputs = vec![bitcoin::TxOut {
 				value: Amount::from_sat(splice_amount_sats),
 				script_pubkey: address.script_pubkey(),
 			}];
 			let contribution =
-				funding_template.splice_out(outputs, min_feerate, max_feerate).map_err(|e| {
+				funding_template.splice_out(outputs, feerate, max_feerate).map_err(|e| {
 					log_error!(self.logger, "Failed to splice channel: {}", e);
 					Error::ChannelSplicingFailed
 				})?;
@@ -1745,6 +1820,77 @@ impl Node {
 				)
 				.map_err(|e| {
 					log_error!(self.logger, "Failed to splice channel: {:?}", e);
+					Error::ChannelSplicingFailed
+				})
+		} else {
+			log_error!(
+				self.logger,
+				"Channel not found for user_channel_id {} and counterparty {}",
+				user_channel_id,
+				counterparty_node_id
+			);
+			Err(Error::ChannelSplicingFailed)
+		}
+	}
+
+	/// Fee-bumps the pending splice on a channel by replacing its in-flight funding transaction
+	/// (RBF). The splice's amount and destination are preserved; only the fee rate is raised.
+	/// Errors if the channel has no pending splice to bump.
+	pub fn bump_channel_funding_fee(
+		&self, user_channel_id: &UserChannelId, counterparty_node_id: PublicKey,
+	) -> Result<(), Error> {
+		let open_channels =
+			self.channel_manager.list_channels_with_counterparty(&counterparty_node_id);
+		if let Some(channel_details) =
+			open_channels.iter().find(|c| c.user_channel_id == user_channel_id.0)
+		{
+			let min_feerate =
+				self.fee_estimator.estimate_fee_rate(ConfirmationTarget::ChannelFunding);
+
+			let funding_template = self
+				.channel_manager
+				.splice_channel(&channel_details.channel_id, &counterparty_node_id)
+				.map_err(|e| {
+					log_error!(self.logger, "Failed to RBF channel: {:?}", e);
+					Error::ChannelSplicingFailed
+				})?;
+
+			let Some(min_rbf_feerate) = funding_template.min_rbf_feerate() else {
+				log_error!(self.logger, "Failed to RBF channel: no pending splice to replace");
+				return Err(Error::ChannelSplicingFailed);
+			};
+
+			let Some((target_feerate, max_feerate)) =
+				rbf_splice_feerates(min_feerate, min_rbf_feerate)
+			else {
+				log_error!(
+					self.logger,
+					"Failed to RBF channel: the RBF minimum feerate exceeds our maximum"
+				);
+				return Err(Error::ChannelSplicingFailed);
+			};
+
+			let contribution = self
+				.runtime
+				.block_on(funding_template.rbf_prior_contribution(
+					Some(target_feerate),
+					max_feerate,
+					Arc::clone(&self.wallet),
+				))
+				.map_err(|e| {
+					log_error!(self.logger, "Failed to RBF channel: {}", e);
+					Error::ChannelSplicingFailed
+				})?;
+
+			self.channel_manager
+				.funding_contributed(
+					&channel_details.channel_id,
+					&counterparty_node_id,
+					contribution,
+					None,
+				)
+				.map_err(|e| {
+					log_error!(self.logger, "Failed to RBF channel: {:?}", e);
 					Error::ChannelSplicingFailed
 				})
 		} else {
@@ -2094,11 +2240,7 @@ impl Node {
 			| self.chain_monitor.provided_node_features()
 			| self.onion_messenger.provided_node_features()
 			| gossip_features
-			| self
-				.liquidity_source
-				.as_ref()
-				.map(|ls| ls.liquidity_manager().provided_node_features())
-				.unwrap_or_else(LdkNodeFeatures::empty)
+			| self.liquidity_source.liquidity_manager().provided_node_features()
 	}
 }
 

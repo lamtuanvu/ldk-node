@@ -9,11 +9,11 @@ pub(crate) mod bitcoind;
 mod electrum;
 mod esplora;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use bitcoin::{Script, Txid};
+use bitcoin::{Script, Transaction, Txid};
 use lightning::chain::{BlockLocator, Filter};
 
 use crate::chain::bitcoind::{BitcoindChainSource, UtxoSourceClient};
@@ -24,7 +24,7 @@ use crate::config::{
 	WALLET_SYNC_INTERVAL_MINIMUM_SECS,
 };
 use crate::fee_estimator::OnchainFeeEstimator;
-use crate::logger::{log_debug, log_info, log_trace, LdkLogger, Logger};
+use crate::logger::{log_debug, log_error, log_info, log_trace, LdkLogger, Logger};
 use crate::runtime::Runtime;
 use crate::types::{Broadcaster, ChainMonitor, ChannelManager, DynStore, Sweeper, Wallet};
 use crate::{Error, PersistedNodeMetrics};
@@ -84,7 +84,7 @@ impl WalletSyncStatus {
 
 pub(crate) struct ChainSource {
 	kind: ChainSourceKind,
-	registered_txids: Mutex<Vec<Txid>>,
+	registered_txids: Mutex<HashSet<Txid>>,
 	tx_broadcaster: Arc<Broadcaster>,
 	logger: Arc<Logger>,
 }
@@ -113,7 +113,7 @@ impl ChainSource {
 			node_metrics,
 		)?;
 		let kind = ChainSourceKind::Esplora(esplora_chain_source);
-		let registered_txids = Mutex::new(Vec::new());
+		let registered_txids = Mutex::new(HashSet::new());
 		Ok((Self { kind, registered_txids, tx_broadcaster, logger }, None))
 	}
 
@@ -133,7 +133,7 @@ impl ChainSource {
 			node_metrics,
 		);
 		let kind = ChainSourceKind::Electrum(electrum_chain_source);
-		let registered_txids = Mutex::new(Vec::new());
+		let registered_txids = Mutex::new(HashSet::new());
 		(Self { kind, registered_txids, tx_broadcaster, logger }, None)
 	}
 
@@ -156,7 +156,7 @@ impl ChainSource {
 		);
 		let best_block = bitcoind_chain_source.poll_best_block().await.ok();
 		let kind = ChainSourceKind::Bitcoind(bitcoind_chain_source);
-		let registered_txids = Mutex::new(Vec::new());
+		let registered_txids = Mutex::new(HashSet::new());
 		(Self { kind, registered_txids, tx_broadcaster, logger }, best_block)
 	}
 
@@ -180,7 +180,7 @@ impl ChainSource {
 		);
 		let best_block = bitcoind_chain_source.poll_best_block().await.ok();
 		let kind = ChainSourceKind::Bitcoind(bitcoind_chain_source);
-		let registered_txids = Mutex::new(Vec::new());
+		let registered_txids = Mutex::new(HashSet::new());
 		(Self { kind, registered_txids, tx_broadcaster, logger }, best_block)
 	}
 
@@ -214,7 +214,7 @@ impl ChainSource {
 		}
 	}
 
-	pub(crate) fn registered_txids(&self) -> Vec<Txid> {
+	pub(crate) fn registered_txids(&self) -> HashSet<Txid> {
 		self.registered_txids.lock().expect("lock").clone()
 	}
 
@@ -453,15 +453,30 @@ impl ChainSource {
 					return;
 				}
 				Some(next_package) = receiver.recv() => {
+					// Classify funding broadcasts into payment records before sending. If
+					// classification fails we skip the broadcast, since broadcasting a tx we
+					// failed to record would leave it on-chain without a payment.
+					let package = match self.tx_broadcaster.classify_package(next_package).await {
+						Ok(package) => package,
+						Err(e) => {
+							log_error!(
+								tx_bcast_logger,
+								"Skipping broadcast: failed to persist payment records: {:?}",
+								e,
+							);
+							continue;
+						},
+					};
+					let txs: Vec<Transaction> = package.into_transactions();
 					match &self.kind {
 						ChainSourceKind::Esplora(esplora_chain_source) => {
-							esplora_chain_source.process_broadcast_package(next_package).await
+							esplora_chain_source.process_broadcast_package(txs).await
 						},
 						ChainSourceKind::Electrum(electrum_chain_source) => {
-							electrum_chain_source.process_broadcast_package(next_package).await
+							electrum_chain_source.process_broadcast_package(txs).await
 						},
 						ChainSourceKind::Bitcoind(bitcoind_chain_source) => {
-							bitcoind_chain_source.process_broadcast_package(next_package).await
+							bitcoind_chain_source.process_broadcast_package(txs).await
 						},
 					}
 				}
@@ -472,7 +487,7 @@ impl ChainSource {
 
 impl Filter for ChainSource {
 	fn register_tx(&self, txid: &Txid, script_pubkey: &Script) {
-		self.registered_txids.lock().expect("lock").push(*txid);
+		self.registered_txids.lock().expect("lock").insert(*txid);
 		match &self.kind {
 			ChainSourceKind::Esplora(esplora_chain_source) => {
 				esplora_chain_source.register_tx(txid, script_pubkey)

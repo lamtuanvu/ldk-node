@@ -50,7 +50,7 @@ use ldk_node::{
 use lightning::io;
 use lightning::ln::msgs::SocketAddress;
 use lightning::routing::gossip::NodeAlias;
-use lightning::util::persist::KVStore;
+use lightning::util::persist::{KVStore, PageToken, PaginatedKVStore, PaginatedListResponse};
 use lightning_invoice::{Bolt11InvoiceDescription, Description};
 use lightning_persister::fs_store::v1::FilesystemStore;
 use lightning_types::payment::{PaymentHash, PaymentPreimage};
@@ -435,7 +435,8 @@ pub(crate) struct TestConfig {
 	pub store_type: TestStoreType,
 	pub node_entropy: NodeEntropy,
 	pub async_payments_role: Option<AsyncPaymentsRole>,
-	pub recovery_mode: bool,
+	pub wallet_rescan_from_height: Option<u32>,
+	pub force_wallet_full_scan: bool,
 }
 
 impl Default for TestConfig {
@@ -447,14 +448,16 @@ impl Default for TestConfig {
 		let mnemonic = generate_entropy_mnemonic(None);
 		let node_entropy = NodeEntropy::from_bip39_mnemonic(mnemonic, None);
 		let async_payments_role = None;
-		let recovery_mode = false;
+		let wallet_rescan_from_height = None;
+		let force_wallet_full_scan = false;
 		TestConfig {
 			node_config,
 			log_writer,
 			store_type,
 			node_entropy,
 			async_payments_role,
-			recovery_mode,
+			wallet_rescan_from_height,
+			force_wallet_full_scan,
 		}
 	}
 }
@@ -537,12 +540,14 @@ pub(crate) fn setup_node(chain_source: &TestChainSource, config: TestConfig) -> 
 			let esplora_url = format!("http://{}", electrsd.esplora_url.as_ref().unwrap());
 			let mut sync_config = EsploraSyncConfig::default();
 			sync_config.background_sync_config = None;
+			sync_config.force_wallet_full_scan = config.force_wallet_full_scan;
 			builder.set_chain_source_esplora(esplora_url.clone(), Some(sync_config));
 		},
 		TestChainSource::Electrum(electrsd) => {
 			let electrum_url = format!("tcp://{}", electrsd.electrum_url);
 			let mut sync_config = ElectrumSyncConfig::default();
 			sync_config.background_sync_config = None;
+			sync_config.force_wallet_full_scan = config.force_wallet_full_scan;
 			builder.set_chain_source_electrum(electrum_url.clone(), Some(sync_config));
 		},
 		TestChainSource::BitcoindRpcSync(bitcoind) => {
@@ -551,7 +556,13 @@ pub(crate) fn setup_node(chain_source: &TestChainSource, config: TestConfig) -> 
 			let values = bitcoind.params.get_cookie_values().unwrap().unwrap();
 			let rpc_user = values.user;
 			let rpc_password = values.password;
-			builder.set_chain_source_bitcoind_rpc(rpc_host, rpc_port, rpc_user, rpc_password);
+			builder.set_chain_source_bitcoind_rpc(
+				rpc_host,
+				rpc_port,
+				rpc_user,
+				rpc_password,
+				config.wallet_rescan_from_height,
+			);
 		},
 		TestChainSource::BitcoindRestSync(bitcoind) => {
 			let rpc_host = bitcoind.params.rpc_socket.ip().to_string();
@@ -568,6 +579,7 @@ pub(crate) fn setup_node(chain_source: &TestChainSource, config: TestConfig) -> 
 				rpc_port,
 				rpc_user,
 				rpc_password,
+				config.wallet_rescan_from_height,
 			);
 		},
 	}
@@ -586,10 +598,6 @@ pub(crate) fn setup_node(chain_source: &TestChainSource, config: TestConfig) -> 
 
 	builder.set_async_payments_role(config.async_payments_role).unwrap();
 
-	if config.recovery_mode {
-		builder.set_wallet_recovery_mode();
-	}
-
 	let node = match config.store_type {
 		TestStoreType::TestSyncStore => {
 			let kv_store = TestSyncStore::new(config.node_config.storage_dir_path.into());
@@ -600,10 +608,6 @@ pub(crate) fn setup_node(chain_source: &TestChainSource, config: TestConfig) -> 
 			builder.build_with_fs_store(config.node_entropy.into()).unwrap()
 		},
 	};
-
-	if config.recovery_mode {
-		builder.set_wallet_recovery_mode();
-	}
 
 	node.start().unwrap();
 	assert!(node.status().is_running);
@@ -1364,7 +1368,9 @@ pub(crate) async fn do_channel_full_cycle<E: ElectrumApi>(
 
 	println!("\nB splices out to pay A");
 	let addr_a = node_a.onchain_payment().new_address().unwrap();
-	let splice_out_sat = funding_amount_sat / 2;
+	let available_splice_out_sat = node_b.list_channels()[0].outbound_capacity_msat / 1000;
+	let splice_out_sat = available_splice_out_sat / 2;
+	assert!(splice_out_sat > 500_000);
 	node_b.splice_out(&user_channel_id_b, node_a.node_id(), &addr_a, splice_out_sat).unwrap();
 
 	expect_splice_negotiated_event!(node_a, node_b.node_id());
@@ -1700,6 +1706,21 @@ impl KVStore for TestSyncStore {
 	}
 }
 
+impl PaginatedKVStore for TestSyncStore {
+	fn list_paginated(
+		&self, primary_namespace: &str, secondary_namespace: &str, page_token: Option<PageToken>,
+	) -> impl Future<Output = Result<PaginatedListResponse, io::Error>> + 'static + Send {
+		let primary_namespace = primary_namespace.to_string();
+		let secondary_namespace = secondary_namespace.to_string();
+		let inner = Arc::clone(&self.inner);
+		async move {
+			inner
+				.list_paginated_internal_async(&primary_namespace, &secondary_namespace, page_token)
+				.await
+		}
+	}
+}
+
 struct TestSyncStoreInner {
 	serializer: tokio::sync::RwLock<()>,
 	test_store: InMemoryStore,
@@ -1761,6 +1782,37 @@ impl TestSyncStoreInner {
 	) -> lightning::io::Result<Vec<String>> {
 		let _guard = self.serializer.read().await;
 		self.do_list_async(primary_namespace, secondary_namespace).await
+	}
+
+	async fn list_paginated_internal_async(
+		&self, primary_namespace: &str, secondary_namespace: &str, page_token: Option<PageToken>,
+	) -> lightning::io::Result<PaginatedListResponse> {
+		let _guard = self.serializer.read().await;
+		let sqlite_res = PaginatedKVStore::list_paginated(
+			&self.sqlite_store,
+			primary_namespace,
+			secondary_namespace,
+			page_token.clone(),
+		)
+		.await;
+		let test_res = PaginatedKVStore::list_paginated(
+			&self.test_store,
+			primary_namespace,
+			secondary_namespace,
+			page_token,
+		)
+		.await;
+
+		match sqlite_res {
+			Ok(sqlite_response) => {
+				assert_eq!(sqlite_response, test_res.unwrap());
+				Ok(sqlite_response)
+			},
+			Err(e) => {
+				assert!(test_res.is_err());
+				Err(e)
+			},
+		}
 	}
 
 	async fn read_internal_async(
@@ -1873,4 +1925,27 @@ impl TestSyncStoreInner {
 			},
 		}
 	}
+}
+
+/// The PostgreSQL connection string used by the Postgres-backed tests, overridable via the
+/// `TEST_POSTGRES_URL` environment variable.
+#[cfg(feature = "postgres")]
+pub(crate) fn test_connection_string() -> String {
+	std::env::var("TEST_POSTGRES_URL")
+		.unwrap_or_else(|_| "host=localhost user=postgres password=postgres".to_string())
+}
+
+/// Drops the given table from the `ldk_db` database, ignoring the case where the database doesn't
+/// exist yet. Used to ensure a clean slate before and after Postgres-backed tests.
+#[cfg(feature = "postgres")]
+pub(crate) async fn drop_table(table_name: &str) {
+	let connection_string = format!("{} dbname=ldk_db", test_connection_string());
+	let Ok((client, connection)) =
+		tokio_postgres::connect(&connection_string, tokio_postgres::NoTls).await
+	else {
+		// Database doesn't exist yet — nothing to drop.
+		return;
+	};
+	tokio::spawn(connection);
+	let _ = client.execute(&format!("DROP TABLE IF EXISTS {table_name}"), &[]).await;
 }
