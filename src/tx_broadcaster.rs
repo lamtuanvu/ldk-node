@@ -163,6 +163,17 @@ where
 			log_error!(self.logger, "Failed to broadcast transactions: {}", e);
 		});
 	}
+
+	/// Enqueues a single fully-signed transaction for broadcast (swaps B4).
+	///
+	/// Thin wrapper over the [`BroadcasterInterface::broadcast_transactions`] impl below:
+	/// it enqueues the transaction onto the bounded broadcast queue drained by the chain
+	/// source's `process_broadcast_queue` loop. The actual network send happens there,
+	/// so this returns immediately and does not confirm acceptance by the backend.
+	#[cfg(feature = "swaps")]
+	pub(crate) fn broadcast_tx(&self, tx: &Transaction) {
+		<Self as BroadcasterInterface>::broadcast_transactions(self, &[tx]);
+	}
 }
 
 impl<L: Deref> BroadcasterInterface for TransactionBroadcaster<L>

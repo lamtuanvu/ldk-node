@@ -2413,6 +2413,8 @@ fn build_with_store_internal(
 		prober,
 		#[cfg(cycle_tests)]
 		_leak_checker,
+		#[cfg(feature = "swaps")]
+		swap_tx_watch: Arc::new(crate::chain::SwapTxWatch::new()),
 	})
 }
 

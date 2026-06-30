@@ -26,6 +26,9 @@ panic = 'abort'     # Abort on panic
 [features]
 default = []
 postgres = ["dep:tokio-postgres", "dep:native-tls", "dep:postgres-native-tls"]
+# Peerswap native primitives (B-series). Empty for now; gates all swap
+# additions so the default build is byte-for-byte unaffected.
+swaps = []
 
 [dependencies]
 #lightning = { version = "0.2.0", features = ["std"] }
