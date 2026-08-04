@@ -150,10 +150,6 @@ pub use bitcoin::psbt::Psbt;
 /// Swap keypair type returned by [`Node::derive_swap_keypair`] (B7).
 #[cfg(feature = "swaps")]
 pub use bitcoin::secp256k1::Keypair as SwapKeypair;
-/// Confirmed wallet UTXO type returned by [`Node::swap_list_confirmed_utxos`]
-/// (B2).
-#[cfg(feature = "swaps")]
-pub use lightning::util::wallet_utils::Utxo;
 #[cfg(feature = "uniffi")]
 pub use bitcoin::FeeRate;
 use bitcoin::{Address, Amount, BlockHash, Network};
@@ -194,6 +190,10 @@ use lightning::ln::peer_handler::CustomMessageHandler;
 use lightning::routing::gossip::NodeAlias;
 use lightning::sign::EntropySource;
 use lightning::util::persist::KVStore;
+/// Confirmed wallet UTXO type returned by [`Node::swap_list_confirmed_utxos`]
+/// (B2).
+#[cfg(feature = "swaps")]
+pub use lightning::util::wallet_utils::Utxo;
 use lightning::util::wallet_utils::{Input, Wallet as LdkWallet};
 use lightning_background_processor::process_events_async;
 pub use lightning_invoice;
@@ -1180,10 +1180,9 @@ impl Node {
 		payment_hash: lightning_types::payment::PaymentHash,
 		preimage: lightning_types::payment::PaymentPreimage,
 	) -> Result<PaymentId, Error> {
-		use lightning::ln::channelmanager::{RecipientOnionFields, RetryableSendFailure};
+		use lightning::ln::outbound_payment::{RecipientOnionFields, RetryableSendFailure};
 
-		let rt_lock = self.runtime.read().unwrap();
-		if rt_lock.is_none() {
+		if !*self.is_running.read().unwrap() {
 			return Err(Error::NotRunning);
 		}
 
@@ -1209,9 +1208,9 @@ impl Node {
 		// a claimable event (no proof-of-payment leak); the secret only ever travels
 		// inside the onion we build, so no third party can construct a claimable HTLC
 		// for this hash.
-		let payment_secret = self
+		let (payment_secret, _payment_metadata) = self
 			.channel_manager
-			.create_inbound_payment_for_hash(payment_hash, Some(amount_msat), 3600, None)
+			.create_inbound_payment_for_hash(payment_hash, Some(amount_msat), 3600, None, None)
 			.map_err(|()| {
 				log_error!(
 					self.logger,
@@ -1230,7 +1229,7 @@ impl Node {
 			payment::PaymentDirection::Outbound,
 			payment::PaymentStatus::Pending,
 		);
-		self.payment_store.insert(payment_record).map_err(|e| {
+		self.runtime.block_on(self.payment_store.insert(payment_record)).map_err(|e| {
 			log_error!(self.logger, "Failed to insert rebalance payment record: {}", e);
 			e
 		})?;
@@ -1238,7 +1237,7 @@ impl Node {
 		match self.channel_manager.send_payment_with_route(
 			route,
 			payment_hash,
-			RecipientOnionFields::secret_only(payment_secret),
+			RecipientOnionFields::secret_only(payment_secret, amount_msat),
 			payment_id,
 		) {
 			Ok(()) => {
@@ -1256,7 +1255,7 @@ impl Node {
 					status: Some(payment::PaymentStatus::Failed),
 					..payment::store::PaymentDetailsUpdate::new(payment_id)
 				};
-				let _ = self.payment_store.update(&update);
+				let _ = self.runtime.block_on(self.payment_store.update(update));
 				log_error!(
 					self.logger,
 					"Self-rebalance send failed ({:?}) for payment_id {}.",
