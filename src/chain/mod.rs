@@ -280,6 +280,8 @@ impl ChainSource {
 					channel_manager,
 					chain_monitor,
 					output_sweeper,
+					logger: Arc::clone(&self.logger),
+					divergence: Arc::new(Mutex::new(None)),
 				};
 				cbf_chain_source.start(chain_listener);
 			},
@@ -687,8 +689,7 @@ impl ChainSource {
 				// confirmations by ≤1, which errs on the safe/late side for deadlines.
 				match esplora_client.get_height().await {
 					Ok(tip_height) if tip_height >= height => {
-						let confirmations =
-							tip_height.saturating_sub(height).saturating_add(1);
+						let confirmations = tip_height.saturating_sub(height).saturating_add(1);
 						RawTxObservation::Confirmed { height: Some(height), confirmations }
 					},
 					Ok(tip_height) => {
@@ -756,8 +757,8 @@ impl ChainSource {
 								latest_chain_tip.read().unwrap().as_ref().map(|tip| tip.height)
 							},
 						};
-						let height = tip_height
-							.map(|t| t.saturating_sub(confirmations.saturating_sub(1)));
+						let height =
+							tip_height.map(|t| t.saturating_sub(confirmations.saturating_sub(1)));
 						RawTxObservation::Confirmed { height, confirmations }
 					},
 					Ok(None) => RawTxObservation::NotFound,
@@ -914,25 +915,15 @@ pub(crate) fn derive_tx_status(
 		RawTxObservation::InMempool => TxStatus {
 			confirmations: 0,
 			height: None,
-			status: if previously_confirmed {
-				ChainStatus::Reorged
-			} else {
-				ChainStatus::Mempool
-			},
+			status: if previously_confirmed { ChainStatus::Reorged } else { ChainStatus::Mempool },
 		},
 		RawTxObservation::NotFound => TxStatus {
 			confirmations: 0,
 			height: None,
-			status: if previously_confirmed {
-				ChainStatus::Reorged
-			} else {
-				ChainStatus::Dropped
-			},
+			status: if previously_confirmed { ChainStatus::Reorged } else { ChainStatus::Dropped },
 		},
-		RawTxObservation::Unreachable => TxStatus {
-			confirmations: 0,
-			height: None,
-			status: ChainStatus::NoChainSource,
+		RawTxObservation::Unreachable => {
+			TxStatus { confirmations: 0, height: None, status: ChainStatus::NoChainSource }
 		},
 	}
 }
@@ -1078,8 +1069,7 @@ mod swap_b5_tests {
 		// The load-bearing E6 invariant: an unanswerable chain source is never
 		// reported as confirmed, regardless of prior confirmation history.
 		for previously_confirmed in [false, true] {
-			let status =
-				derive_tx_status(RawTxObservation::Unreachable, previously_confirmed);
+			let status = derive_tx_status(RawTxObservation::Unreachable, previously_confirmed);
 			assert_eq!(status.status, ChainStatus::NoChainSource);
 			assert_ne!(status.status, ChainStatus::Confirmed);
 			assert_eq!(status.confirmations, 0);

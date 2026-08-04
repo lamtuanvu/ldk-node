@@ -229,6 +229,22 @@ impl Wallet {
 		self.inner.lock().expect("lock").spk_index().inner().all_spks().values().cloned().collect()
 	}
 
+	/// Defers persistence of the wallet's chain tip while a bulk chain sync is running.
+	///
+	/// See `KVStoreWalletPersister::set_defer_local_chain` for why only the chain is deferred.
+	/// Callers must pair this with [`Self::flush_chain_persistence`]; nothing flushes implicitly.
+	pub(crate) async fn set_bulk_chain_persistence(&self, enabled: bool) {
+		self.persister.lock().await.set_defer_local_chain(enabled);
+	}
+
+	/// Persists any chain state deferred by [`Self::set_bulk_chain_persistence`].
+	pub(crate) async fn flush_chain_persistence(&self) -> Result<(), Error> {
+		self.persister.lock().await.flush_local_chain().await.map_err(|e| {
+			log_error!(self.logger, "Failed to flush deferred on-chain wallet chain state: {}", e);
+			Error::PersistenceFailed
+		})
+	}
+
 	async fn update_payment_store(&self, mut events: Vec<WalletEvent>) -> Result<(), Error> {
 		if events.is_empty() {
 			return Ok(());
@@ -2133,9 +2149,7 @@ impl WalletKeysManager {
 /// method adds error logging on top of this pure derivation. Secret material is
 /// never logged here.
 #[cfg(feature = "swaps")]
-fn swap_keypair_from_master(
-	master: &Xpriv, index: u32,
-) -> Result<Keypair, bitcoin::bip32::Error> {
+fn swap_keypair_from_master(master: &Xpriv, index: u32) -> Result<Keypair, bitcoin::bip32::Error> {
 	let secp = Secp256k1::new();
 	let child = master.derive_priv(&secp, &[ChildNumber::Hardened { index }])?;
 	Ok(Keypair::from_secret_key(&secp, &child.private_key))

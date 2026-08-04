@@ -25,11 +25,62 @@ pub(crate) struct KVStoreWalletPersister {
 	pending_change_set: ChangeSet,
 	kv_store: Arc<DynStore>,
 	logger: Arc<Logger>,
+	/// While set, `local_chain` updates are merged into the in-memory aggregate but not written to
+	/// the KV store. See [`Self::set_defer_local_chain`].
+	defer_local_chain: bool,
+	/// Whether the in-memory `local_chain` aggregate holds changes not yet written to the KV store.
+	local_chain_dirty: bool,
 }
 
 impl KVStoreWalletPersister {
 	pub(crate) fn new(kv_store: Arc<DynStore>, logger: Arc<Logger>) -> Self {
-		Self { latest_change_set: None, pending_change_set: ChangeSet::default(), kv_store, logger }
+		Self {
+			latest_change_set: None,
+			pending_change_set: ChangeSet::default(),
+			kv_store,
+			logger,
+			defer_local_chain: false,
+			local_chain_dirty: false,
+		}
+	}
+
+	/// Defers `local_chain` writes while a bulk chain sync is in progress.
+	///
+	/// The persisted `local_chain` is a `BTreeMap<height, hash>` covering the whole chain, and it is
+	/// re-serialized and re-written in full on every applied block. During an initial sync that
+	/// makes the total bytes written quadratic in chain height — the dominant cost on a
+	/// flash-storage device, and the reason a from-scratch sync is impractical there.
+	///
+	/// Deferring is safe because `local_chain` is the one part of the wallet's state that is
+	/// reconstructible: a stale persisted chain simply lowers the resume floor, and the chain source
+	/// replays the missing blocks on restart. `indexer` and `tx_graph` are deliberately *not*
+	/// deferred — address-derivation indices and transactions are funds-critical and are not
+	/// cheaply reconstructible, so they keep writing through synchronously.
+	pub(super) fn set_defer_local_chain(&mut self, defer: bool) {
+		self.defer_local_chain = defer;
+	}
+
+	/// Writes the in-memory `local_chain` aggregate if it has deferred changes.
+	pub(super) async fn flush_local_chain(&mut self) -> Result<(), std::io::Error> {
+		if !self.local_chain_dirty {
+			return Ok(());
+		}
+
+		let latest_change_set = self.latest_change_set.as_ref().ok_or_else(|| {
+			std::io::Error::new(
+				std::io::ErrorKind::Other,
+				"Wallet must be initialized before flushing the local chain",
+			)
+		})?;
+
+		write_bdk_wallet_local_chain(
+			&latest_change_set.local_chain,
+			&*self.kv_store,
+			Arc::clone(&self.logger),
+		)
+		.await?;
+		self.local_chain_dirty = false;
+		Ok(())
 	}
 
 	async fn initialize_inner(&mut self) -> Result<ChangeSet, std::io::Error> {
@@ -55,7 +106,8 @@ impl KVStoreWalletPersister {
 
 	async fn persist_inner(
 		latest_change_set_opt: &mut Option<ChangeSet>, kv_store: &Arc<DynStore>,
-		logger: &Arc<Logger>, change_set: &ChangeSet,
+		logger: &Arc<Logger>, change_set: &ChangeSet, defer_local_chain: bool,
+		local_chain_dirty: &mut bool,
 	) -> Result<(), std::io::Error> {
 		if change_set.is_empty() {
 			return Ok(());
@@ -162,12 +214,20 @@ impl KVStoreWalletPersister {
 
 		if !change_set.local_chain.is_empty() {
 			latest_change_set.local_chain.merge(change_set.local_chain.clone());
-			write_bdk_wallet_local_chain(
-				&latest_change_set.local_chain,
-				&*kv_store,
-				Arc::clone(&logger),
-			)
-			.await?;
+			if defer_local_chain {
+				// Merged in memory only; `flush_local_chain` writes the aggregate later. A crash
+				// before that flush leaves an older persisted chain, which lowers the resume floor
+				// and causes the missing blocks to be replayed.
+				*local_chain_dirty = true;
+			} else {
+				write_bdk_wallet_local_chain(
+					&latest_change_set.local_chain,
+					&*kv_store,
+					Arc::clone(&logger),
+				)
+				.await?;
+				*local_chain_dirty = false;
+			}
 		}
 
 		Ok(())
@@ -182,6 +242,8 @@ impl KVStoreWalletPersister {
 			&self.kv_store,
 			&self.logger,
 			&self.pending_change_set,
+			self.defer_local_chain,
+			&mut self.local_chain_dirty,
 		)
 		.await?;
 		let _ = std::mem::take(&mut self.pending_change_set);
@@ -212,6 +274,8 @@ impl AsyncWalletPersister for KVStoreWalletPersister {
 			&persister.kv_store,
 			&persister.logger,
 			change_set,
+			persister.defer_local_chain,
+			&mut persister.local_chain_dirty,
 		))
 	}
 }

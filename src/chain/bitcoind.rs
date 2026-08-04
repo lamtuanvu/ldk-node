@@ -425,6 +425,8 @@ impl BitcoindChainSource {
 			channel_manager: Arc::clone(&channel_manager),
 			chain_monitor: Arc::clone(&chain_monitor),
 			output_sweeper,
+			logger: Arc::clone(&self.logger),
+			divergence: Arc::new(Mutex::new(None)),
 		};
 		let mut spv_client =
 			SpvClient::new(chain_tip, chain_poller, HeaderCache::new(), &chain_listener);
@@ -1016,9 +1018,7 @@ impl BitcoindClient {
 	/// - `Ok(None)` when the node does not know the tx (RPC error code -5),
 	/// - `Err(..)` for any transport/other failure, so the caller fails closed.
 	#[cfg(feature = "swaps")]
-	pub(crate) async fn swap_tx_confirmations(
-		&self, txid: &Txid,
-	) -> std::io::Result<Option<u32>> {
+	pub(crate) async fn swap_tx_confirmations(&self, txid: &Txid) -> std::io::Result<Option<u32>> {
 		let rpc_client = match self {
 			BitcoindClient::Rpc { rpc_client, .. } => Arc::clone(rpc_client),
 			BitcoindClient::Rest { rpc_client, .. } => Arc::clone(rpc_client),
@@ -1541,9 +1541,81 @@ pub(crate) struct ChainListener {
 	pub(crate) channel_manager: Arc<ChannelManager>,
 	pub(crate) chain_monitor: Arc<ChainMonitor>,
 	pub(crate) output_sweeper: Arc<Sweeper>,
+	pub(crate) logger: Arc<Logger>,
+	/// Records the first listener divergence seen since the last drain.
+	///
+	/// `Listen` returns `()`, so divergence cannot be propagated through the trait. The chain
+	/// source drains this after each block and must stop advancing when it is set: continuing
+	/// would publish a "synced" tip while a listener sits on a stale chain.
+	pub(crate) divergence: Arc<Mutex<Option<String>>>,
+}
+
+/// Whether a listener should be handed a given block.
+///
+/// `ChannelManager` and `OutputSweeper` enforce LDK's `Listen` contract with `assert_eq!` on both
+/// the previous block hash and `height == best + 1`, so handing either one a block it has already
+/// applied panics the node rather than returning an error. Listener durability is not
+/// synchronized — `ChannelManager` is persisted asynchronously by the background processor while
+/// `OutputSweeper` is only marked dirty and flushed periodically — so after a crash they can be
+/// durable at different heights. The chain source resumes from the *minimum* height across all
+/// listeners, which replays blocks to any listener that got further ahead.
+///
+/// Classification is deliberately hash-aware. Deciding on height alone would treat a *different*
+/// block at an already-seen height as an ordinary replay and skip it, silently stranding the
+/// listener on a stale fork — a worse failure than the panic being avoided, because it is silent.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ListenerAction {
+	/// The listener expects exactly this block.
+	Deliver,
+	/// The listener already has this exact block on its chain; skip it.
+	AlreadyApplied,
+	/// The listener cannot accept this block without first being rewound.
+	Diverged,
+}
+
+pub(crate) fn listener_action(
+	best: &BlockLocator, block_hash: bitcoin::BlockHash, prev_blockhash: bitcoin::BlockHash,
+	height: u32,
+) -> ListenerAction {
+	if height == best.height + 1 {
+		// The ordinary case: extends the listener's tip.
+		return if best.block_hash == prev_blockhash {
+			ListenerAction::Deliver
+		} else {
+			ListenerAction::Diverged
+		};
+	}
+
+	if height == best.height {
+		// Same height: an exact replay is safe to skip, a different block is a fork.
+		return if best.block_hash == block_hash {
+			ListenerAction::AlreadyApplied
+		} else {
+			ListenerAction::Diverged
+		};
+	}
+
+	if height < best.height {
+		// Below the tip: only a skip if this exact block is on the listener's own chain.
+		// `previous_blocks` holds ancestors in reverse chronological order starting at
+		// `best.height - 1`, so the ancestor at `height` sits at index `best.height - height - 1`.
+		let idx = (best.height - height - 1) as usize;
+		return match best.previous_blocks.get(idx) {
+			Some(Some(ancestor)) if *ancestor == block_hash => ListenerAction::AlreadyApplied,
+			// Either the ancestor differs (a fork), or we have no record that far back and
+			// therefore cannot prove this block is ours. Both must be treated as divergence.
+			_ => ListenerAction::Diverged,
+		};
+	}
+
+	// height > best.height + 1: a gap. Delivering would violate the one-call-per-block contract.
+	ListenerAction::Diverged
 }
 
 impl ChainListener {
+	/// Logs a diverged listener. Delivering anyway would panic on LDK's chain-order assertion, and
+	/// silently skipping would strand the listener on a stale chain, so the condition is surfaced
+	/// loudly rather than swallowed.
 	pub(crate) fn get_best_block(&self) -> BlockLocator {
 		let candidates = [
 			self.onchain_wallet.current_best_block(),
@@ -1551,19 +1623,45 @@ impl ChainListener {
 			self.output_sweeper.current_best_block(),
 		];
 		let mut min = candidates.into_iter().min_by_key(|b| b.height).expect("non-empty");
-		if let Some(worst_monitor) = self
-			.chain_monitor
-			.list_monitors()
-			.iter()
-			.flat_map(|id| self.chain_monitor.get_monitor(*id))
-			.map(|m| m.current_best_block())
-			.min_by_key(|b| b.height)
-		{
+		if let Some(worst_monitor) = self.min_monitor_best_block() {
 			if worst_monitor.height < min.height {
 				min = worst_monitor;
 			}
 		}
 		min
+	}
+
+	/// The furthest-behind channel monitor, or `None` when there are no monitors.
+	fn min_monitor_best_block(&self) -> Option<BlockLocator> {
+		self.chain_monitor
+			.list_monitors()
+			.iter()
+			.flat_map(|id| self.chain_monitor.get_monitor(*id))
+			.map(|m| m.current_best_block())
+			.min_by_key(|b| b.height)
+	}
+
+	pub(crate) fn take_divergence(&self) -> Option<String> {
+		self.divergence.lock().unwrap().take()
+	}
+
+	fn log_divergence(&self, who: &str, best: &BlockLocator, height: u32) {
+		let mut recorded = self.divergence.lock().unwrap();
+		if recorded.is_none() {
+			*recorded = Some(format!(
+				"{} diverged at height {} (listener at {}, hash {})",
+				who, height, best.height, best.block_hash
+			));
+		}
+		log_error!(
+			self.logger,
+			"{} cannot accept the block at height {}: it is at height {} (hash {}). It must be \
+			 rewound before it can continue; skipping to avoid a chain-order panic.",
+			who,
+			height,
+			best.height,
+			best.block_hash,
+		);
 	}
 }
 
@@ -1572,16 +1670,89 @@ impl Listen for ChainListener {
 		&self, header: &bitcoin::block::Header,
 		txdata: &lightning::chain::transaction::TransactionData, height: u32,
 	) {
+		// The on-chain wallet is deliberately not gated. `Wallet::blocks_disconnected` is a no-op
+		// because BDK expects blocks to be reconnected starting from the point of disagreement, so
+		// a height-based gate would starve it of the new chain after a reorg. BDK also tolerates an
+		// exact duplicate, which is the only case a gate would otherwise guard against.
 		self.onchain_wallet.filtered_block_connected(header, txdata, height);
-		self.channel_manager.filtered_block_connected(header, txdata, height);
-		self.chain_monitor.filtered_block_connected(header, txdata, height);
-		self.output_sweeper.filtered_block_connected(header, txdata, height);
+
+		let block_hash = header.block_hash();
+
+		let cm_best = self.channel_manager.current_best_block();
+		match listener_action(&cm_best, block_hash, header.prev_blockhash, height) {
+			ListenerAction::Deliver => {
+				self.channel_manager.filtered_block_connected(header, txdata, height)
+			},
+			ListenerAction::AlreadyApplied => {},
+			ListenerAction::Diverged => self.log_divergence("ChannelManager", &cm_best, height),
+		}
+
+		// `ChainMonitor` has no chain-order assertion of its own, but `ChannelMonitor` advances its
+		// tip whenever the incoming height is greater *without validating the parent*, so replaying
+		// a different chain would silently graft a stale ancestor. Gate it on the furthest-behind
+		// monitor: monitors ahead of that point ignore heights at or below their own tip.
+		match self.min_monitor_best_block() {
+			Some(monitor_best) => {
+				match listener_action(&monitor_best, block_hash, header.prev_blockhash, height) {
+					ListenerAction::Deliver | ListenerAction::AlreadyApplied => {
+						self.chain_monitor.filtered_block_connected(header, txdata, height)
+					},
+					ListenerAction::Diverged => {
+						self.log_divergence("ChainMonitor", &monitor_best, height)
+					},
+				}
+			},
+			// No monitors: nothing to strand.
+			None => self.chain_monitor.filtered_block_connected(header, txdata, height),
+		}
+
+		let sweeper_best = self.output_sweeper.current_best_block();
+		match listener_action(&sweeper_best, block_hash, header.prev_blockhash, height) {
+			ListenerAction::Deliver => {
+				self.output_sweeper.filtered_block_connected(header, txdata, height)
+			},
+			ListenerAction::AlreadyApplied => {},
+			ListenerAction::Diverged => self.log_divergence("OutputSweeper", &sweeper_best, height),
+		}
 	}
+
 	fn block_connected(&self, block: &bitcoin::Block, height: u32) {
 		self.onchain_wallet.block_connected(block, height);
-		self.channel_manager.block_connected(block, height);
-		self.chain_monitor.block_connected(block, height);
-		self.output_sweeper.block_connected(block, height);
+
+		let block_hash = block.header.block_hash();
+
+		let cm_best = self.channel_manager.current_best_block();
+		match listener_action(&cm_best, block_hash, block.header.prev_blockhash, height) {
+			ListenerAction::Deliver => self.channel_manager.block_connected(block, height),
+			ListenerAction::AlreadyApplied => {},
+			ListenerAction::Diverged => self.log_divergence("ChannelManager", &cm_best, height),
+		}
+
+		match self.min_monitor_best_block() {
+			Some(monitor_best) => {
+				match listener_action(
+					&monitor_best,
+					block_hash,
+					block.header.prev_blockhash,
+					height,
+				) {
+					ListenerAction::Deliver | ListenerAction::AlreadyApplied => {
+						self.chain_monitor.block_connected(block, height)
+					},
+					ListenerAction::Diverged => {
+						self.log_divergence("ChainMonitor", &monitor_best, height)
+					},
+				}
+			},
+			None => self.chain_monitor.block_connected(block, height),
+		}
+
+		let sweeper_best = self.output_sweeper.current_best_block();
+		match listener_action(&sweeper_best, block_hash, block.header.prev_blockhash, height) {
+			ListenerAction::Deliver => self.output_sweeper.block_connected(block, height),
+			ListenerAction::AlreadyApplied => {},
+			ListenerAction::Diverged => self.log_divergence("OutputSweeper", &sweeper_best, height),
+		}
 	}
 
 	fn blocks_disconnected(&self, fork_point_block: lightning::chain::BlockLocator) {
@@ -1621,6 +1792,7 @@ impl std::error::Error for BitcoindClientError {}
 mod tests {
 	use bitcoin::hashes::Hash;
 	use bitcoin::{FeeRate, OutPoint, ScriptBuf, Transaction, TxIn, TxOut, Txid, Witness};
+	use lightning::chain::BlockLocator;
 	use lightning_block_sync::http::JsonResponse;
 	use proptest::arbitrary::any;
 	use proptest::collection::vec;
@@ -1628,9 +1800,98 @@ mod tests {
 	use serde_json::json;
 
 	use crate::chain::bitcoind::{
-		FeeResponse, GetMempoolEntryResponse, GetRawMempoolResponse, GetRawTransactionResponse,
-		MempoolMinFeeResponse,
+		listener_action, FeeResponse, GetMempoolEntryResponse, GetRawMempoolResponse,
+		GetRawTransactionResponse, ListenerAction, MempoolMinFeeResponse,
 	};
+
+	fn hash(byte: u8) -> bitcoin::BlockHash {
+		bitcoin::BlockHash::from_byte_array([byte; 32])
+	}
+
+	/// A listener tip at `height`/`hash_byte` whose ancestors are byte-tagged `hash_byte - n`.
+	fn locator(height: u32, hash_byte: u8) -> BlockLocator {
+		let mut loc = BlockLocator::new(hash(hash_byte), height);
+		for (i, slot) in loc.previous_blocks.iter_mut().enumerate() {
+			*slot = Some(hash(hash_byte.wrapping_sub(i as u8 + 1)));
+		}
+		loc
+	}
+
+	#[test]
+	fn listener_action_delivers_the_next_block_in_order() {
+		// Extends the tip: parent matches, height is best + 1.
+		assert_eq!(
+			listener_action(&locator(100, 50), hash(51), hash(50), 101),
+			ListenerAction::Deliver
+		);
+	}
+
+	#[test]
+	fn listener_action_rejects_a_next_height_block_with_the_wrong_parent() {
+		assert_eq!(
+			listener_action(&locator(100, 50), hash(99), hash(200), 101),
+			ListenerAction::Diverged
+		);
+	}
+
+	#[test]
+	fn listener_action_skips_an_exact_replay_at_the_tip() {
+		// The crash case the gating exists for: the resume floor is the minimum height across all
+		// listeners, so a listener that persisted further ahead is replayed its own blocks.
+		// `ChannelManager` and `OutputSweeper` assert on chain order, so delivering would panic.
+		assert_eq!(
+			listener_action(&locator(100, 50), hash(50), hash(49), 100),
+			ListenerAction::AlreadyApplied
+		);
+	}
+
+	#[test]
+	fn listener_action_skips_an_exact_replay_below_the_tip() {
+		// Two blocks back on the listener's own chain: ancestors are tagged 49, 48, ...
+		assert_eq!(
+			listener_action(&locator(100, 50), hash(48), hash(47), 98),
+			ListenerAction::AlreadyApplied
+		);
+	}
+
+	#[test]
+	fn listener_action_reports_a_different_block_at_the_same_height() {
+		// The bug this classifier exists to prevent. Height alone would call this an ordinary
+		// replay and skip it, silently stranding the listener on the stale fork — worse than the
+		// panic being avoided, because nothing reports it.
+		assert_eq!(
+			listener_action(&locator(100, 50), hash(0xbb), hash(0xaa), 100),
+			ListenerAction::Diverged
+		);
+	}
+
+	#[test]
+	fn listener_action_reports_a_different_block_below_the_tip() {
+		// Right height, but not the block on the listener's chain (ancestor there is tagged 48).
+		assert_eq!(
+			listener_action(&locator(100, 50), hash(0xbb), hash(0xaa), 98),
+			ListenerAction::Diverged
+		);
+	}
+
+	#[test]
+	fn listener_action_reports_divergence_beyond_known_ancestry() {
+		// `previous_blocks` holds 12 ancestors; past that we cannot prove the block is ours, so it
+		// must not be assumed to be a safe replay.
+		assert_eq!(
+			listener_action(&locator(100, 50), hash(1), hash(0), 50),
+			ListenerAction::Diverged
+		);
+	}
+
+	#[test]
+	fn listener_action_reports_a_gap() {
+		// More than one block ahead: delivering violates LDK's one-call-per-block contract.
+		assert_eq!(
+			listener_action(&locator(90, 50), hash(60), hash(59), 101),
+			ListenerAction::Diverged
+		);
+	}
 
 	prop_compose! {
 		fn arbitrary_witness()(

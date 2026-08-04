@@ -53,6 +53,27 @@ const INITIAL_BACKOFF_MS: u64 = 500;
 /// Retry matched block downloads before surfacing a CBF sync failure.
 const CBF_BLOCK_FETCH_RETRIES: u8 = 3;
 
+/// Bound on the queue between the kyoto event loop and [`BlockApplicator`].
+///
+/// This queue was previously unbounded. During a bulk sync, filter processing outruns listener
+/// application (each applied block costs a BDK persist), so an unbounded queue lets hundreds of
+/// thousands of `ChainOp` values accumulate with no backpressure — a concrete OOM risk on a
+/// 512 MiB device. A bound makes the event loop wait for the applicator instead.
+///
+/// Kept small because a `ConnectFull` op carries an entire block: at 64 slots the worst case is
+/// bounded even when every queued op is a matched block. Most ops are `ConnectFiltered`, which
+/// carries only an 80-byte header, so this depth is ample for pipelining in the common case.
+const CBF_CHAIN_OP_QUEUE_DEPTH: usize = 64;
+
+/// How many applied blocks may accumulate before the deferred on-chain chain tip is written.
+///
+/// While catching up, the wallet's `local_chain` write is deferred (see
+/// `Wallet::set_bulk_chain_persistence`) so the growing full-chain map is not re-serialized on
+/// every block. Flushing every retarget period bounds how many blocks a crash can force us to
+/// replay, while collapsing ~2016 full-map writes into one. Once caught up, every block is
+/// followed by a `Synced` op, which flushes — so at the tip this reverts to one write per block.
+const CBF_CHAIN_FLUSH_INTERVAL_BLOCKS: u32 = 2016;
+
 const ESPLORA_TIMEOUT: u64 = 2;
 
 /// Retries and per-request timeout for the fresh Electrum connection opened each fee cycle.
@@ -131,8 +152,10 @@ enum ChainOp {
 
 struct BlockApplicator {
 	chain_listener: ChainListener,
-	ops_rx: mpsc::UnboundedReceiver<ChainOp>,
+	ops_rx: mpsc::Receiver<ChainOp>,
 	next_height: u32,
+	/// Blocks applied since the last deferred-chain-state flush.
+	blocks_since_flush: u32,
 	sync_state_tx: watch::Sender<CbfSyncState>,
 	/// Present only for the native CBF fee source: lets us cache the fee rate of blocks we download
 	/// here, so the fee estimator doesn't have to re-download them.
@@ -143,7 +166,64 @@ struct BlockApplicator {
 }
 
 impl BlockApplicator {
+	/// Writes the deferred on-chain chain tip, logging (but not propagating) a failure: the chain
+	/// state is reconstructible by replay, so a failed flush must not abort block application.
+	async fn flush_chain_state(&mut self) {
+		match self.chain_listener.onchain_wallet.flush_chain_persistence().await {
+			Ok(()) => self.blocks_since_flush = 0,
+			Err(e) => {
+				// Deliberately do NOT reset the counter: the chain state is still unwritten, so the
+				// next applied block should retry promptly rather than wait another full interval.
+				// `local_chain_dirty` likewise stays set, so no state is dropped on the floor.
+				log_error!(
+					self.logger,
+					"Failed to flush deferred CBF chain state ({}); will retry on the next block.",
+					e
+				);
+			},
+		}
+	}
+
+	/// Drains any listener divergence recorded during the last block application.
+	///
+	/// Returns `true` when the applicator must stop. A diverged listener is sitting on a chain we
+	/// cannot extend, so advancing `next_height` would march past it and eventually publish a
+	/// "synced" tip while that listener is stale — silent, and unrecoverable without a reorg whose
+	/// fork point happens to fall below it. Failing loudly instead surfaces the condition to
+	/// `wait_until_synced` and stops further damage.
+	async fn fail_on_divergence(&mut self) -> bool {
+		let Some(reason) = self.chain_listener.take_divergence() else {
+			return false;
+		};
+		log_error!(
+			self.logger,
+			"Halting CBF block application: {}. The node must be restarted to re-derive a common \
+			 chain state from the persisted listener heights.",
+			reason
+		);
+		// Publish the failure BEFORE flushing. The flush is an unbounded KV write; if it hangs, a
+		// `wait_until_synced` caller would otherwise block forever waiting for a state that is
+		// already decided. Signalling first makes the failure observable regardless.
+		self.sync_state_tx.send_replace(CbfSyncState::Failed(Error::TxSyncFailed));
+		// Persist what was applied before the divergence so the resume floor reflects it.
+		self.flush_chain_state().await;
+		true
+	}
+
+	/// Counts an applied block and flushes once the interval has elapsed.
+	async fn note_block_applied(&mut self) {
+		self.blocks_since_flush += 1;
+		if self.blocks_since_flush >= CBF_CHAIN_FLUSH_INTERVAL_BLOCKS {
+			self.flush_chain_state().await;
+		}
+	}
+
 	async fn run(mut self) {
+		// Defer the wallet's full-chain map write for as long as this applicator runs. Every path
+		// that leaves the catching-up state (`Synced`, `Failed`, and the periodic interval) flushes,
+		// so deferral never outlives a sync boundary.
+		self.chain_listener.onchain_wallet.set_bulk_chain_persistence(true).await;
+
 		while let Some(op) = self.ops_rx.recv().await {
 			match op {
 				ChainOp::ConnectFull { block: ib } => {
@@ -157,7 +237,11 @@ impl BlockApplicator {
 						continue;
 					}
 					self.chain_listener.block_connected(&ib.block, ib.height);
+					if self.fail_on_divergence().await {
+						return;
+					}
 					self.next_height += 1;
+					self.note_block_applied().await;
 					mark_syncing(&self.sync_state_tx);
 					if let Some(cache) = &self.block_fee_cache {
 						let fee_rate = coinbase_fee_rate(&ib.block, ib.height);
@@ -178,7 +262,11 @@ impl BlockApplicator {
 						continue;
 					}
 					self.chain_listener.filtered_block_connected(&header, &[], height);
+					if self.fail_on_divergence().await {
+						return;
+					}
 					self.next_height += 1;
+					self.note_block_applied().await;
 					mark_syncing(&self.sync_state_tx);
 				},
 				ChainOp::Disconnect { fork_point } => {
@@ -192,6 +280,9 @@ impl BlockApplicator {
 				ChainOp::Synced { tip_height } => {
 					log_info!(self.logger, "CBF caught up to tip {}", tip_height);
 					if self.next_height > tip_height {
+						// Reaching the tip is the durability boundary: write the deferred chain state
+						// before publishing, so the tip we advertise as applied is also persisted.
+						self.flush_chain_state().await;
 						self.publish_synced_tip(tip_height).await;
 					} else {
 						log_debug!(
@@ -205,10 +296,17 @@ impl BlockApplicator {
 				},
 				ChainOp::Failed { error } => {
 					log_info!(self.logger, "we received error chain op {}", error);
+					// Persist whatever we applied before the failure so the resume floor reflects it.
+					self.flush_chain_state().await;
 					self.sync_state_tx.send_replace(CbfSyncState::Failed(error));
 				},
 			}
 		}
+
+		// The channel closed, which is how a normal shutdown reaches us. Deferred chain state lives
+		// only in memory, so without this flush a clean stop would silently discard every block
+		// applied since the last interval flush and force them to be re-synced on next start.
+		self.flush_chain_state().await;
 	}
 
 	async fn publish_synced_tip(&self, tip_height: u32) {
@@ -373,7 +471,7 @@ impl CbfChainSource {
 			*status = CbfRuntimeStatus::Started { requester };
 		}
 
-		let (ops_tx, ops_rx) = mpsc::unbounded_channel();
+		let (ops_tx, ops_rx) = mpsc::channel(CBF_CHAIN_OP_QUEUE_DEPTH);
 		let block_fee_cache = match &self.fee_source {
 			FeeSource::Cbf { block_fee_cache } => Some(Arc::clone(block_fee_cache)),
 			_ => None,
@@ -385,6 +483,7 @@ impl CbfChainSource {
 		});
 		let block_applicator = BlockApplicator {
 			next_height: best_block_height + 1,
+			blocks_since_flush: 0,
 			sync_state_tx: self.sync_state_tx.clone(),
 			chain_listener: chain_listener.clone(),
 			ops_rx,
@@ -580,7 +679,7 @@ impl CbfChainSource {
 	async fn process_kyoto_events(
 		logger: Arc<Logger>, mut event_rx: mpsc::UnboundedReceiver<KyotoEvent>,
 		registered_scripts: Arc<Mutex<HashSet<ScriptBuf>>>,
-		cbf_runtime_status: Arc<Mutex<CbfRuntimeStatus>>, ops_tx: mpsc::UnboundedSender<ChainOp>,
+		cbf_runtime_status: Arc<Mutex<CbfRuntimeStatus>>, ops_tx: mpsc::Sender<ChainOp>,
 		onchain_wallet: Arc<Wallet>, sync_state_tx: watch::Sender<CbfSyncState>,
 	) {
 		while let Some(event) = event_rx.recv().await {
@@ -592,10 +691,17 @@ impl CbfChainSource {
 					// `synced_to_tip` that predates this block.
 					mark_syncing(&sync_state_tx);
 
-					let requester = match &*cbf_runtime_status.lock().expect("lock") {
-						CbfRuntimeStatus::Started { requester } => requester.clone(),
-						CbfRuntimeStatus::Stopped => {
-							let _ = ops_tx.send(ChainOp::Failed { error: Error::NotRunning });
+					// Copy the requester out and release the lock before any `.await` below: this is a
+					// `std::sync::Mutex`, so holding its guard across an await point would make this
+					// future non-`Send` and it could not be spawned.
+					let requester_opt = match &*cbf_runtime_status.lock().expect("lock") {
+						CbfRuntimeStatus::Started { requester } => Some(requester.clone()),
+						CbfRuntimeStatus::Stopped => None,
+					};
+					let requester = match requester_opt {
+						Some(requester) => requester,
+						None => {
+							let _ = ops_tx.send(ChainOp::Failed { error: Error::NotRunning }).await;
 							return;
 						},
 					};
@@ -622,8 +728,9 @@ impl CbfChainSource {
 										"Failed to obtain receiver for matched CBF block {}; node is stopped",
 										block_hash
 									);
-									let _ =
-										ops_tx.send(ChainOp::Failed { error: Error::NotRunning });
+									let _ = ops_tx
+										.send(ChainOp::Failed { error: Error::NotRunning })
+										.await;
 									return;
 								},
 							};
@@ -661,8 +768,9 @@ impl CbfChainSource {
 										reason,
 										CBF_BLOCK_FETCH_RETRIES
 									);
-									let _ =
-										ops_tx.send(ChainOp::Failed { error: Error::TxSyncFailed });
+									let _ = ops_tx
+										.send(ChainOp::Failed { error: Error::TxSyncFailed })
+										.await;
 									return;
 								},
 							}
@@ -674,7 +782,7 @@ impl CbfChainSource {
 							height: indexed_filter.height(),
 						}
 					};
-					if let Err(e) = ops_tx.send(chop) {
+					if let Err(e) = ops_tx.send(chop).await {
 						log_debug!(logger, "ops_rx gone: {}", e);
 					}
 				},
@@ -683,7 +791,8 @@ impl CbfChainSource {
 					//tip does NOT mean that we caught everything up, that's why we send a ChainOp,
 					//only processing of which means we processed all blocks up to the tip.
 					log_info!(logger, "Kyoto synced up to the tip {}", sync_update.tip().height);
-					let _ = ops_tx.send(ChainOp::Synced { tip_height: sync_update.tip().height });
+					let _ =
+						ops_tx.send(ChainOp::Synced { tip_height: sync_update.tip().height }).await;
 				},
 				KyotoEvent::ChainUpdate(BlockHeaderChanges::Connected(indexed_header)) => {
 					log_debug!(
@@ -702,7 +811,7 @@ impl CbfChainSource {
 							lowest.prev_blockhash(),
 							lowest.height.saturating_sub(1),
 						);
-						let _ = ops_tx.send(ChainOp::Disconnect { fork_point });
+						let _ = ops_tx.send(ChainOp::Disconnect { fork_point }).await;
 					}
 				},
 				KyotoEvent::ChainUpdate(BlockHeaderChanges::ForkAdded(fork)) => {
