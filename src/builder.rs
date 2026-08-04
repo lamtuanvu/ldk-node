@@ -547,7 +547,7 @@ impl NodeBuilder {
 	///
 	/// When enabled, the node will be able to send and receive custom gossip messages
 	/// containing metadata extensions to the standard Lightning gossip protocol.
-	/// 
+	///
 	/// Custom gossip messages use message type 32769 and can contain arbitrary metadata
 	/// up to 4096 bytes in length.
 	pub fn enable_custom_gossip(&mut self) -> &mut Self {
@@ -1152,7 +1152,7 @@ impl ArcedNodeBuilder {
 	///
 	/// When enabled, the node will be able to send and receive custom gossip messages
 	/// containing metadata extensions to the standard Lightning gossip protocol.
-	/// 
+	///
 	/// Custom gossip messages use message type 32769 and can contain arbitrary metadata
 	/// up to 4096 bytes in length.
 	pub fn enable_custom_gossip(&self) {

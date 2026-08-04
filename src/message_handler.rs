@@ -268,8 +268,11 @@ where
 			},
 			Self::Combined { liquidity_source, gossip_handler } => {
 				// Notify both handlers
-				let _ =
-					liquidity_source.liquidity_manager().peer_connected(their_node_id, msg, inbound);
+				let _ = liquidity_source.liquidity_manager().peer_connected(
+					their_node_id,
+					msg,
+					inbound,
+				);
 				gossip_handler.peer_connected(their_node_id, msg, inbound)
 			},
 		}

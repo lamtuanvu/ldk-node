@@ -17,8 +17,7 @@ use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::Secp256k1;
 use lightning::impl_writeable_tlv_based;
 use lightning::ln::channelmanager::{
-	Bolt11InvoiceParameters, OptionalBolt11PaymentParams, PaymentId,
-	MIN_FINAL_CLTV_EXPIRY_DELTA,
+	Bolt11InvoiceParameters, OptionalBolt11PaymentParams, PaymentId, MIN_FINAL_CLTV_EXPIRY_DELTA,
 };
 use lightning::ln::outbound_payment::{Bolt11PaymentError, Retry, RetryableSendFailure};
 use lightning::routing::router::{
@@ -44,7 +43,6 @@ use crate::payment::store::{
 use crate::peer_store::{PeerInfo, PeerStore};
 use crate::runtime::Runtime;
 use crate::types::{ChannelManager, KeysManager, PaymentStore};
-
 
 #[cfg(not(feature = "uniffi"))]
 type Bolt11Invoice = LdkBolt11Invoice;
@@ -89,8 +87,7 @@ pub struct Bolt11Payment {
 impl Bolt11Payment {
 	pub(crate) fn new(
 		runtime: Arc<Runtime>, channel_manager: Arc<ChannelManager>,
-		connection_manager: Arc<ConnectionManager<Arc<Logger>>>,
-		keys_manager: Arc<KeysManager>,
+		connection_manager: Arc<ConnectionManager<Arc<Logger>>>, keys_manager: Arc<KeysManager>,
 		liquidity_source: Arc<LiquiditySource<Arc<Logger>>>, payment_store: Arc<PaymentStore>,
 		peer_store: Arc<PeerStore<Arc<Logger>>>, config: Arc<Config>,
 		is_running: Arc<RwLock<bool>>, logger: Arc<Logger>,
@@ -678,8 +675,13 @@ impl Bolt11Payment {
 		route_hints: Vec<RouteHint>,
 	) -> Result<Bolt11Invoice, Error> {
 		let description = maybe_try_convert_enum(description)?;
-		let invoice =
-			self.receive_with_hints_inner(Some(amount_msat), &description, expiry_secs, None, route_hints)?;
+		let invoice = self.receive_with_hints_inner(
+			Some(amount_msat),
+			&description,
+			expiry_secs,
+			None,
+			route_hints,
+		)?;
 		Ok(maybe_wrap(invoice))
 	}
 
@@ -722,11 +724,7 @@ impl Bolt11Payment {
 					None,
 				)
 				.map_err(|e| {
-					log_error!(
-						self.logger,
-						"Failed to register inbound payment for hash: {:?}",
-						e
-					);
+					log_error!(self.logger, "Failed to register inbound payment for hash: {:?}", e);
 					Error::InvoiceCreationFailed
 				})?;
 			(manual_hash, secret, metadata)
@@ -758,8 +756,7 @@ impl Bolt11Payment {
 		}
 
 		if let Some(amount_msat) = amount_msat {
-			invoice_builder =
-				invoice_builder.amount_milli_satoshis(amount_msat).basic_mpp();
+			invoice_builder = invoice_builder.amount_milli_satoshis(amount_msat).basic_mpp();
 		}
 
 		let invoice = invoice_builder
