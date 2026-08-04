@@ -1099,13 +1099,172 @@ fn resume_checkpoint(logger: &Logger, chain_listener: &ChainListener) -> Option<
 
 	// Walk BDK's checkpoint chain back to the reorg-safe anchor height.
 	let target_height = min_best_block.height.saturating_sub(REORG_SAFETY_BLOCKS);
-	let mut cursor = bdk_cp;
-	while cursor.height() > target_height {
-		match cursor.prev() {
-			Some(prev) => cursor = prev,
-			None => break,
-		}
+	let cursor = resume_anchor(bdk_cp, target_height);
+
+	if cursor.height() > min_best_block.height {
+		// The wallet's lowest usable checkpoint sits above a listener (e.g. a wallet anchored
+		// at its birthday next to Lightning state persisted below it). Anchoring kyoto there
+		// would make it emit only blocks the applicator refuses to apply — `next_height`
+		// derives from the *minimum* listener — stalling sync forever without ever tripping
+		// the divergence gate. Fall back to a full scan so the lagging listener can catch up.
+		log_error!(
+			logger,
+			"CBF resume: wallet's lowest usable checkpoint (height {}) is above the \
+			 furthest-behind listener (height {}); falling back to a scan from genesis.",
+			cursor.height(),
+			min_best_block.height,
+		);
+		return None;
 	}
 
 	(cursor.height() > 0).then(|| HashCheckpoint::new(cursor.height(), cursor.hash()))
+}
+
+/// Walks `bdk_cp` back toward `target_height` without ever stepping onto genesis.
+///
+/// On a dense chain this lands on the checkpoint at `target_height`, exactly like a plain
+/// walk. The genesis guard matters for sparse chains — most importantly a fresh wallet whose
+/// only real anchor is its birthday checkpoint (`[genesis, birthday]`): stepping onto genesis
+/// there would make [`resume_checkpoint`] return `None` and silently demote the node to a full
+/// filter scan from block 1, with every block below the birthday discarded on arrival.
+fn resume_anchor(bdk_cp: bdk_chain::CheckPoint, target_height: u32) -> bdk_chain::CheckPoint {
+	let mut cursor = bdk_cp;
+	while cursor.height() > target_height {
+		match cursor.prev() {
+			Some(prev) if prev.height() > 0 => cursor = prev,
+			_ => break,
+		}
+	}
+	cursor
+}
+
+/// Returns the highest checkpoint compiled into the `bip157` crate strictly below
+/// `first_scan_height`, or `None` when the wallet should root at genesis.
+///
+/// Strictly below, because everything downstream — the initial BDK checkpoint, the listeners'
+/// best block, kyoto's `ChainState::Checkpoint` — treats the anchor as already applied, and
+/// scanning begins at the block after it. An anchor *at* `first_scan_height` would silently
+/// skip that block's filters, losing a transaction confirmed exactly there.
+///
+/// Only compiled-in constants are used: CBF has no chain backend at build time, and consulting
+/// a third-party tip oracle would reintroduce exactly the dependency this chain source removes.
+/// Rounding down can only extend the scanned range, never shrink it. Mainnet ships two such
+/// anchors — 481,823 (one block before SegWit activation) and 709,631 (one block before taproot
+/// activation); all other networks resolve to `None`.
+pub(crate) fn birthday_checkpoint(
+	network: Network, first_scan_height: u32,
+) -> Option<HashCheckpoint> {
+	if network != Network::Bitcoin {
+		return None;
+	}
+	[HashCheckpoint::segwit_activation(), HashCheckpoint::taproot_activation()]
+		.into_iter()
+		.filter(|cp| cp.height < first_scan_height)
+		.max_by_key(|cp| cp.height)
+}
+
+/// Resolves a configured `wallet_rescan_from_height` into the initial chain tip handed to the
+/// builder, logging the anchor and its provenance.
+///
+/// The returned locator seeds the initial BDK checkpoint of a wallet whose persisted chain
+/// state is still rooted at genesis, the best block of a freshly created `ChannelManager` and
+/// sweeper, and — through them — kyoto's resume checkpoint and the block applicator's
+/// `next_height`. A wallet with a persisted block is never rewound, but absent Lightning
+/// components are still initialized from it.
+pub(crate) fn resolve_birthday(
+	logger: &Logger, network: Network, wallet_rescan_from_height: Option<u32>,
+) -> Option<BlockLocator> {
+	let requested = wallet_rescan_from_height?;
+	match birthday_checkpoint(network, requested) {
+		Some(cp) => {
+			let provenance = if cp.height == HashCheckpoint::taproot_activation().height {
+				"bip157 taproot_activation constant"
+			} else {
+				"bip157 segwit_activation constant"
+			};
+			log_info!(
+				logger,
+				"CBF wallet birthday: requested height {} resolved to compiled checkpoint at \
+				 height {} (hash {}, {}); scanning starts at height {}. Applied only while the \
+				 wallet's persisted chain state is still rooted at genesis.",
+				requested,
+				cp.height,
+				cp.hash,
+				provenance,
+				cp.height + 1,
+			);
+			Some(BlockLocator::new(cp.hash, cp.height))
+		},
+		None => {
+			log_info!(
+				logger,
+				"CBF wallet birthday: no compiled checkpoint strictly below requested height {} \
+				 on {}; a fresh wallet will scan from genesis.",
+				requested,
+				network,
+			);
+			None
+		},
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use bitcoin::hashes::Hash;
+
+	#[test]
+	fn birthday_anchors_strictly_below_the_first_scan_height() {
+		let taproot = HashCheckpoint::taproot_activation();
+		let segwit = HashCheckpoint::segwit_activation();
+
+		assert_eq!(birthday_checkpoint(Network::Bitcoin, u32::MAX), Some(taproot));
+		assert_eq!(birthday_checkpoint(Network::Bitcoin, 900_000), Some(taproot));
+		assert_eq!(birthday_checkpoint(Network::Bitcoin, taproot.height + 1), Some(taproot));
+		// Scanning starts strictly after the anchor, so a first transaction exactly at a
+		// compiled anchor height must fall through to the next-lower anchor or that block's
+		// filters would never be checked.
+		assert_eq!(birthday_checkpoint(Network::Bitcoin, taproot.height), Some(segwit));
+		assert_eq!(birthday_checkpoint(Network::Bitcoin, segwit.height + 1), Some(segwit));
+		assert_eq!(birthday_checkpoint(Network::Bitcoin, segwit.height), None);
+		assert_eq!(birthday_checkpoint(Network::Bitcoin, 0), None);
+	}
+
+	#[test]
+	fn birthday_is_mainnet_only() {
+		for network in [Network::Testnet, Network::Signet, Network::Regtest] {
+			assert_eq!(birthday_checkpoint(network, u32::MAX), None);
+		}
+	}
+
+	fn chain_of(heights: &[u32]) -> bdk_chain::CheckPoint {
+		bdk_chain::CheckPoint::from_block_ids(
+			heights
+				.iter()
+				.map(|h| bdk_chain::BlockId { height: *h, hash: bitcoin::BlockHash::all_zeros() }),
+		)
+		.expect("strictly increasing heights")
+	}
+
+	#[test]
+	fn resume_anchor_walks_dense_chains_to_the_target() {
+		let heights: Vec<u32> = (0..=10).collect();
+		let cp = chain_of(&heights);
+		assert_eq!(resume_anchor(cp.clone(), 3).height(), 3);
+		assert_eq!(resume_anchor(cp.clone(), 10).height(), 10);
+		// Target 0 stops at height 1: the anchor never falls onto genesis.
+		assert_eq!(resume_anchor(cp, 0).height(), 1);
+	}
+
+	#[test]
+	fn resume_anchor_never_falls_onto_genesis_on_sparse_chains() {
+		// A fresh wallet with a birthday checkpoint: [genesis, birthday]. The reorg-safety
+		// walk-back must anchor on the birthday, not slide onto genesis and force a full
+		// scan from block 1.
+		let cp = chain_of(&[0, 709_631]);
+		assert_eq!(resume_anchor(cp, 709_624).height(), 709_631);
+
+		let genesis_only = chain_of(&[0]);
+		assert_eq!(resume_anchor(genesis_only, 0).height(), 0);
+	}
 }

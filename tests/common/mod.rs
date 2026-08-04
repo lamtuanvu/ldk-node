@@ -726,7 +726,7 @@ pub(crate) fn setup_node(chain_source: &TestChainSource, config: TestConfig) -> 
 		TestChainSource::Cbf(bitcoind) => {
 			let p2p_socket = bitcoind.params.p2p_socket.expect("P2P must be enabled for CBF");
 			let peer_addr = format!("{}", p2p_socket);
-			builder.set_chain_source_cbf(vec![peer_addr], None);
+			builder.set_chain_source_cbf(vec![peer_addr], None, config.wallet_rescan_from_height);
 		},
 	}
 

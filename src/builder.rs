@@ -72,7 +72,7 @@ use crate::io::{
 };
 use crate::liquidity::{LSPS2ServiceConfig, LiquiditySourceBuilder, LspConfig};
 use crate::lnurl_auth::LnurlAuth;
-use crate::logger::{log_error, LdkLogger, LogLevel, LogWriter, Logger};
+use crate::logger::{log_error, log_info, LdkLogger, LogLevel, LogWriter, Logger};
 use crate::message_handler::NodeCustomMessageHandler;
 use crate::payment::asynchronous::om_mailbox::OnionMessageMailbox;
 use crate::peer_store::PeerStore;
@@ -116,6 +116,7 @@ enum ChainDataSourceConfig {
 	Cbf {
 		peers: Vec<String>,
 		fee_source_config: Option<CbfFeeSourceConfig>,
+		wallet_rescan_from_height: Option<u32>,
 	},
 }
 
@@ -409,11 +410,30 @@ impl NodeBuilder {
 	///
 	/// `fee_source_config` optionally delegates fee estimation to an Esplora or Electrum server;
 	/// if `None`, fee rates are derived from recent blocks.
+	///
+	/// `wallet_rescan_from_height` is an optional wallet birthday: the lowest height whose block
+	/// the wallet must still scan. It applies only while the wallet's persisted chain state is
+	/// still rooted at genesis; a wallet with a persisted block is never rewound. Because no
+	/// chain backend is reachable at build time, the wallet is anchored on the highest
+	/// checkpoint compiled into the `bip157` crate *strictly below* the given height — scanning
+	/// starts at the block after the anchor, so the block at the given height is always scanned
+	/// (heights at or below the lowest anchor fall back to a full scan from block 1; the
+	/// genesis block itself is unspendable by consensus and needs no scan). Mainnet anchors are
+	/// 481,823 (one block before SegWit activation) and 709,631 (one block before taproot
+	/// activation). On all other networks a fresh wallet scans from genesis. Passing `None`
+	/// also scans from genesis — unlike the Bitcoin Core sources, where `None` anchors at the
+	/// current tip — because CBF has no trusted tip oracle at build time and anchoring lower is
+	/// the only direction that cannot skip wallet history. For a restored seed with older
+	/// on-chain activity, pass a height at or below its first transaction (or `None`).
 	pub fn set_chain_source_cbf(
 		&mut self, peers: Vec<String>, fee_source_config: Option<CbfFeeSourceConfig>,
+		wallet_rescan_from_height: Option<u32>,
 	) -> &mut Self {
-		self.chain_data_source_config =
-			Some(ChainDataSourceConfig::Cbf { peers, fee_source_config });
+		self.chain_data_source_config = Some(ChainDataSourceConfig::Cbf {
+			peers,
+			fee_source_config,
+			wallet_rescan_from_height,
+		});
 		self
 	}
 
@@ -1560,9 +1580,14 @@ fn build_with_store_internal(
 				Arc::clone(&node_metrics),
 			)
 		},
-		Some(ChainDataSourceConfig::Cbf { peers, fee_source_config }) => ChainSource::new_cbf(
+		Some(ChainDataSourceConfig::Cbf {
+			peers,
+			fee_source_config,
+			wallet_rescan_from_height,
+		}) => ChainSource::new_cbf(
 			peers.clone(),
 			fee_source_config.clone(),
+			*wallet_rescan_from_height,
 			Arc::clone(&runtime),
 			Arc::clone(&fee_estimator),
 			Arc::clone(&tx_broadcaster),
@@ -1680,12 +1705,55 @@ fn build_with_store_internal(
 			},
 		})?;
 	let bdk_wallet = match wallet_opt {
-		Some(wallet) => {
-			// `wallet_rescan_from_height`, when set, is fresh-wallet-only. Rewinding a
-			// persisted wallet is not just replacing BDK's best block: its local-chain and
+		Some(mut wallet) => {
+			// `wallet_rescan_from_height`, when set, applies only while the wallet's
+			// persisted chain state is still rooted at genesis. Rewinding a wallet with a
+			// persisted block is not just replacing BDK's best block: its local-chain and
 			// tx-graph changesets are already persisted, and LDK state may also have synced
 			// to a later tip. A safe rewind needs an explicit recovery flow that invalidates
 			// all dependent state before replaying blocks.
+			//
+			// One exception heals the crash window between wallet creation and the initial
+			// checkpoint persist: a CBF wallet whose chain state never persisted a block
+			// past genesis is re-anchored at the compiled birthday checkpoint. The
+			// anchor is a deterministic constant, so this is exactly the checkpoint the
+			// wallet received at creation; without it, listeners already persisted at the
+			// birthday would latch divergence against the genesis-rooted wallet on every
+			// subsequent start.
+			if wallet.latest_checkpoint().height() == 0
+				&& matches!(chain_data_source_config, Some(ChainDataSourceConfig::Cbf { .. }))
+			{
+				if let Some(best_block) = chain_tip_opt {
+					let block_id = bdk_chain::BlockId {
+						height: best_block.height,
+						hash: best_block.block_hash,
+					};
+					let latest_checkpoint = wallet.latest_checkpoint().insert(block_id);
+					let update =
+						bdk_wallet::Update { chain: Some(latest_checkpoint), ..Default::default() };
+					wallet.apply_update(update).map_err(|e| {
+						log_error!(
+							logger,
+							"Failed to re-apply the wallet birthday checkpoint: {}",
+							e
+						);
+						BuildError::WalletSetupFailed
+					})?;
+					runtime.block_on(wallet.persist_async(&mut wallet_persister)).map_err(|e| {
+						log_error!(
+							logger,
+							"Failed to persist the wallet birthday checkpoint: {}",
+							e
+						);
+						BuildError::WalletSetupFailed
+					})?;
+					log_info!(
+						logger,
+						"Re-anchored an unscanned wallet at the configured CBF birthday (height {}).",
+						best_block.height
+					);
+				}
+			}
 			wallet
 		},
 		None => {
@@ -1778,6 +1846,14 @@ fn build_with_store_internal(
 					bdk_wallet::Update { chain: Some(latest_checkpoint), ..Default::default() };
 				wallet.apply_update(update).map_err(|e| {
 					log_error!(logger, "Failed to apply checkpoint during wallet setup: {}", e);
+					BuildError::WalletSetupFailed
+				})?;
+				// `apply_update` only stages the checkpoint. Persist it now: a crash before
+				// the first persisted block would otherwise resurrect a genesis-rooted
+				// wallet next to listeners already initialized at the checkpoint, which the
+				// CBF divergence gate then latches on every subsequent start.
+				runtime.block_on(wallet.persist_async(&mut wallet_persister)).map_err(|e| {
+					log_error!(logger, "Failed to persist checkpoint during wallet setup: {}", e);
 					BuildError::WalletSetupFailed
 				})?;
 			}

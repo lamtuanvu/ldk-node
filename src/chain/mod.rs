@@ -245,11 +245,14 @@ impl ChainSource {
 	}
 
 	pub(crate) fn new_cbf(
-		peers: Vec<String>, fee_source_config: Option<CbfFeeSourceConfig>, runtime: Arc<Runtime>,
+		peers: Vec<String>, fee_source_config: Option<CbfFeeSourceConfig>,
+		wallet_rescan_from_height: Option<u32>, runtime: Arc<Runtime>,
 		fee_estimator: Arc<OnchainFeeEstimator>, tx_broadcaster: Arc<Broadcaster>,
 		kv_store: Arc<DynStore>, config: Arc<Config>, logger: Arc<Logger>,
 		node_metrics: Arc<PersistedNodeMetrics>,
 	) -> Result<(Self, Option<BlockLocator>), Error> {
+		let birthday_tip =
+			cbf::resolve_birthday(&logger, config.network, wallet_rescan_from_height);
 		let cbf_chain_source = CbfChainSource::new(
 			peers,
 			fee_source_config,
@@ -262,7 +265,7 @@ impl ChainSource {
 		)?;
 		let kind = ChainSourceKind::Cbf(cbf_chain_source);
 		let registered_txids = Mutex::new(HashSet::new());
-		Ok((Self { kind, registered_txids, tx_broadcaster, logger }, None))
+		Ok((Self { kind, registered_txids, tx_broadcaster, logger }, birthday_tip))
 	}
 
 	pub(crate) fn start(
