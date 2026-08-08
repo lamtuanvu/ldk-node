@@ -381,18 +381,62 @@ enum FeeSource {
 	Electrum { server_url: String },
 }
 
+/// Result of parsing a single configured trusted-peer entry (`ip:port` or `host:port`).
+///
+/// Kept distinct from [`TrustedPeer`] so the parse step is unit-testable without depending on
+/// kyoto's internal representation; [`ParsedPeer::into_trusted_peer`] converts to the real type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ParsedPeer {
+	/// A literal IPv4/IPv6 socket address.
+	Addr(SocketAddr),
+	/// A hostname/port pair. Resolution happens at kyoto connect time, not here.
+	Hostname { host: String, port: u16 },
+}
+
+impl ParsedPeer {
+	fn into_trusted_peer(self) -> TrustedPeer {
+		match self {
+			ParsedPeer::Addr(addr) => TrustedPeer::from_socket_addr(addr),
+			ParsedPeer::Hostname { host, port } => TrustedPeer::from_hostname(host, port),
+		}
+	}
+}
+
+/// Parses a single configured CBF trusted-peer entry.
+///
+/// Tries a literal `SocketAddr` first (covers IPv4/IPv6). On failure, splits on the last `:`
+/// and treats the left side as a hostname to be resolved at kyoto connect time via
+/// [`TrustedPeer::from_hostname`] (backed by [`tokio::net::lookup_host`]). Returns `Err` for
+/// entries with no parseable port, rather than silently dropping them — a mistyped peer should
+/// surface as a startup error, not vanish from the trusted-peer list.
+fn parse_trusted_peer(peer_str: &str) -> Result<ParsedPeer, Error> {
+	if let Ok(addr) = peer_str.parse::<SocketAddr>() {
+		return Ok(ParsedPeer::Addr(addr));
+	}
+
+	let (host, port_str) = peer_str.rsplit_once(':').ok_or(Error::InvalidSocketAddress)?;
+	if host.is_empty() {
+		return Err(Error::InvalidSocketAddress);
+	}
+	let port: u16 = port_str.parse().map_err(|_| Error::InvalidSocketAddress)?;
+
+	Ok(ParsedPeer::Hostname { host: host.to_string(), port })
+}
+
 impl CbfChainSource {
 	pub(crate) fn new(
 		peers: Vec<String>, fee_source_config: Option<CbfFeeSourceConfig>, runtime: Arc<Runtime>,
 		fee_estimator: Arc<OnchainFeeEstimator>, kv_store: Arc<DynStore>, config: Arc<Config>,
 		logger: Arc<Logger>, node_metrics: Arc<PersistedNodeMetrics>,
 	) -> Result<Self, Error> {
-		let trusted_peers: Vec<TrustedPeer> = peers
-			.iter()
-			.filter_map(|peer_str| {
-				peer_str.parse::<SocketAddr>().ok().map(TrustedPeer::from_socket_addr)
-			})
-			.collect();
+		let mut trusted_peers = Vec::with_capacity(peers.len());
+		for peer_str in &peers {
+			let parsed = parse_trusted_peer(peer_str).map_err(|e| {
+				log_error!(logger, "Invalid CBF trusted peer '{}': {}", peer_str, e);
+				e
+			})?;
+			trusted_peers.push(parsed.into_trusted_peer());
+		}
 
 		let fee_source = match fee_source_config {
 			Some(CbfFeeSourceConfig::Esplora(server_url)) => {
@@ -1222,6 +1266,18 @@ pub(crate) fn resolve_birthday(
 mod tests {
 	use super::*;
 	use bitcoin::hashes::Hash;
+
+	#[test]
+	fn parse_peer_accepts_hostname() {
+		let p = parse_trusted_peer("bitcoind.local:18444").expect("hostname peer");
+		// shape assertion only — resolution happens at connect time
+		assert!(
+			matches!(p, ParsedPeer::Hostname { ref host, port } if host == "bitcoind.local" && port == 18444)
+		);
+		let p2 = parse_trusted_peer("127.0.0.1:18444").expect("socketaddr peer");
+		assert!(matches!(p2, ParsedPeer::Addr(_)));
+		assert!(parse_trusted_peer("no-port-here").is_err());
+	}
 
 	#[test]
 	fn birthday_anchors_strictly_below_the_first_scan_height() {
