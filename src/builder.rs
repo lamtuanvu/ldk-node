@@ -45,7 +45,7 @@ use lightning::util::sweep::OutputSweeper;
 use lightning_dns_resolver::OMDomainResolver;
 use vss_client::headers::VssHeaderProvider;
 
-use crate::chain::{CbfFeeSourceConfig, ChainSource};
+use crate::chain::{CbfFeeSourceConfig, ChainServiceHooks, ChainSource};
 use crate::config::{
 	default_user_config, may_announce_channel, AnnounceError, AsyncPaymentsRole,
 	BitcoindRestClientConfig, Config, ElectrumSyncConfig, EsploraSyncConfig, HRNResolverConfig,
@@ -311,6 +311,7 @@ impl std::error::Error for BuildError {}
 pub struct NodeBuilder {
 	config: Config,
 	chain_data_source_config: Option<ChainDataSourceConfig>,
+	cbf_chain_service_hooks: ChainServiceHooks,
 	gossip_source_config: Option<GossipSourceConfig>,
 	liquidity_source_config: Option<LiquiditySourceConfig>,
 	log_writer_config: Option<LogWriterConfig>,
@@ -341,6 +342,7 @@ impl NodeBuilder {
 		Self {
 			config,
 			chain_data_source_config,
+			cbf_chain_service_hooks: ChainServiceHooks::default(),
 			gossip_source_config,
 			liquidity_source_config,
 			log_writer_config,
@@ -434,6 +436,25 @@ impl NodeBuilder {
 			fee_source_config,
 			wallet_rescan_from_height,
 		});
+		self
+	}
+
+	/// Configures app-supplied external chain-service hooks for the CBF chain source.
+	///
+	/// `hooks.fee_estimates`, if set, is tried before CBF's own fee estimation (native
+	/// block-derived, or the [`CbfFeeSourceConfig`] passed to [`set_chain_source_cbf`]) on every
+	/// fee-update cycle; an `Err` result (or no hook at all) falls through to that configured
+	/// behavior unchanged. `hooks.broadcast`, if set, is tried before CBF's P2P broadcast on
+	/// every outgoing transaction package; an `Err` result (or no hook at all) falls through to
+	/// P2P broadcast unchanged.
+	///
+	/// Only meaningful when paired with [`set_chain_source_cbf`]; a no-op for every other chain
+	/// source. This is intentionally payment-agnostic: the fork never learns anything about how
+	/// (or whether) a hook is backed by L402 or any other payment protocol.
+	///
+	/// [`set_chain_source_cbf`]: Self::set_chain_source_cbf
+	pub fn set_cbf_chain_service_hooks(&mut self, hooks: ChainServiceHooks) -> &mut Self {
+		self.cbf_chain_service_hooks = hooks;
 		self
 	}
 
@@ -950,6 +971,7 @@ impl NodeBuilder {
 		build_with_store_internal(
 			config,
 			self.chain_data_source_config.as_ref(),
+			self.cbf_chain_service_hooks.clone(),
 			self.gossip_source_config.as_ref(),
 			self.liquidity_source_config.as_ref(),
 			self.pathfinding_scores_sync_config.as_ref(),
@@ -1465,7 +1487,7 @@ impl ArcedNodeBuilder {
 /// Builds a [`Node`] instance according to the options previously configured.
 fn build_with_store_internal(
 	config: Arc<Config>, chain_data_source_config: Option<&ChainDataSourceConfig>,
-	gossip_source_config: Option<&GossipSourceConfig>,
+	cbf_chain_service_hooks: ChainServiceHooks, gossip_source_config: Option<&GossipSourceConfig>,
 	liquidity_source_config: Option<&LiquiditySourceConfig>,
 	pathfinding_scores_sync_config: Option<&PathfindingScoresSyncConfig>,
 	probing_config: Option<&ProbingConfig>, async_payments_role: Option<AsyncPaymentsRole>,
@@ -1595,6 +1617,7 @@ fn build_with_store_internal(
 			Arc::clone(&config),
 			Arc::clone(&logger),
 			Arc::clone(&node_metrics),
+			cbf_chain_service_hooks.clone(),
 		)
 		.map_err(|_| BuildError::ChainSourceSetupFailed)?,
 		Some(ChainDataSourceConfig::Bitcoind {

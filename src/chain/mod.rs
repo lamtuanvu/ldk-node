@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use bitcoin::{Script, Txid};
+use bitcoin::{Script, Transaction, Txid};
 use lightning::chain::{BlockLocator, Filter};
 
 use crate::chain::bitcoind::{BitcoindChainSource, ChainListener, UtxoSourceClient};
@@ -127,6 +127,41 @@ pub enum CbfFeeSourceConfig {
 	Esplora(String),
 	/// Use an Electrum server for fee rate estimation.
 	Electrum(String),
+}
+
+/// A future resolving to per-conf-target (blocks) fee estimates in sat/vB, or `Err(())` if the
+/// external chain service could not provide them this cycle.
+pub type FeeEstimatesFuture = std::pin::Pin<
+	Box<dyn std::future::Future<Output = Result<std::collections::HashMap<u16, f64>, ()>> + Send>,
+>;
+/// A future resolving to `Ok(())` if the external chain service accepted a raw-tx broadcast, or
+/// `Err(())` to fall back to the node's own P2P broadcast.
+pub type BroadcastFuture =
+	std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ()>> + Send>>;
+
+/// App-supplied hooks that let an external chain service short-circuit the CBF chain source's
+/// native fee estimation and P2P transaction broadcast.
+///
+/// Only meaningful when paired with the CBF chain source (see
+/// [`crate::builder::NodeBuilder::set_cbf_chain_service_hooks`]); ignored for every other chain
+/// source. This type is payment-agnostic — the fork never learns about L402, or any other
+/// payment protocol a caller might use to obtain fee data or relay a broadcast.
+#[derive(Clone, Default)]
+pub struct ChainServiceHooks {
+	/// conf-target (blocks) → sat/vB. Err/None → fall through to fee_source / block-derived.
+	pub fee_estimates: Option<std::sync::Arc<dyn Fn() -> FeeEstimatesFuture + Send + Sync>>,
+	/// Attempt external broadcast of raw txs. Err → fall through to P2P broadcast.
+	pub broadcast:
+		Option<std::sync::Arc<dyn Fn(Vec<Transaction>) -> BroadcastFuture + Send + Sync>>,
+}
+
+impl std::fmt::Debug for ChainServiceHooks {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("ChainServiceHooks")
+			.field("fee_estimates", &self.fee_estimates.is_some())
+			.field("broadcast", &self.broadcast.is_some())
+			.finish()
+	}
 }
 
 pub(crate) struct ChainSource {
@@ -254,7 +289,7 @@ impl ChainSource {
 		wallet_rescan_from_height: Option<u32>, runtime: Arc<Runtime>,
 		fee_estimator: Arc<OnchainFeeEstimator>, tx_broadcaster: Arc<Broadcaster>,
 		kv_store: Arc<DynStore>, config: Arc<Config>, logger: Arc<Logger>,
-		node_metrics: Arc<PersistedNodeMetrics>,
+		node_metrics: Arc<PersistedNodeMetrics>, chain_service_hooks: ChainServiceHooks,
 	) -> Result<(Self, Option<BlockLocator>), Error> {
 		let birthday_tip =
 			cbf::resolve_birthday(&logger, config.network, wallet_rescan_from_height);
@@ -267,6 +302,7 @@ impl ChainSource {
 			Arc::clone(&config),
 			Arc::clone(&logger),
 			Arc::clone(&node_metrics),
+			chain_service_hooks,
 		)?;
 		let kind = ChainSourceKind::Cbf(cbf_chain_source);
 		let registered_txids = Mutex::new(HashSet::new());

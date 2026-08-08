@@ -17,7 +17,7 @@ use tokio::sync::{mpsc, watch};
 
 use crate::chain::bitcoind::ChainListener;
 use crate::chain::electrum::get_electrum_fee_rate_cache_update;
-use crate::chain::CbfFeeSourceConfig;
+use crate::chain::{CbfFeeSourceConfig, ChainServiceHooks};
 use crate::config::{Config, DEFAULT_FEE_RATE_CACHE_UPDATE_INTERVAL_SECS};
 use crate::error::Error;
 use crate::fee_estimator::{
@@ -139,6 +139,9 @@ pub struct CbfChainSource {
 	kv_store: Arc<DynStore>,
 	node_metrics: Arc<PersistedNodeMetrics>,
 	logger: Arc<Logger>,
+	/// App-supplied external chain-service hooks (fee estimates / broadcast); empty (no-op)
+	/// unless configured via [`crate::builder::NodeBuilder::set_cbf_chain_service_hooks`].
+	hooks: ChainServiceHooks,
 }
 
 #[derive(Debug)]
@@ -423,11 +426,93 @@ fn parse_trusted_peer(peer_str: &str) -> Result<ParsedPeer, Error> {
 	Ok(ParsedPeer::Hostname { host: host.to_string(), port })
 }
 
+/// Resolves the per-target fee-rate cache for a single fee-update cycle.
+///
+/// If `hooks.fee_estimates` is configured, it is tried first: an `Ok(by_blocks)` map (keyed by
+/// conf-target in blocks, valued in sat/vB) is converted into the estimator's internal
+/// per-[`ConfirmationTarget`] cache and returned WITHOUT calling `fallback`. A target whose
+/// block count is absent from `by_blocks` is simply omitted from the returned cache — reads for
+/// that target fall back to [`OnchainFeeEstimator`]'s own per-target static fallback, exactly as
+/// they do today when the cache has never been populated for it.
+///
+/// An `Err(())` result (or no hook configured at all) falls through to `fallback` — the
+/// existing (Esplora / Electrum / native-CBF) fee computation, unchanged.
+///
+/// A free function (not a method) so it is unit-testable with a fake hook and a fake fallback,
+/// without a live kyoto node.
+async fn resolve_fee_estimates<F, Fut>(
+	hooks: &ChainServiceHooks, logger: &Logger, fallback: F,
+) -> Result<HashMap<ConfirmationTarget, FeeRate>, Error>
+where
+	F: FnOnce() -> Fut,
+	Fut: std::future::Future<Output = Result<HashMap<ConfirmationTarget, FeeRate>, Error>>,
+{
+	if let Some(hook) = hooks.fee_estimates.as_ref() {
+		match hook().await {
+			Ok(by_blocks) => {
+				let mut cache = HashMap::with_capacity(10);
+				for target in get_all_conf_targets() {
+					let num_blocks = get_num_block_defaults_for_target(target) as u16;
+					if let Some(&sat_per_vb) = by_blocks.get(&num_blocks) {
+						// sat/vB -> sat/kwu: 1 vB = 4 WU, 1 kwu = 1000 WU, so *1000/4 == *250.
+						let sat_per_kwu = (sat_per_vb * 250.0).max(1.0) as u64;
+						let fee_rate = FeeRate::from_sat_per_kwu(sat_per_kwu);
+						cache.insert(target, apply_post_estimation_adjustments(target, fee_rate));
+					}
+				}
+				return Ok(cache);
+			},
+			Err(()) => {
+				log_debug!(
+					logger,
+					"External chain-service fee-estimates hook declined; falling back to the \
+					 configured fee source."
+				);
+			},
+		}
+	}
+	fallback().await
+}
+
+/// Outcome of trying the app-supplied broadcast hook before falling back to P2P.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BroadcastOutcome {
+	/// The hook accepted the package; P2P broadcast was not used.
+	HookHandled,
+	/// No hook configured, or the hook declined (`Err(())`); P2P broadcast handled it.
+	FellThroughToP2p,
+}
+
+/// Tries the app-supplied broadcast hook before falling back to the node's own P2P broadcast.
+///
+/// If `hooks.broadcast` is configured, it is called with the package's transactions: `Ok(())`
+/// means the external service accepted the broadcast, so `p2p_send` is NOT called. `Err(())` (or
+/// no hook configured at all) falls through to `p2p_send` — the existing kyoto
+/// `submit_package`/per-tx broadcast path, unchanged.
+///
+/// A free function (not a method) so it is unit-testable with a fake hook and a fake
+/// `p2p_send`, without a live kyoto node.
+async fn dispatch_broadcast<F, Fut>(
+	hooks: &ChainServiceHooks, txs: Vec<Transaction>, p2p_send: F,
+) -> BroadcastOutcome
+where
+	F: FnOnce(Vec<Transaction>) -> Fut,
+	Fut: std::future::Future<Output = ()>,
+{
+	if let Some(hook) = hooks.broadcast.as_ref() {
+		if hook(txs.clone()).await.is_ok() {
+			return BroadcastOutcome::HookHandled;
+		}
+	}
+	p2p_send(txs).await;
+	BroadcastOutcome::FellThroughToP2p
+}
+
 impl CbfChainSource {
 	pub(crate) fn new(
 		peers: Vec<String>, fee_source_config: Option<CbfFeeSourceConfig>, runtime: Arc<Runtime>,
 		fee_estimator: Arc<OnchainFeeEstimator>, kv_store: Arc<DynStore>, config: Arc<Config>,
-		logger: Arc<Logger>, node_metrics: Arc<PersistedNodeMetrics>,
+		logger: Arc<Logger>, node_metrics: Arc<PersistedNodeMetrics>, hooks: ChainServiceHooks,
 	) -> Result<Self, Error> {
 		let mut trusted_peers = Vec::with_capacity(peers.len());
 		for peer_str in &peers {
@@ -467,6 +552,7 @@ impl CbfChainSource {
 			kv_store,
 			node_metrics,
 			logger,
+			hooks,
 		})
 	}
 
@@ -908,6 +994,20 @@ impl CbfChainSource {
 	}
 
 	pub(crate) async fn update_fee_rate_estimates(&self) -> Result<(), Error> {
+		let new_fee_rate_cache =
+			resolve_fee_estimates(&self.hooks, &self.logger, || self.fee_rate_cache_from_source())
+				.await?;
+
+		self.commit_fee_rate_cache(new_fee_rate_cache).await
+	}
+
+	/// The existing (Esplora / Electrum / native-CBF) fee computation, unchanged from before the
+	/// [`ChainServiceHooks`] fee-estimates hook was introduced. Called by
+	/// [`update_fee_rate_estimates`](Self::update_fee_rate_estimates) as the `fallback` passed to
+	/// [`resolve_fee_estimates`].
+	async fn fee_rate_cache_from_source(
+		&self,
+	) -> Result<HashMap<ConfirmationTarget, FeeRate>, Error> {
 		let new_fee_rate_cache = match &self.fee_source {
 			FeeSource::Esplora { client } => {
 				let estimates = client.get_fee_estimates().await.map_err(|e| {
@@ -999,7 +1099,7 @@ impl CbfChainSource {
 			},
 		};
 
-		self.commit_fee_rate_cache(new_fee_rate_cache).await
+		Ok(new_fee_rate_cache)
 	}
 
 	/// Writes a freshly computed per-target fee-rate map into the estimator cache and records the
@@ -1025,26 +1125,33 @@ impl CbfChainSource {
 				return;
 			},
 		};
+		let logger = Arc::clone(&self.logger);
 
-		match Package::from_vec(package.clone()) {
-			Ok(package) => {
-				if let Err(e) = requester.submit_package(package).await {
-					log_error!(self.logger, "Failed to broadcast transaction package: {:?}", e);
-				}
-			},
-			Err(_) => {
-				for tx in package {
-					let txid = tx.compute_txid();
-					if let Err(e) = requester.submit_package(tx).await {
-						log_error!(
-							self.logger,
-							"Failed to broadcast transaction {}: {:?}",
-							txid,
-							e
-						);
+		let outcome = dispatch_broadcast(&self.hooks, package, move |package| async move {
+			match Package::from_vec(package.clone()) {
+				Ok(package) => {
+					if let Err(e) = requester.submit_package(package).await {
+						log_error!(logger, "Failed to broadcast transaction package: {:?}", e);
 					}
-				}
-			},
+				},
+				Err(_) => {
+					for tx in package {
+						let txid = tx.compute_txid();
+						if let Err(e) = requester.submit_package(tx).await {
+							log_error!(logger, "Failed to broadcast transaction {}: {:?}", txid, e);
+						}
+					}
+				},
+			}
+		})
+		.await;
+
+		if outcome == BroadcastOutcome::HookHandled {
+			log_debug!(
+				self.logger,
+				"External chain-service broadcast hook accepted the transaction package; P2P \
+				 relay skipped."
+			);
 		}
 	}
 
@@ -1332,5 +1439,182 @@ mod tests {
 
 		let genesis_only = chain_of(&[0]);
 		assert_eq!(resume_anchor(genesis_only, 0).height(), 0);
+	}
+
+	// ------------------------------------------------------------------------------------------
+	// ChainServiceHooks (Task 5): fee-estimates and broadcast decision functions.
+	// ------------------------------------------------------------------------------------------
+
+	use std::sync::atomic::{AtomicBool, Ordering};
+
+	use lightning::chain::chaininterface::ConfirmationTarget as LdkConfirmationTarget;
+
+	use crate::chain::{BroadcastFuture, FeeEstimatesFuture};
+
+	fn test_logger() -> Logger {
+		Logger::new_log_facade()
+	}
+
+	#[tokio::test]
+	async fn chain_service_hooks_fee_estimates_hook_overrides_matching_targets() {
+		let logger = test_logger();
+		let hooks = ChainServiceHooks {
+			fee_estimates: Some(Arc::new(|| -> FeeEstimatesFuture {
+				Box::pin(async {
+					let mut by_blocks = HashMap::new();
+					by_blocks.insert(1u16, 50.0);
+					by_blocks.insert(6u16, 20.0);
+					Ok(by_blocks)
+				})
+			})),
+			broadcast: None,
+		};
+
+		let cache = resolve_fee_estimates(&hooks, &logger, || async {
+			panic!("fallback must not run when the hook succeeds")
+		})
+		.await
+		.expect("hook path succeeds");
+
+		// 1 block -> MaximumFeeEstimate; verified via the same adjustment the production code
+		// applies, so this doesn't hardcode (and risk drifting from) the bump formula.
+		let max_fee_target =
+			ConfirmationTarget::Lightning(LdkConfirmationTarget::MaximumFeeEstimate);
+		let expected_max_fee =
+			apply_post_estimation_adjustments(max_fee_target, FeeRate::from_sat_per_kwu(50 * 250));
+		assert_eq!(cache.get(&max_fee_target), Some(&expected_max_fee));
+
+		// 6 blocks -> both OnchainPayment and UrgentOnChainSweep get the same input rate.
+		assert_eq!(
+			cache.get(&ConfirmationTarget::OnchainPayment),
+			Some(&FeeRate::from_sat_per_kwu(20 * 250))
+		);
+		assert_eq!(
+			cache.get(&ConfirmationTarget::Lightning(LdkConfirmationTarget::UrgentOnChainSweep)),
+			Some(&FeeRate::from_sat_per_kwu(20 * 250))
+		);
+
+		// A target whose block count the hook didn't provide is simply absent from the cache
+		// (reads for it fall back to the estimator's own static per-target fallback).
+		assert!(!cache.contains_key(&ConfirmationTarget::ChannelFunding));
+	}
+
+	#[tokio::test]
+	async fn chain_service_hooks_fee_estimates_hook_error_falls_through() {
+		let logger = test_logger();
+		let hooks = ChainServiceHooks {
+			fee_estimates: Some(Arc::new(|| -> FeeEstimatesFuture { Box::pin(async { Err(()) }) })),
+			broadcast: None,
+		};
+
+		let mut configured_source_cache = HashMap::new();
+		configured_source_cache
+			.insert(ConfirmationTarget::OnchainPayment, FeeRate::from_sat_per_kwu(999));
+		let expected = configured_source_cache.clone();
+
+		let fallback_called = Arc::new(AtomicBool::new(false));
+		let fallback_called_clone = Arc::clone(&fallback_called);
+		let cache = resolve_fee_estimates(&hooks, &logger, move || {
+			let fallback_called = Arc::clone(&fallback_called_clone);
+			let configured_source_cache = configured_source_cache.clone();
+			async move {
+				fallback_called.store(true, Ordering::SeqCst);
+				Ok(configured_source_cache)
+			}
+		})
+		.await
+		.expect("fallback succeeds");
+
+		assert!(
+			fallback_called.load(Ordering::SeqCst),
+			"an errored hook must fall through to the configured fee source"
+		);
+		assert_eq!(cache, expected);
+	}
+
+	#[tokio::test]
+	async fn chain_service_hooks_fee_estimates_no_hook_falls_through() {
+		let logger = test_logger();
+		let hooks = ChainServiceHooks::default();
+
+		let fallback_called = Arc::new(AtomicBool::new(false));
+		let fallback_called_clone = Arc::clone(&fallback_called);
+		let _ = resolve_fee_estimates(&hooks, &logger, move || {
+			let fallback_called = Arc::clone(&fallback_called_clone);
+			async move {
+				fallback_called.store(true, Ordering::SeqCst);
+				Ok(HashMap::new())
+			}
+		})
+		.await
+		.expect("fallback succeeds");
+
+		assert!(fallback_called.load(Ordering::SeqCst), "no hook configured must fall through");
+	}
+
+	#[tokio::test]
+	async fn chain_service_hooks_broadcast_hook_ok_skips_p2p() {
+		let hooks = ChainServiceHooks {
+			fee_estimates: None,
+			broadcast: Some(Arc::new(|_txs| -> BroadcastFuture { Box::pin(async { Ok(()) }) })),
+		};
+		let p2p_called = Arc::new(AtomicBool::new(false));
+		let p2p_called_clone = Arc::clone(&p2p_called);
+
+		let outcome = dispatch_broadcast(&hooks, Vec::new(), move |_txs| {
+			let p2p_called = Arc::clone(&p2p_called_clone);
+			async move {
+				p2p_called.store(true, Ordering::SeqCst);
+			}
+		})
+		.await;
+
+		assert_eq!(outcome, BroadcastOutcome::HookHandled);
+		assert!(
+			!p2p_called.load(Ordering::SeqCst),
+			"P2P broadcast must not run when the hook accepts the package"
+		);
+	}
+
+	#[tokio::test]
+	async fn chain_service_hooks_broadcast_hook_err_falls_through_to_p2p() {
+		let hooks = ChainServiceHooks {
+			fee_estimates: None,
+			broadcast: Some(Arc::new(|_txs| -> BroadcastFuture { Box::pin(async { Err(()) }) })),
+		};
+		let p2p_called = Arc::new(AtomicBool::new(false));
+		let p2p_called_clone = Arc::clone(&p2p_called);
+
+		let outcome = dispatch_broadcast(&hooks, Vec::new(), move |_txs| {
+			let p2p_called = Arc::clone(&p2p_called_clone);
+			async move {
+				p2p_called.store(true, Ordering::SeqCst);
+			}
+		})
+		.await;
+
+		assert_eq!(outcome, BroadcastOutcome::FellThroughToP2p);
+		assert!(
+			p2p_called.load(Ordering::SeqCst),
+			"P2P broadcast must run when the hook declines the package"
+		);
+	}
+
+	#[tokio::test]
+	async fn chain_service_hooks_broadcast_no_hook_falls_through_to_p2p() {
+		let hooks = ChainServiceHooks::default();
+		let p2p_called = Arc::new(AtomicBool::new(false));
+		let p2p_called_clone = Arc::clone(&p2p_called);
+
+		let outcome = dispatch_broadcast(&hooks, Vec::new(), move |_txs| {
+			let p2p_called = Arc::clone(&p2p_called_clone);
+			async move {
+				p2p_called.store(true, Ordering::SeqCst);
+			}
+		})
+		.await;
+
+		assert_eq!(outcome, BroadcastOutcome::FellThroughToP2p);
+		assert!(p2p_called.load(Ordering::SeqCst), "no hook configured must fall through to P2P");
 	}
 }
