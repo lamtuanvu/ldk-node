@@ -563,7 +563,12 @@ impl Wallet {
 		&self, output_script: ScriptBuf, amount: Amount, confirmation_target: ConfirmationTarget,
 		locktime: LockTime,
 	) -> Result<Transaction, Error> {
-		self.create_funding_transaction(output_script, amount, confirmation_target, locktime)
+		self.runtime.block_on(self.create_funding_transaction(
+			output_script,
+			amount,
+			confirmation_target,
+			locktime,
+		))
 	}
 
 	/// Lists the wallet's confirmed, unspent outputs as [`Utxo`]s.
@@ -573,7 +578,9 @@ impl Wallet {
 	/// [`Error`] so swap call sites get a meaningful failure value.
 	#[cfg(feature = "swaps")]
 	pub(crate) fn swap_list_confirmed_utxos(&self) -> Result<Vec<Utxo>, Error> {
-		WalletSource::list_confirmed_utxos(self).map_err(|()| Error::WalletOperationFailed)
+		self.runtime
+			.block_on(WalletSource::list_confirmed_utxos(self))
+			.map_err(|()| Error::WalletOperationFailed)
 	}
 
 	/// Signs a PSBT with the BDK wallet, returning the extracted [`Transaction`].
@@ -584,7 +591,9 @@ impl Wallet {
 	/// are not finalized by BDK and the `finalized` bool is intentionally ignored.
 	#[cfg(feature = "swaps")]
 	pub(crate) fn swap_sign_psbt(&self, psbt: Psbt) -> Result<Transaction, Error> {
-		WalletSource::sign_psbt(self, psbt).map_err(|()| Error::WalletOperationFailed)
+		self.runtime
+			.block_on(WalletSource::sign_psbt(self, psbt))
+			.map_err(|()| Error::WalletOperationFailed)
 	}
 
 	pub(crate) async fn get_new_internal_address(&self) -> Result<bitcoin::Address, Error> {
