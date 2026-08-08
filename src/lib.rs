@@ -156,6 +156,11 @@ pub use chain::{BroadcastFuture, ChainServiceHooks, FeeEstimatesFuture};
 /// [`set_chain_source_cbf`]: crate::builder::NodeBuilder::set_chain_source_cbf
 pub use chain::CbfFeeSourceConfig;
 
+/// Simplified CBF sync-status snapshot, re-exported from the otherwise-private
+/// `chain` module so a consumer can name the return type of
+/// [`Node::cbf_sync_status`].
+pub use chain::CbfSyncStatus;
+
 /// Public types appearing in the swap-primitive signatures on [`Node`]
 /// (Peerswap native primitives, B-series). Re-exported so the consumer crate
 /// can name them without reaching into the (otherwise-private) LDK/bitcoin
@@ -984,6 +989,17 @@ impl Node {
 	/// Returns the config with which the [`Node`] was initialized.
 	pub fn config(&self) -> Config {
 		self.config.as_ref().clone()
+	}
+
+	/// Returns a snapshot of the CBF chain source's sync status
+	/// ([`CbfSyncStatus`]), or `None` if this [`Node`] is not configured with
+	/// the CBF chain source (i.e. [`set_chain_source_cbf`] was not called).
+	///
+	/// Never blocks — reads the current value without waiting for a change.
+	///
+	/// [`set_chain_source_cbf`]: crate::builder::NodeBuilder::set_chain_source_cbf
+	pub fn cbf_sync_status(&self) -> Option<CbfSyncStatus> {
+		self.chain_source.cbf_sync_status()
 	}
 
 	/// Returns the next event in the event queue, if currently available.

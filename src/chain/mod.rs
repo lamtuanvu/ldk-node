@@ -129,6 +129,28 @@ pub enum CbfFeeSourceConfig {
 	Electrum(String),
 }
 
+/// A simplified, externally-consumable snapshot of the CBF chain source's sync
+/// state.
+///
+/// This deliberately does NOT expose the crate-internal, error-carrying sync
+/// state type the CBF chain source tracks internally — only whether it is
+/// still catching up, has caught up to the network tip, or has given up.
+/// Returned by [`crate::Node::cbf_sync_status`]; `None` for every other chain
+/// source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+pub enum CbfSyncStatus {
+	/// CBF has not yet caught up to the network tip — either the initial
+	/// compact-filter sync, or catching up again after falling behind.
+	Syncing,
+	/// CBF has caught up to the network tip and applied all pending blocks.
+	Synced,
+	/// The CBF background restart loop gave up after repeated failures, or
+	/// the chain source has been cleanly stopped (e.g. during node
+	/// shutdown/reload). Not currently making sync progress either way.
+	Failed,
+}
+
 /// A future resolving to per-conf-target (blocks) fee estimates in sat/vB, or `Err(())` if the
 /// external chain service could not provide them this cycle.
 pub type FeeEstimatesFuture = std::pin::Pin<
@@ -207,6 +229,17 @@ impl ChainSource {
 				bitcoind_chain_source.fee_estimator()
 			},
 			ChainSourceKind::Cbf(cbf_chain_source) => cbf_chain_source.fee_estimator(),
+		}
+	}
+
+	/// Returns a snapshot of the CBF chain source's sync status
+	/// ([`CbfSyncStatus`]), or `None` if this chain source is not CBF.
+	pub(crate) fn cbf_sync_status(&self) -> Option<CbfSyncStatus> {
+		match &self.kind {
+			ChainSourceKind::Cbf(cbf_chain_source) => Some(cbf_chain_source.sync_status()),
+			ChainSourceKind::Esplora(_)
+			| ChainSourceKind::Electrum(_)
+			| ChainSourceKind::Bitcoind(_) => None,
 		}
 	}
 

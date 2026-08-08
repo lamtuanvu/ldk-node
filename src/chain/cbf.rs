@@ -17,7 +17,7 @@ use tokio::sync::{mpsc, watch};
 
 use crate::chain::bitcoind::ChainListener;
 use crate::chain::electrum::get_electrum_fee_rate_cache_update;
-use crate::chain::{CbfFeeSourceConfig, ChainServiceHooks};
+use crate::chain::{CbfFeeSourceConfig, CbfSyncStatus, ChainServiceHooks};
 use crate::config::{Config, DEFAULT_FEE_RATE_CACHE_UPDATE_INTERVAL_SECS};
 use crate::error::Error;
 use crate::fee_estimator::{
@@ -119,6 +119,17 @@ enum CbfSyncState {
 		synced_to_tip: bool,
 	},
 	Failed(Error),
+}
+
+/// Pure mapping from the internal, error-carrying [`CbfSyncState`] to the
+/// externally-consumable [`CbfSyncStatus`] — extracted so the mapping is
+/// unit-testable without a live kyoto node or `watch` channel.
+fn simplify_sync_state(state: CbfSyncState) -> CbfSyncStatus {
+	match state {
+		CbfSyncState::Active { synced_to_tip: true, .. } => CbfSyncStatus::Synced,
+		CbfSyncState::Active { synced_to_tip: false, .. } => CbfSyncStatus::Syncing,
+		CbfSyncState::Failed(_) => CbfSyncStatus::Failed,
+	}
 }
 
 /// Marks that we are applying a block past the last `FiltersSynced` tip, so a `sync_wallets` call
@@ -682,6 +693,13 @@ impl CbfChainSource {
 	#[cfg(feature = "swaps")]
 	pub(super) fn fee_estimator(&self) -> &Arc<OnchainFeeEstimator> {
 		&self.fee_estimator
+	}
+
+	/// Returns a simplified, externally-consumable snapshot of the current
+	/// CBF sync state. Never blocks — reads the current value of the
+	/// `watch` channel without waiting for a change.
+	pub(super) fn sync_status(&self) -> CbfSyncStatus {
+		simplify_sync_state(*self.sync_state_tx.borrow())
 	}
 
 	pub(crate) fn start(&self, chain_listener: ChainListener) {
@@ -1485,6 +1503,41 @@ pub(crate) fn resolve_birthday(
 mod tests {
 	use super::*;
 	use bitcoin::hashes::Hash;
+
+	// ------------------------------------------------------------------------------------------
+	// simplify_sync_state: internal CbfSyncState -> public CbfSyncStatus mapping.
+	// ------------------------------------------------------------------------------------------
+
+	#[test]
+	fn simplify_sync_state_active_not_synced_is_syncing() {
+		let state = CbfSyncState::Active { applied_tip: Some(100), synced_to_tip: false };
+		assert_eq!(simplify_sync_state(state), CbfSyncStatus::Syncing);
+	}
+
+	#[test]
+	fn simplify_sync_state_active_no_applied_tip_is_syncing() {
+		// Freshly constructed state before `start()` ever ran.
+		let state = CbfSyncState::Active { applied_tip: None, synced_to_tip: false };
+		assert_eq!(simplify_sync_state(state), CbfSyncStatus::Syncing);
+	}
+
+	#[test]
+	fn simplify_sync_state_active_synced_to_tip_is_synced() {
+		let state = CbfSyncState::Active { applied_tip: Some(900_000), synced_to_tip: true };
+		assert_eq!(simplify_sync_state(state), CbfSyncStatus::Synced);
+	}
+
+	#[test]
+	fn simplify_sync_state_failed_is_failed_regardless_of_error_variant() {
+		assert_eq!(
+			simplify_sync_state(CbfSyncState::Failed(Error::NotRunning)),
+			CbfSyncStatus::Failed
+		);
+		assert_eq!(
+			simplify_sync_state(CbfSyncState::Failed(Error::TxSyncFailed)),
+			CbfSyncStatus::Failed
+		);
+	}
 
 	#[test]
 	fn parse_peer_accepts_hostname() {
