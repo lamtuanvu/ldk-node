@@ -1090,30 +1090,9 @@ impl BitcoindClient {
 			.await
 		{
 			Ok(resp) => Ok(Some(resp.0)),
-			Err(e) => match e.into_inner() {
-				Some(inner) => {
-					let rpc_error_res: Result<Box<RpcError>, _> = inner.downcast();
-
-					match rpc_error_res {
-						Ok(rpc_error) => {
-							// -5 == "No such mempool or blockchain transaction".
-							if rpc_error.code == -5 {
-								Ok(None)
-							} else {
-								Err(std::io::Error::new(std::io::ErrorKind::Other, rpc_error))
-							}
-						},
-						Err(_) => Err(std::io::Error::new(
-							std::io::ErrorKind::Other,
-							"Failed to process verbose getrawtransaction response",
-						)),
-					}
-				},
-				None => Err(std::io::Error::new(
-					std::io::ErrorKind::Other,
-					"Failed to process verbose getrawtransaction response",
-				)),
-			},
+			// -5 == "No such mempool or blockchain transaction".
+			Err(RpcClientError::Rpc(rpc_error)) if rpc_error.code == -5 => Ok(None),
+			Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())),
 		}
 	}
 
@@ -1487,8 +1466,8 @@ pub(crate) struct SwapTxConfirmationResponse(pub u32);
 
 #[cfg(feature = "swaps")]
 impl TryInto<SwapTxConfirmationResponse> for JsonResponse {
-	type Error = std::io::Error;
-	fn try_into(self) -> std::io::Result<SwapTxConfirmationResponse> {
+	type Error = String;
+	fn try_into(self) -> Result<SwapTxConfirmationResponse, String> {
 		let confirmations = self.0["confirmations"].as_u64().unwrap_or(0);
 		Ok(SwapTxConfirmationResponse(confirmations as u32))
 	}
