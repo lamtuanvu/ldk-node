@@ -148,9 +148,23 @@ pub type BroadcastFuture =
 /// payment protocol a caller might use to obtain fee data or relay a broadcast.
 #[derive(Clone, Default)]
 pub struct ChainServiceHooks {
-	/// conf-target (blocks) → sat/vB. Err/None → fall through to fee_source / block-derived.
+	/// conf-target (blocks) → sat/vB.
+	///
+	/// Applied **all-or-nothing**: the returned map MUST include a finite entry for every one
+	/// of the six distinct block-count targets the estimator needs — `1`, `3`, `6`, `12`,
+	/// `144`, and `1008` blocks — or the whole result is discarded and treated exactly like
+	/// `Err(())`. A map covering only some of these is never partially applied (the underlying
+	/// cache is a full replace, not a merge, so a partial map would silently pin the omitted
+	/// targets to the crate's static fallback rate rather than a live estimate). Accepted
+	/// sat/vB values are clamped to a sane range before use. The app-side endpoint backing this
+	/// hook must serve estimates for exactly these six block counts every time it is called.
+	///
+	/// `Err(())`, an incomplete/empty map, a timeout, or leaving this unset all fall through to
+	/// `fee_source` / block-derived estimation.
 	pub fee_estimates: Option<std::sync::Arc<dyn Fn() -> FeeEstimatesFuture + Send + Sync>>,
-	/// Attempt external broadcast of raw txs. Err → fall through to P2P broadcast.
+	/// Attempt external broadcast of raw txs. Tried even if the underlying CBF/kyoto runtime is
+	/// not currently running. `Err(())`, a timeout, or leaving this unset falls through to P2P
+	/// broadcast.
 	pub broadcast:
 		Option<std::sync::Arc<dyn Fn(Vec<Transaction>) -> BroadcastFuture + Send + Sync>>,
 }

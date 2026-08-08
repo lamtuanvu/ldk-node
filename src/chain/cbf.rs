@@ -80,6 +80,25 @@ const ESPLORA_TIMEOUT: u64 = 2;
 const ELECTRUM_FEE_NUM_RETRIES: u8 = 3;
 const ELECTRUM_FEE_TIMEOUT_SECS: u64 = 10;
 
+/// Timeout applied to every [`ChainServiceHooks`] invocation (both `fee_estimates` and
+/// `broadcast`). Unlike the Esplora/Electrum fee paths, an app-supplied hook has no client-level
+/// timeout of its own, so without this an indefinitely-hanging hook would stall the fee-update
+/// cycle, or the 500-deep broadcast-queue drain loop (`CBF_CHAIN_OP_QUEUE_DEPTH`-adjacent —
+/// `continuously_process_broadcast_queue` in `chain/mod.rs`), for as long as the hook never
+/// resolves. A timeout is treated identically to `Err(())`: fall through to the native path.
+/// Matches the file's existing 10s external-service timeouts (`ELECTRUM_FEE_TIMEOUT_SECS`,
+/// `CBF_BLOCK_FETCH_TIMEOUT_SECS`).
+const CHAIN_SERVICE_HOOK_TIMEOUT_SECS: u64 = 10;
+
+/// Sat/vB bounds clamped onto every value in an accepted `ChainServiceHooks::fee_estimates`
+/// result before unit conversion. Defends against a malformed/hostile hook in two ways: a value
+/// below the floor would starve fee bumping/relay, and an unclamped extreme value can overflow
+/// `FeeRate::to_sat_per_vb_ceil` when a swap caller later reads the cached estimate back out in
+/// sat/vB. `10_000` sat/vB is roughly two orders of magnitude above any real-world mempool
+/// congestion spike, so this never clips a legitimate estimate.
+const CHAIN_SERVICE_HOOK_MIN_SAT_PER_VB: f64 = 1.0;
+const CHAIN_SERVICE_HOOK_MAX_SAT_PER_VB: f64 = 10_000.0;
+
 /// Runtime status of the underlying kyoto node.
 enum CbfRuntimeStatus {
 	Started { requester: Requester },
@@ -426,47 +445,100 @@ fn parse_trusted_peer(peer_str: &str) -> Result<ParsedPeer, Error> {
 	Ok(ParsedPeer::Hostname { host: host.to_string(), port })
 }
 
+/// The distinct block-count keys the fee-rate cache needs — the set of
+/// `get_num_block_defaults_for_target(target)` values across every [`get_all_conf_targets`]
+/// entry. A `ChainServiceHooks::fee_estimates` hook result is only ever applied if it covers
+/// every one of these; see [`resolve_fee_estimates`].
+fn required_hook_fee_targets() -> HashSet<u16> {
+	get_all_conf_targets()
+		.into_iter()
+		.map(|target| get_num_block_defaults_for_target(target) as u16)
+		.collect()
+}
+
 /// Resolves the per-target fee-rate cache for a single fee-update cycle.
 ///
-/// If `hooks.fee_estimates` is configured, it is tried first: an `Ok(by_blocks)` map (keyed by
-/// conf-target in blocks, valued in sat/vB) is converted into the estimator's internal
-/// per-[`ConfirmationTarget`] cache and returned WITHOUT calling `fallback`. A target whose
-/// block count is absent from `by_blocks` is simply omitted from the returned cache — reads for
-/// that target fall back to [`OnchainFeeEstimator`]'s own per-target static fallback, exactly as
-/// they do today when the cache has never been populated for it.
+/// If `hooks.fee_estimates` is configured, it is tried first, bounded by `hook_timeout`
+/// (production callers pass [`CHAIN_SERVICE_HOOK_TIMEOUT_SECS`]; tests inject a short duration
+/// so a deliberately-hung fake hook doesn't slow the test suite down). It is applied
+/// **all-or-nothing**: an `Ok(by_blocks)`
+/// map (keyed by conf-target in blocks, valued in sat/vB) is only converted into the estimator's
+/// internal per-[`ConfirmationTarget`] cache and returned WITHOUT calling `fallback` if it has a
+/// finite value for every key in [`required_hook_fee_targets`]. Every accepted value is clamped
+/// to `[CHAIN_SERVICE_HOOK_MIN_SAT_PER_VB, CHAIN_SERVICE_HOOK_MAX_SAT_PER_VB]` before unit
+/// conversion.
 ///
-/// An `Err(())` result (or no hook configured at all) falls through to `fallback` — the
-/// existing (Esplora / Electrum / native-CBF) fee computation, unchanged.
+/// A `by_blocks` map that is missing one or more required keys (including an empty map) is
+/// **rejected in full** and treated exactly like `Err(())` — NOT partially applied. This matters
+/// because [`OnchainFeeEstimator::set_fee_rate_cache`] replaces the whole cache rather than
+/// merging: applying a partial map would silently pin every uncovered target to the crate's
+/// static conservative fallback rate (worse than any pre-hook source) instead of falling through
+/// to a live estimate from the configured source, and would also bypass that source's own
+/// safety guards (e.g. the Esplora path's "empty estimates disallowed on Mainnet" check) for a
+/// cycle that never actually reaches it. Because this function returns early only on full
+/// acceptance, [`CbfChainSource::commit_fee_rate_cache`]'s timestamp stamp downstream is never
+/// applied for a rejected/timed-out/errored hook result — only for whichever cache (hook or
+/// fallback) was actually accepted.
+///
+/// An `Err(())` result, a timeout, an incomplete/empty map, or no hook configured at all all
+/// fall through to `fallback` — the existing (Esplora / Electrum / native-CBF) fee computation,
+/// unchanged.
 ///
 /// A free function (not a method) so it is unit-testable with a fake hook and a fake fallback,
 /// without a live kyoto node.
 async fn resolve_fee_estimates<F, Fut>(
-	hooks: &ChainServiceHooks, logger: &Logger, fallback: F,
+	hooks: &ChainServiceHooks, logger: &Logger, hook_timeout: Duration, fallback: F,
 ) -> Result<HashMap<ConfirmationTarget, FeeRate>, Error>
 where
 	F: FnOnce() -> Fut,
 	Fut: std::future::Future<Output = Result<HashMap<ConfirmationTarget, FeeRate>, Error>>,
 {
 	if let Some(hook) = hooks.fee_estimates.as_ref() {
-		match hook().await {
-			Ok(by_blocks) => {
-				let mut cache = HashMap::with_capacity(10);
-				for target in get_all_conf_targets() {
-					let num_blocks = get_num_block_defaults_for_target(target) as u16;
-					if let Some(&sat_per_vb) = by_blocks.get(&num_blocks) {
+		let hook_result = tokio::time::timeout(hook_timeout, hook()).await;
+		match hook_result {
+			Ok(Ok(by_blocks)) => {
+				let required = required_hook_fee_targets();
+				let covers_all = required
+					.iter()
+					.all(|blocks| by_blocks.get(blocks).is_some_and(|v| v.is_finite()));
+				if covers_all {
+					let mut cache = HashMap::with_capacity(10);
+					for target in get_all_conf_targets() {
+						let num_blocks = get_num_block_defaults_for_target(target) as u16;
+						// Presence + finiteness guaranteed by `covers_all` above.
+						let sat_per_vb = by_blocks[&num_blocks].clamp(
+							CHAIN_SERVICE_HOOK_MIN_SAT_PER_VB,
+							CHAIN_SERVICE_HOOK_MAX_SAT_PER_VB,
+						);
 						// sat/vB -> sat/kwu: 1 vB = 4 WU, 1 kwu = 1000 WU, so *1000/4 == *250.
-						let sat_per_kwu = (sat_per_vb * 250.0).max(1.0) as u64;
+						let sat_per_kwu = (sat_per_vb * 250.0) as u64;
 						let fee_rate = FeeRate::from_sat_per_kwu(sat_per_kwu);
 						cache.insert(target, apply_post_estimation_adjustments(target, fee_rate));
 					}
+					return Ok(cache);
 				}
-				return Ok(cache);
+				log_debug!(
+					logger,
+					"External chain-service fee-estimates hook returned an incomplete map \
+					 (missing or non-finite for one or more of the {} required block-count \
+					 targets); rejecting it in full and falling back to the configured fee \
+					 source.",
+					required.len()
+				);
 			},
-			Err(()) => {
+			Ok(Err(())) => {
 				log_debug!(
 					logger,
 					"External chain-service fee-estimates hook declined; falling back to the \
 					 configured fee source."
+				);
+			},
+			Err(_elapsed) => {
+				log_debug!(
+					logger,
+					"External chain-service fee-estimates hook timed out after {:?}; falling \
+					 back to the configured fee source.",
+					hook_timeout
 				);
 			},
 		}
@@ -485,23 +557,38 @@ enum BroadcastOutcome {
 
 /// Tries the app-supplied broadcast hook before falling back to the node's own P2P broadcast.
 ///
-/// If `hooks.broadcast` is configured, it is called with the package's transactions: `Ok(())`
-/// means the external service accepted the broadcast, so `p2p_send` is NOT called. `Err(())` (or
-/// no hook configured at all) falls through to `p2p_send` — the existing kyoto
-/// `submit_package`/per-tx broadcast path, unchanged.
+/// If `hooks.broadcast` is configured, it is called with the package's transactions, bounded by
+/// `hook_timeout` (production callers pass [`CHAIN_SERVICE_HOOK_TIMEOUT_SECS`]; tests inject a
+/// short duration so a deliberately-hung fake hook doesn't slow the test suite down): `Ok(())`
+/// means the external service accepted the broadcast, so `p2p_send` is NOT called. `Err(())`, a
+/// timeout, or no hook configured at all falls through to `p2p_send` — the existing kyoto
+/// `submit_package`/per-tx broadcast path, unchanged. `p2p_send` is called (and must itself
+/// degrade gracefully, e.g. by logging) even when the underlying kyoto runtime is stopped —
+/// only `p2p_send`'s own implementation depends on kyoto health, not this decision function.
 ///
 /// A free function (not a method) so it is unit-testable with a fake hook and a fake
 /// `p2p_send`, without a live kyoto node.
 async fn dispatch_broadcast<F, Fut>(
-	hooks: &ChainServiceHooks, txs: Vec<Transaction>, p2p_send: F,
+	hooks: &ChainServiceHooks, logger: &Logger, hook_timeout: Duration, txs: Vec<Transaction>,
+	p2p_send: F,
 ) -> BroadcastOutcome
 where
 	F: FnOnce(Vec<Transaction>) -> Fut,
 	Fut: std::future::Future<Output = ()>,
 {
 	if let Some(hook) = hooks.broadcast.as_ref() {
-		if hook(txs.clone()).await.is_ok() {
-			return BroadcastOutcome::HookHandled;
+		let hook_result = tokio::time::timeout(hook_timeout, hook(txs.clone())).await;
+		match hook_result {
+			Ok(Ok(())) => return BroadcastOutcome::HookHandled,
+			Ok(Err(())) => {},
+			Err(_elapsed) => {
+				log_debug!(
+					logger,
+					"External chain-service broadcast hook timed out after {:?}; falling back \
+					 to P2P.",
+					hook_timeout
+				);
+			},
 		}
 	}
 	p2p_send(txs).await;
@@ -994,9 +1081,13 @@ impl CbfChainSource {
 	}
 
 	pub(crate) async fn update_fee_rate_estimates(&self) -> Result<(), Error> {
-		let new_fee_rate_cache =
-			resolve_fee_estimates(&self.hooks, &self.logger, || self.fee_rate_cache_from_source())
-				.await?;
+		let new_fee_rate_cache = resolve_fee_estimates(
+			&self.hooks,
+			&self.logger,
+			Duration::from_secs(CHAIN_SERVICE_HOOK_TIMEOUT_SECS),
+			|| self.fee_rate_cache_from_source(),
+		)
+		.await?;
 
 		self.commit_fee_rate_cache(new_fee_rate_cache).await
 	}
@@ -1118,32 +1209,53 @@ impl CbfChainSource {
 	}
 
 	pub(crate) async fn process_broadcast_package(&self, package: Vec<Transaction>) {
+		// Read the requester (if any) up front, but do NOT bail out when the kyoto runtime is
+		// stopped: the broadcast hook must still be tried (it's payment-agnostic and may be the
+		// only working relay left once the CBF restart loop has given up, e.g. for a
+		// time-sensitive force-close tx). Only the P2P fallback leg below actually needs a live
+		// `Requester` — it degrades to an error log when there isn't one.
 		let requester = match &*self.cbf_runtime_status.lock().expect("lock") {
-			CbfRuntimeStatus::Started { requester } => requester.clone(),
-			CbfRuntimeStatus::Stopped => {
-				debug_assert!(false, "We should have started the chain source before broadcasting");
-				return;
-			},
+			CbfRuntimeStatus::Started { requester } => Some(requester.clone()),
+			CbfRuntimeStatus::Stopped => None,
 		};
 		let logger = Arc::clone(&self.logger);
 
-		let outcome = dispatch_broadcast(&self.hooks, package, move |package| async move {
-			match Package::from_vec(package.clone()) {
-				Ok(package) => {
-					if let Err(e) = requester.submit_package(package).await {
-						log_error!(logger, "Failed to broadcast transaction package: {:?}", e);
-					}
-				},
-				Err(_) => {
-					for tx in package {
-						let txid = tx.compute_txid();
-						if let Err(e) = requester.submit_package(tx).await {
-							log_error!(logger, "Failed to broadcast transaction {}: {:?}", txid, e);
+		let outcome = dispatch_broadcast(
+			&self.hooks,
+			&self.logger,
+			Duration::from_secs(CHAIN_SERVICE_HOOK_TIMEOUT_SECS),
+			package,
+			move |package| async move {
+				let Some(requester) = requester else {
+					log_error!(
+						logger,
+						"Cannot P2P-broadcast transaction package: CBF chain source is stopped \
+						 and no external chain-service broadcast hook accepted it."
+					);
+					return;
+				};
+				match Package::from_vec(package.clone()) {
+					Ok(package) => {
+						if let Err(e) = requester.submit_package(package).await {
+							log_error!(logger, "Failed to broadcast transaction package: {:?}", e);
 						}
-					}
-				},
-			}
-		})
+					},
+					Err(_) => {
+						for tx in package {
+							let txid = tx.compute_txid();
+							if let Err(e) = requester.submit_package(tx).await {
+								log_error!(
+									logger,
+									"Failed to broadcast transaction {}: {:?}",
+									txid,
+									e
+								);
+							}
+						}
+					},
+				}
+			},
+		)
 		.await;
 
 		if outcome == BroadcastOutcome::HookHandled {
@@ -1442,7 +1554,7 @@ mod tests {
 	}
 
 	// ------------------------------------------------------------------------------------------
-	// ChainServiceHooks (Task 5): fee-estimates and broadcast decision functions.
+	// ChainServiceHooks (Task 5 + fix round 1): fee-estimates and broadcast decision functions.
 	// ------------------------------------------------------------------------------------------
 
 	use std::sync::atomic::{AtomicBool, Ordering};
@@ -1455,48 +1567,223 @@ mod tests {
 		Logger::new_log_facade()
 	}
 
+	/// Generous timeout for tests where the hook resolves immediately — long enough to never be
+	/// mistaken for the hung-hook case, short enough to never meaningfully slow the suite down.
+	fn generous_test_timeout() -> Duration {
+		Duration::from_secs(5)
+	}
+
+	/// A full, valid `fee_estimates` map: one entry per distinct block-count target the
+	/// estimator needs (`1, 3, 6, 12, 144, 1008`), each with a different sat/vB value so
+	/// per-target application can be told apart in assertions.
+	fn full_by_blocks_map() -> HashMap<u16, f64> {
+		let mut by_blocks = HashMap::new();
+		by_blocks.insert(1u16, 50.0);
+		by_blocks.insert(3u16, 30.0);
+		by_blocks.insert(6u16, 20.0);
+		by_blocks.insert(12u16, 15.0);
+		by_blocks.insert(144u16, 10.0);
+		by_blocks.insert(1008u16, 5.0);
+		by_blocks
+	}
+
+	/// Mirrors `resolve_fee_estimates`'s own sat/vB -> sat/kwu conversion + post-estimation
+	/// adjustment, so tests assert against the real formula instead of a hardcoded, driftable
+	/// number.
+	fn expected_rate(sat_per_vb: f64, target: ConfirmationTarget) -> FeeRate {
+		apply_post_estimation_adjustments(
+			target,
+			FeeRate::from_sat_per_kwu((sat_per_vb * 250.0) as u64),
+		)
+	}
+
+	#[test]
+	fn required_hook_fee_targets_is_the_six_distinct_block_counts() {
+		// Sanity check on the fixture used by every full-map test below: if the per-target
+		// block-count defaults ever change, this (and `full_by_blocks_map`) should be the first
+		// thing to fail, not a confusing downstream assertion.
+		let required = required_hook_fee_targets();
+		let mut expected: Vec<u16> = vec![1, 3, 6, 12, 144, 1008];
+		expected.sort_unstable();
+		let mut actual: Vec<u16> = required.into_iter().collect();
+		actual.sort_unstable();
+		assert_eq!(actual, expected);
+	}
+
 	#[tokio::test]
-	async fn chain_service_hooks_fee_estimates_hook_overrides_matching_targets() {
+	async fn chain_service_hooks_fee_estimates_full_map_is_applied_per_target() {
 		let logger = test_logger();
 		let hooks = ChainServiceHooks {
 			fee_estimates: Some(Arc::new(|| -> FeeEstimatesFuture {
+				Box::pin(async { Ok(full_by_blocks_map()) })
+			})),
+			broadcast: None,
+		};
+
+		let cache = resolve_fee_estimates(&hooks, &logger, generous_test_timeout(), || async {
+			panic!("fallback must not run once the map covers every required target")
+		})
+		.await
+		.expect("hook path succeeds");
+
+		// Every one of the 10 conf-targets must be present -- a full map is applied in full.
+		assert_eq!(cache.len(), get_all_conf_targets().len());
+
+		let max_fee = ConfirmationTarget::Lightning(LdkConfirmationTarget::MaximumFeeEstimate);
+		assert_eq!(cache[&max_fee], expected_rate(50.0, max_fee));
+
+		assert_eq!(
+			cache[&ConfirmationTarget::ChannelFunding],
+			expected_rate(30.0, ConfirmationTarget::ChannelFunding)
+		);
+
+		assert_eq!(
+			cache[&ConfirmationTarget::OnchainPayment],
+			expected_rate(20.0, ConfirmationTarget::OnchainPayment)
+		);
+		let urgent_sweep = ConfirmationTarget::Lightning(LdkConfirmationTarget::UrgentOnChainSweep);
+		assert_eq!(cache[&urgent_sweep], expected_rate(20.0, urgent_sweep));
+
+		let non_anchor_fee =
+			ConfirmationTarget::Lightning(LdkConfirmationTarget::NonAnchorChannelFee);
+		assert_eq!(cache[&non_anchor_fee], expected_rate(15.0, non_anchor_fee));
+		let output_spending =
+			ConfirmationTarget::Lightning(LdkConfirmationTarget::OutputSpendingFee);
+		assert_eq!(cache[&output_spending], expected_rate(15.0, output_spending));
+
+		// The special-cased adjustment (trims towards the relay floor) still applies to a
+		// hook-sourced rate, exactly as it does for the native sources.
+		let min_non_anchor = ConfirmationTarget::Lightning(
+			LdkConfirmationTarget::MinAllowedNonAnchorChannelRemoteFee,
+		);
+		assert_eq!(cache[&min_non_anchor], expected_rate(10.0, min_non_anchor));
+		let close_min = ConfirmationTarget::Lightning(LdkConfirmationTarget::ChannelCloseMinimum);
+		assert_eq!(cache[&close_min], expected_rate(10.0, close_min));
+
+		let min_anchor =
+			ConfirmationTarget::Lightning(LdkConfirmationTarget::MinAllowedAnchorChannelRemoteFee);
+		assert_eq!(cache[&min_anchor], expected_rate(5.0, min_anchor));
+		let anchor_fee = ConfirmationTarget::Lightning(LdkConfirmationTarget::AnchorChannelFee);
+		assert_eq!(cache[&anchor_fee], expected_rate(5.0, anchor_fee));
+	}
+
+	#[tokio::test]
+	async fn chain_service_hooks_fee_estimates_sparse_map_falls_through_to_fallback() {
+		let logger = test_logger();
+		// Covers every required block count except 1008 -- a realistic "hook forgot one tier"
+		// scenario, not just a totally empty map.
+		let hooks = ChainServiceHooks {
+			fee_estimates: Some(Arc::new(|| -> FeeEstimatesFuture {
 				Box::pin(async {
-					let mut by_blocks = HashMap::new();
-					by_blocks.insert(1u16, 50.0);
-					by_blocks.insert(6u16, 20.0);
+					let mut by_blocks = full_by_blocks_map();
+					by_blocks.remove(&1008u16);
 					Ok(by_blocks)
 				})
 			})),
 			broadcast: None,
 		};
 
-		let cache = resolve_fee_estimates(&hooks, &logger, || async {
-			panic!("fallback must not run when the hook succeeds")
+		let mut configured_source_cache = HashMap::new();
+		configured_source_cache
+			.insert(ConfirmationTarget::OnchainPayment, FeeRate::from_sat_per_kwu(999));
+		let expected = configured_source_cache.clone();
+
+		let fallback_called = Arc::new(AtomicBool::new(false));
+		let fallback_called_clone = Arc::clone(&fallback_called);
+		let cache = resolve_fee_estimates(&hooks, &logger, generous_test_timeout(), move || {
+			let fallback_called = Arc::clone(&fallback_called_clone);
+			let configured_source_cache = configured_source_cache.clone();
+			async move {
+				fallback_called.store(true, Ordering::SeqCst);
+				Ok(configured_source_cache)
+			}
 		})
 		.await
-		.expect("hook path succeeds");
+		.expect("fallback succeeds");
 
-		// 1 block -> MaximumFeeEstimate; verified via the same adjustment the production code
-		// applies, so this doesn't hardcode (and risk drifting from) the bump formula.
-		let max_fee_target =
-			ConfirmationTarget::Lightning(LdkConfirmationTarget::MaximumFeeEstimate);
-		let expected_max_fee =
-			apply_post_estimation_adjustments(max_fee_target, FeeRate::from_sat_per_kwu(50 * 250));
-		assert_eq!(cache.get(&max_fee_target), Some(&expected_max_fee));
-
-		// 6 blocks -> both OnchainPayment and UrgentOnChainSweep get the same input rate.
-		assert_eq!(
-			cache.get(&ConfirmationTarget::OnchainPayment),
-			Some(&FeeRate::from_sat_per_kwu(20 * 250))
+		assert!(
+			fallback_called.load(Ordering::SeqCst),
+			"a map missing even one required block-count target must be rejected in full, not \
+			 partially applied"
 		);
-		assert_eq!(
-			cache.get(&ConfirmationTarget::Lightning(LdkConfirmationTarget::UrgentOnChainSweep)),
-			Some(&FeeRate::from_sat_per_kwu(20 * 250))
-		);
+		assert_eq!(cache, expected);
+	}
 
-		// A target whose block count the hook didn't provide is simply absent from the cache
-		// (reads for it fall back to the estimator's own static per-target fallback).
-		assert!(!cache.contains_key(&ConfirmationTarget::ChannelFunding));
+	#[tokio::test]
+	async fn chain_service_hooks_fee_estimates_empty_map_falls_through_to_fallback() {
+		let logger = test_logger();
+		let hooks = ChainServiceHooks {
+			fee_estimates: Some(Arc::new(|| -> FeeEstimatesFuture {
+				Box::pin(async { Ok(HashMap::new()) })
+			})),
+			broadcast: None,
+		};
+
+		let mut configured_source_cache = HashMap::new();
+		configured_source_cache
+			.insert(ConfirmationTarget::OnchainPayment, FeeRate::from_sat_per_kwu(999));
+		let expected = configured_source_cache.clone();
+
+		let fallback_called = Arc::new(AtomicBool::new(false));
+		let fallback_called_clone = Arc::clone(&fallback_called);
+		let cache = resolve_fee_estimates(&hooks, &logger, generous_test_timeout(), move || {
+			let fallback_called = Arc::clone(&fallback_called_clone);
+			let configured_source_cache = configured_source_cache.clone();
+			async move {
+				fallback_called.store(true, Ordering::SeqCst);
+				Ok(configured_source_cache)
+			}
+		})
+		.await
+		.expect("fallback succeeds");
+
+		assert!(
+			fallback_called.load(Ordering::SeqCst),
+			"an empty hook map must fall through to the configured source, never be silently \
+			 committed as a no-op cache with a fresh timestamp"
+		);
+		// `resolve_fee_estimates` has exactly one return path per call: since the empty hook
+		// result was rejected, the only cache that could ever reach `commit_fee_rate_cache`
+		// (and therefore ever get a timestamp stamped) is this fallback cache.
+		assert_eq!(cache, expected);
+	}
+
+	#[tokio::test]
+	async fn chain_service_hooks_fee_estimates_out_of_range_values_are_clamped() {
+		let logger = test_logger();
+		let hooks = ChainServiceHooks {
+			fee_estimates: Some(Arc::new(|| -> FeeEstimatesFuture {
+				Box::pin(async {
+					let mut by_blocks = full_by_blocks_map();
+					// Below the floor -> must clamp to CHAIN_SERVICE_HOOK_MIN_SAT_PER_VB, not to
+					// whatever a post-conversion `.max()` in sat/kwu units would have floored it
+					// to (that was 250x weaker than intended).
+					by_blocks.insert(3u16, 0.000_001);
+					// Absurdly large -> must clamp to CHAIN_SERVICE_HOOK_MAX_SAT_PER_VB rather
+					// than risk an overflow downstream in `FeeRate::to_sat_per_vb_ceil`.
+					by_blocks.insert(12u16, 1.0e12);
+					Ok(by_blocks)
+				})
+			})),
+			broadcast: None,
+		};
+
+		let cache = resolve_fee_estimates(&hooks, &logger, generous_test_timeout(), || async {
+			panic!("fallback must not run once the map covers every required target")
+		})
+		.await
+		.expect("hook path succeeds (all required targets present, just out of range)");
+
+		assert_eq!(
+			cache[&ConfirmationTarget::ChannelFunding],
+			expected_rate(CHAIN_SERVICE_HOOK_MIN_SAT_PER_VB, ConfirmationTarget::ChannelFunding)
+		);
+		let non_anchor_fee =
+			ConfirmationTarget::Lightning(LdkConfirmationTarget::NonAnchorChannelFee);
+		assert_eq!(
+			cache[&non_anchor_fee],
+			expected_rate(CHAIN_SERVICE_HOOK_MAX_SAT_PER_VB, non_anchor_fee)
+		);
 	}
 
 	#[tokio::test]
@@ -1514,7 +1801,7 @@ mod tests {
 
 		let fallback_called = Arc::new(AtomicBool::new(false));
 		let fallback_called_clone = Arc::clone(&fallback_called);
-		let cache = resolve_fee_estimates(&hooks, &logger, move || {
+		let cache = resolve_fee_estimates(&hooks, &logger, generous_test_timeout(), move || {
 			let fallback_called = Arc::clone(&fallback_called_clone);
 			let configured_source_cache = configured_source_cache.clone();
 			async move {
@@ -1539,7 +1826,7 @@ mod tests {
 
 		let fallback_called = Arc::new(AtomicBool::new(false));
 		let fallback_called_clone = Arc::clone(&fallback_called);
-		let _ = resolve_fee_estimates(&hooks, &logger, move || {
+		let _ = resolve_fee_estimates(&hooks, &logger, generous_test_timeout(), move || {
 			let fallback_called = Arc::clone(&fallback_called_clone);
 			async move {
 				fallback_called.store(true, Ordering::SeqCst);
@@ -1553,7 +1840,45 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn chain_service_hooks_fee_estimates_hook_timeout_falls_through() {
+		let logger = test_logger();
+		// Never resolves -- combined with a short injected timeout below, this proves the
+		// timeout actually fires rather than hanging the fee-update cycle forever.
+		let hooks = ChainServiceHooks {
+			fee_estimates: Some(Arc::new(|| -> FeeEstimatesFuture {
+				Box::pin(std::future::pending())
+			})),
+			broadcast: None,
+		};
+
+		let mut configured_source_cache = HashMap::new();
+		configured_source_cache
+			.insert(ConfirmationTarget::OnchainPayment, FeeRate::from_sat_per_kwu(999));
+		let expected = configured_source_cache.clone();
+
+		let fallback_called = Arc::new(AtomicBool::new(false));
+		let fallback_called_clone = Arc::clone(&fallback_called);
+		let cache = resolve_fee_estimates(&hooks, &logger, Duration::from_millis(10), move || {
+			let fallback_called = Arc::clone(&fallback_called_clone);
+			let configured_source_cache = configured_source_cache.clone();
+			async move {
+				fallback_called.store(true, Ordering::SeqCst);
+				Ok(configured_source_cache)
+			}
+		})
+		.await
+		.expect("fallback succeeds");
+
+		assert!(
+			fallback_called.load(Ordering::SeqCst),
+			"a hung hook must time out and fall through"
+		);
+		assert_eq!(cache, expected);
+	}
+
+	#[tokio::test]
 	async fn chain_service_hooks_broadcast_hook_ok_skips_p2p() {
+		let logger = test_logger();
 		let hooks = ChainServiceHooks {
 			fee_estimates: None,
 			broadcast: Some(Arc::new(|_txs| -> BroadcastFuture { Box::pin(async { Ok(()) }) })),
@@ -1561,13 +1886,14 @@ mod tests {
 		let p2p_called = Arc::new(AtomicBool::new(false));
 		let p2p_called_clone = Arc::clone(&p2p_called);
 
-		let outcome = dispatch_broadcast(&hooks, Vec::new(), move |_txs| {
-			let p2p_called = Arc::clone(&p2p_called_clone);
-			async move {
-				p2p_called.store(true, Ordering::SeqCst);
-			}
-		})
-		.await;
+		let outcome =
+			dispatch_broadcast(&hooks, &logger, generous_test_timeout(), Vec::new(), move |_txs| {
+				let p2p_called = Arc::clone(&p2p_called_clone);
+				async move {
+					p2p_called.store(true, Ordering::SeqCst);
+				}
+			})
+			.await;
 
 		assert_eq!(outcome, BroadcastOutcome::HookHandled);
 		assert!(
@@ -1578,6 +1904,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn chain_service_hooks_broadcast_hook_err_falls_through_to_p2p() {
+		let logger = test_logger();
 		let hooks = ChainServiceHooks {
 			fee_estimates: None,
 			broadcast: Some(Arc::new(|_txs| -> BroadcastFuture { Box::pin(async { Err(()) }) })),
@@ -1585,13 +1912,14 @@ mod tests {
 		let p2p_called = Arc::new(AtomicBool::new(false));
 		let p2p_called_clone = Arc::clone(&p2p_called);
 
-		let outcome = dispatch_broadcast(&hooks, Vec::new(), move |_txs| {
-			let p2p_called = Arc::clone(&p2p_called_clone);
-			async move {
-				p2p_called.store(true, Ordering::SeqCst);
-			}
-		})
-		.await;
+		let outcome =
+			dispatch_broadcast(&hooks, &logger, generous_test_timeout(), Vec::new(), move |_txs| {
+				let p2p_called = Arc::clone(&p2p_called_clone);
+				async move {
+					p2p_called.store(true, Ordering::SeqCst);
+				}
+			})
+			.await;
 
 		assert_eq!(outcome, BroadcastOutcome::FellThroughToP2p);
 		assert!(
@@ -1602,19 +1930,89 @@ mod tests {
 
 	#[tokio::test]
 	async fn chain_service_hooks_broadcast_no_hook_falls_through_to_p2p() {
+		let logger = test_logger();
 		let hooks = ChainServiceHooks::default();
 		let p2p_called = Arc::new(AtomicBool::new(false));
 		let p2p_called_clone = Arc::clone(&p2p_called);
 
-		let outcome = dispatch_broadcast(&hooks, Vec::new(), move |_txs| {
-			let p2p_called = Arc::clone(&p2p_called_clone);
-			async move {
-				p2p_called.store(true, Ordering::SeqCst);
-			}
-		})
-		.await;
+		let outcome =
+			dispatch_broadcast(&hooks, &logger, generous_test_timeout(), Vec::new(), move |_txs| {
+				let p2p_called = Arc::clone(&p2p_called_clone);
+				async move {
+					p2p_called.store(true, Ordering::SeqCst);
+				}
+			})
+			.await;
 
 		assert_eq!(outcome, BroadcastOutcome::FellThroughToP2p);
 		assert!(p2p_called.load(Ordering::SeqCst), "no hook configured must fall through to P2P");
+	}
+
+	#[tokio::test]
+	async fn chain_service_hooks_broadcast_hook_timeout_falls_through_to_p2p() {
+		let logger = test_logger();
+		let hooks = ChainServiceHooks {
+			fee_estimates: None,
+			broadcast: Some(Arc::new(|_txs| -> BroadcastFuture {
+				Box::pin(std::future::pending())
+			})),
+		};
+		let p2p_called = Arc::new(AtomicBool::new(false));
+		let p2p_called_clone = Arc::clone(&p2p_called);
+
+		let outcome = dispatch_broadcast(
+			&hooks,
+			&logger,
+			Duration::from_millis(10),
+			Vec::new(),
+			move |_txs| {
+				let p2p_called = Arc::clone(&p2p_called_clone);
+				async move {
+					p2p_called.store(true, Ordering::SeqCst);
+				}
+			},
+		)
+		.await;
+
+		assert_eq!(outcome, BroadcastOutcome::FellThroughToP2p);
+		assert!(
+			p2p_called.load(Ordering::SeqCst),
+			"a hung broadcast hook must time out and fall through to P2P"
+		);
+	}
+
+	#[tokio::test]
+	async fn chain_service_hooks_broadcast_hook_succeeds_when_requester_unavailable() {
+		// Models `process_broadcast_package` once the CBF restart loop has given up
+		// (`CbfRuntimeStatus::Stopped`, no live `Requester`): the broadcast hook must still be
+		// tried, and if it accepts the package, the P2P leg (which needs the unavailable
+		// requester) is never reached at all. This is the fix for I-1: previously
+		// `process_broadcast_package` bailed out before even trying the hook once kyoto had
+		// given up -- exactly when an external hook might be the only working relay left (e.g.
+		// for a time-sensitive force-close tx).
+		let logger = test_logger();
+		let hooks = ChainServiceHooks {
+			fee_estimates: None,
+			broadcast: Some(Arc::new(|_txs| -> BroadcastFuture { Box::pin(async { Ok(()) }) })),
+		};
+		let p2p_attempted = Arc::new(AtomicBool::new(false));
+		let p2p_attempted_clone = Arc::clone(&p2p_attempted);
+
+		let outcome =
+			dispatch_broadcast(&hooks, &logger, generous_test_timeout(), Vec::new(), move |_txs| {
+				let p2p_attempted = Arc::clone(&p2p_attempted_clone);
+				async move {
+					// Stands in for `process_broadcast_package`'s real closure when there is no
+					// live `Requester` -- it would log an error and return without broadcasting.
+					p2p_attempted.store(true, Ordering::SeqCst);
+				}
+			})
+			.await;
+
+		assert_eq!(outcome, BroadcastOutcome::HookHandled);
+		assert!(
+			!p2p_attempted.load(Ordering::SeqCst),
+			"the broadcast hook must succeed without the (unavailable) P2P leg ever running"
+		);
 	}
 }

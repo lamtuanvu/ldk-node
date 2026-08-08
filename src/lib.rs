@@ -141,6 +141,21 @@ pub use fee_estimator::{FeerateQuote, SwapFeerateSource};
 #[cfg(feature = "swaps")]
 pub use chain::{ChainStatus, TxStatus};
 
+/// Public external chain-service hook types for the CBF chain source (fee estimates +
+/// broadcast short-circuit). Re-exported from the otherwise-private `chain` module so a
+/// consumer can name [`ChainServiceHooks`] to call
+/// [`crate::builder::NodeBuilder::set_cbf_chain_service_hooks`]. Unlike the swap-primitive
+/// re-exports above, these are CBF-only and not gated behind the `swaps` feature — matching
+/// [`chain::ChainServiceHooks`]'s own (ungated) definition.
+pub use chain::{BroadcastFuture, ChainServiceHooks, FeeEstimatesFuture};
+
+/// Optional external fee-estimation backend for [`set_chain_source_cbf`], re-exported from the
+/// otherwise-private `chain` module so a consumer can name it. Not gated behind `swaps`, matching
+/// [`chain::CbfFeeSourceConfig`]'s own (ungated) definition.
+///
+/// [`set_chain_source_cbf`]: crate::builder::NodeBuilder::set_chain_source_cbf
+pub use chain::CbfFeeSourceConfig;
+
 /// Public types appearing in the swap-primitive signatures on [`Node`]
 /// (Peerswap native primitives, B-series). Re-exported so the consumer crate
 /// can name them without reaching into the (otherwise-private) LDK/bitcoin
