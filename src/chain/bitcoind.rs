@@ -121,6 +121,56 @@ impl BitcoindChainSource {
 		self.api_client.utxo_source()
 	}
 
+	/// Returns the shared on-chain fee estimator backing this chain source
+	/// (Peerswap native primitive B6).
+	#[cfg(feature = "swaps")]
+	pub(super) fn fee_estimator(&self) -> &Arc<OnchainFeeEstimator> {
+		&self.fee_estimator
+	}
+
+	/// Reorg-aware confirmation/eviction query for an ARBITRARY `txid` against
+	/// this Bitcoind backend (Peerswap native primitive B5). See
+	/// [`super::ChainSource::swap_query_tx`] for the fail-closed contract.
+	#[cfg(feature = "swaps")]
+	pub(super) async fn swap_query_tx(&self, txid: Txid) -> super::RawTxObservation {
+		match self.api_client.swap_tx_confirmations(&txid).await {
+			Ok(Some(0)) => super::RawTxObservation::InMempool,
+			Ok(Some(confirmations)) => {
+				// `getrawtransaction` returns the depth but not the height; derive
+				// it as `tip - (confs - 1)`. B5 LOW-2: read a FRESH best-chain tip
+				// (`get_best_block`) rather than the cached `latest_chain_tip`,
+				// which can lag the real tip and yield a height that is too low —
+				// and thus a CSV/claim deadline armed slightly EARLY. A fresh (or
+				// even a one-block-stale-newer) tip can only err on the LATE/safe
+				// side. Fail-soft on the HEIGHT ONLY: the depth is already
+				// authoritative, so on a tip-read error we fall back to the cached
+				// tip rather than failing the whole query closed.
+				let tip_height = match self.api_client.get_best_block().await {
+					Ok((_, Some(h))) => Some(h),
+					Ok((_, None)) => {
+						self.latest_chain_tip.read().unwrap().as_ref().map(|tip| tip.height)
+					},
+					Err(e) => {
+						log_error!(
+							self.logger,
+							"swap_query_tx: Bitcoind fresh-tip read failed for {} ({:?}); falling back to cached tip for height",
+							txid,
+							e
+						);
+						self.latest_chain_tip.read().unwrap().as_ref().map(|tip| tip.height)
+					},
+				};
+				let height = tip_height.map(|t| t.saturating_sub(confirmations.saturating_sub(1)));
+				super::RawTxObservation::Confirmed { height, confirmations }
+			},
+			Ok(None) => super::RawTxObservation::NotFound,
+			Err(e) => {
+				log_error!(self.logger, "swap_query_tx: Bitcoind query failed for {}: {}", txid, e);
+				super::RawTxObservation::Unreachable
+			},
+		}
+	}
+
 	pub(super) async fn validate_zero_fee_commitments_support(&self) -> Result<(), Error> {
 		let node_version_result = tokio::time::timeout(
 			Duration::from_secs(CHAIN_POLLING_TIMEOUT_SECS),

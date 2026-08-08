@@ -98,6 +98,41 @@ impl ElectrumChainSource {
 		self.electrum_runtime_status.write().expect("lock").stop();
 	}
 
+	/// Returns the shared on-chain fee estimator backing this chain source
+	/// (Peerswap native primitive B6).
+	#[cfg(feature = "swaps")]
+	pub(super) fn fee_estimator(&self) -> &Arc<OnchainFeeEstimator> {
+		&self.fee_estimator
+	}
+
+	/// Reorg-aware confirmation/eviction query for an ARBITRARY `txid` against
+	/// this Electrum backend (Peerswap native primitive B5). See
+	/// [`super::ChainSource::swap_query_tx`] for the fail-closed contract.
+	#[cfg(feature = "swaps")]
+	pub(super) async fn swap_query_tx(
+		&self, txid: Txid, script_pubkey: Option<&ScriptBuf>,
+	) -> super::RawTxObservation {
+		let script_pubkey = match script_pubkey {
+			Some(script_pubkey) => script_pubkey.clone(),
+			None => {
+				log_error!(
+					self.logger,
+					"swap_query_tx: Electrum backend requires a watched scriptPubKey for {} (register via watch_txid)",
+					txid
+				);
+				return super::RawTxObservation::Unreachable;
+			},
+		};
+		let client = match self.electrum_runtime_status.read().unwrap().client() {
+			Some(client) => client,
+			None => {
+				log_error!(self.logger, "swap_query_tx: Electrum chain source not started");
+				return super::RawTxObservation::Unreachable;
+			},
+		};
+		client.swap_query_tx(txid, script_pubkey).await
+	}
+
 	pub(crate) async fn sync_onchain_wallet(
 		&self, onchain_wallet: Arc<Wallet>,
 	) -> Result<(), Error> {
@@ -515,6 +550,103 @@ impl ElectrumRuntimeClient {
 			config,
 			logger,
 		})
+	}
+
+	/// Reorg-aware confirmation/eviction query for an ARBITRARY `txid` +
+	/// `script_pubkey` (Peerswap native primitive B5).
+	///
+	/// Electrum exposes no `getrawtransaction`-by-txid-alone RPC; the only
+	/// reorg-aware confirmation signal it exposes is per-scriptPubKey history
+	/// (`blockchain.scripthash.get_history`), so this scans that history for a
+	/// matching `tx_hash` and derives the confirmation depth against a freshly
+	/// polled tip. FAIL-CLOSED (E6) on any transport error or timeout.
+	#[cfg(feature = "swaps")]
+	async fn swap_query_tx(&self, txid: Txid, script_pubkey: ScriptBuf) -> super::RawTxObservation {
+		let electrum_client = Arc::clone(&self.electrum_client);
+		let history_spawn_fut =
+			self.runtime.spawn_blocking(move || electrum_client.script_get_history(&script_pubkey));
+		let history_timeout_fut = tokio::time::timeout(
+			Duration::from_secs(self.sync_config.timeouts_config.per_request_timeout_secs as u64),
+			history_spawn_fut,
+		);
+		let history = match history_timeout_fut.await {
+			Ok(Ok(Ok(history))) => history,
+			Ok(Ok(Err(e))) => {
+				log_error!(
+					self.logger,
+					"swap_query_tx: Electrum history query failed for {}: {}",
+					txid,
+					e
+				);
+				return super::RawTxObservation::Unreachable;
+			},
+			Ok(Err(e)) => {
+				log_error!(
+					self.logger,
+					"swap_query_tx: Electrum history query task failed for {}: {}",
+					txid,
+					e
+				);
+				return super::RawTxObservation::Unreachable;
+			},
+			Err(e) => {
+				log_error!(
+					self.logger,
+					"swap_query_tx: Electrum history query timed out for {}: {}",
+					txid,
+					e
+				);
+				return super::RawTxObservation::Unreachable;
+			},
+		};
+
+		let entry = match history.into_iter().find(|entry| entry.tx_hash == txid) {
+			Some(entry) => entry,
+			None => return super::RawTxObservation::NotFound,
+		};
+
+		// Electrum reports height `0` for a mempool tx, and a negative height for
+		// a mempool tx with an unconfirmed parent; neither is a confirmed height.
+		if entry.height <= 0 {
+			return super::RawTxObservation::InMempool;
+		}
+		let height = entry.height as u32;
+
+		let electrum_client = Arc::clone(&self.electrum_client);
+		let tip_spawn_fut =
+			self.runtime.spawn_blocking(move || electrum_client.block_headers_subscribe());
+		let tip_timeout_fut = tokio::time::timeout(
+			Duration::from_secs(self.sync_config.timeouts_config.per_request_timeout_secs as u64),
+			tip_spawn_fut,
+		);
+		match tip_timeout_fut.await {
+			Ok(Ok(Ok(tip))) if tip.height as u32 >= height => {
+				let confirmations = (tip.height as u32).saturating_sub(height).saturating_add(1);
+				super::RawTxObservation::Confirmed { height: Some(height), confirmations }
+			},
+			Ok(Ok(Ok(tip))) => {
+				log_error!(
+					self.logger,
+					"swap_query_tx: Electrum tip {} below confirming-block height {} for {} (reorg/race); failing closed",
+					tip.height,
+					height,
+					txid
+				);
+				super::RawTxObservation::Unreachable
+			},
+			Ok(Ok(Err(e))) => {
+				log_error!(self.logger, "swap_query_tx: Electrum tip query failed: {}", e);
+				super::RawTxObservation::Unreachable
+			},
+			Ok(Err(e)) => {
+				log_error!(self.logger, "swap_query_tx: Electrum tip query task failed: {}", e);
+				super::RawTxObservation::Unreachable
+			},
+			Err(e) => {
+				log_error!(self.logger, "swap_query_tx: Electrum tip query timed out: {}", e);
+				super::RawTxObservation::Unreachable
+			},
+		}
 	}
 
 	async fn sync_confirmables(

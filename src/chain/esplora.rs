@@ -85,6 +85,78 @@ impl EsploraChainSource {
 		})
 	}
 
+	/// Returns the shared on-chain fee estimator backing this chain source
+	/// (Peerswap native primitive B6).
+	#[cfg(feature = "swaps")]
+	pub(super) fn fee_estimator(&self) -> &Arc<OnchainFeeEstimator> {
+		&self.fee_estimator
+	}
+
+	/// Reorg-aware confirmation/eviction query for an ARBITRARY `txid` against
+	/// this Esplora backend (Peerswap native primitive B5). See
+	/// [`super::ChainSource::swap_query_tx`] for the fail-closed contract.
+	#[cfg(feature = "swaps")]
+	pub(super) async fn swap_query_tx(&self, txid: Txid) -> super::RawTxObservation {
+		let status = match self.esplora_client.get_tx_status(&txid).await {
+			Ok(status) => status,
+			Err(esplora_client::Error::HttpResponse { status: 404, .. }) => {
+				// Definitive "not in the chain or mempool" answer.
+				return super::RawTxObservation::NotFound;
+			},
+			Err(e) => {
+				log_error!(
+					self.logger,
+					"swap_query_tx: Esplora status query failed for {}: {}",
+					txid,
+					e
+				);
+				return super::RawTxObservation::Unreachable;
+			},
+		};
+		if !status.confirmed {
+			return super::RawTxObservation::InMempool;
+		}
+		let height = match status.block_height {
+			Some(height) => height,
+			None => {
+				log_error!(
+					self.logger,
+					"swap_query_tx: Esplora reported a confirmed tx {} without a block height",
+					txid
+				);
+				return super::RawTxObservation::Unreachable;
+			},
+		};
+		// B5 LOW-2: the confirming-block height and the tip come from two
+		// separate Esplora calls; a block/reorg in the gap can make them
+		// inconsistent. Detect the one observable inconsistency — a tip BELOW
+		// the tx's confirming block (impossible on a single consistent chain)
+		// — and FAIL CLOSED (treat as unverifiable) rather than reporting a
+		// bogus `1`-confirmation from the saturating arithmetic. The benign
+		// gap (tip one block ahead of the status snapshot) only over-counts
+		// confirmations by ≤1, which errs on the safe/late side for deadlines.
+		match self.esplora_client.get_height().await {
+			Ok(tip_height) if tip_height >= height => {
+				let confirmations = tip_height.saturating_sub(height).saturating_add(1);
+				super::RawTxObservation::Confirmed { height: Some(height), confirmations }
+			},
+			Ok(tip_height) => {
+				log_error!(
+					self.logger,
+					"swap_query_tx: Esplora tip {} below confirming-block height {} for {} (reorg/race); failing closed",
+					tip_height,
+					height,
+					txid
+				);
+				super::RawTxObservation::Unreachable
+			},
+			Err(e) => {
+				log_error!(self.logger, "swap_query_tx: Esplora tip query failed: {}", e);
+				super::RawTxObservation::Unreachable
+			},
+		}
+	}
+
 	pub(super) async fn validate_zero_fee_commitments_support(&self) -> Result<(), Error> {
 		// This could still accept an Esplora server running against Bitcoin Core v26
 		// through v28, which does not relay ephemeral dust.

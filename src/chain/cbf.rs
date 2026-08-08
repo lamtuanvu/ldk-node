@@ -457,6 +457,16 @@ impl CbfChainSource {
 		kyoto_builder.build()
 	}
 
+	/// Returns the shared on-chain fee estimator backing this chain source
+	/// (Peerswap native primitive B6). CBF derives real fee-rate estimates
+	/// (from an external source or recent-block coinbase outputs, see
+	/// [`CbfFeeSourceConfig`]), so — unlike arbitrary raw-tx confirmation
+	/// queries — feerate estimation is fully supported under CBF.
+	#[cfg(feature = "swaps")]
+	pub(super) fn fee_estimator(&self) -> &Arc<OnchainFeeEstimator> {
+		&self.fee_estimator
+	}
+
 	pub(crate) fn start(&self, chain_listener: ChainListener) {
 		let (node, client) =
 			Self::build_kyoto(&self.trusted_peers, &self.config, &self.logger, &chain_listener);

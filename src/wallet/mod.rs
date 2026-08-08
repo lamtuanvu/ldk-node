@@ -28,7 +28,7 @@ use bitcoin::secp256k1::ecdsa::{RecoverableSignature, Signature};
 use bitcoin::secp256k1::{All, PublicKey, Scalar, Secp256k1, SecretKey};
 use bitcoin::transaction::Sequence;
 use bitcoin::{
-	Address, Amount, FeeRate, OutPoint, ScriptBuf, SignedAmount, Transaction, TxOut, Txid,
+	Address, Amount, FeeRate, Network, OutPoint, ScriptBuf, SignedAmount, Transaction, TxOut, Txid,
 	WPubkeyHash, Weight, WitnessProgram, WitnessVersion,
 };
 use lightning::chain::chaininterface::{

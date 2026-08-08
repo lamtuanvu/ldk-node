@@ -149,10 +149,15 @@ impl ChainSource {
 	/// source-bearing swap feerate quotes.
 	#[cfg(feature = "swaps")]
 	pub(crate) fn fee_estimator(&self) -> &Arc<OnchainFeeEstimator> {
-		match self {
-			Self::Esplora { fee_estimator, .. } => fee_estimator,
-			Self::Electrum { fee_estimator, .. } => fee_estimator,
-			Self::Bitcoind { fee_estimator, .. } => fee_estimator,
+		match &self.kind {
+			ChainSourceKind::Esplora(esplora_chain_source) => esplora_chain_source.fee_estimator(),
+			ChainSourceKind::Electrum(electrum_chain_source) => {
+				electrum_chain_source.fee_estimator()
+			},
+			ChainSourceKind::Bitcoind(bitcoind_chain_source) => {
+				bitcoind_chain_source.fee_estimator()
+			},
+			ChainSourceKind::Cbf(cbf_chain_source) => cbf_chain_source.fee_estimator(),
 		}
 	}
 
@@ -650,131 +655,20 @@ impl ChainSource {
 	pub(crate) async fn swap_query_tx(
 		&self, txid: Txid, script_pubkey: Option<&ScriptBuf>,
 	) -> RawTxObservation {
-		match self {
-			Self::Esplora { esplora_client, logger, .. } => {
-				let status = match esplora_client.get_tx_status(&txid).await {
-					Ok(status) => status,
-					Err(esplora_client::Error::HttpResponse { status: 404, .. }) => {
-						// Definitive "not in the chain or mempool" answer.
-						return RawTxObservation::NotFound;
-					},
-					Err(e) => {
-						log_error!(
-							logger,
-							"swap_query_tx: Esplora status query failed for {}: {}",
-							txid,
-							e
-						);
-						return RawTxObservation::Unreachable;
-					},
-				};
-				if !status.confirmed {
-					return RawTxObservation::InMempool;
-				}
-				let height = match status.block_height {
-					Some(height) => height,
-					None => {
-						log_error!(
-							logger,
-							"swap_query_tx: Esplora reported a confirmed tx {} without a block height",
-							txid
-						);
-						return RawTxObservation::Unreachable;
-					},
-				};
-				// B5 LOW-2: the confirming-block height and the tip come from two
-				// separate Esplora calls; a block/reorg in the gap can make them
-				// inconsistent. Detect the one observable inconsistency — a tip BELOW
-				// the tx's confirming block (impossible on a single consistent chain)
-				// — and FAIL CLOSED (treat as unverifiable) rather than reporting a
-				// bogus `1`-confirmation from the saturating arithmetic. The benign
-				// gap (tip one block ahead of the status snapshot) only over-counts
-				// confirmations by ≤1, which errs on the safe/late side for deadlines.
-				match esplora_client.get_height().await {
-					Ok(tip_height) if tip_height >= height => {
-						let confirmations = tip_height.saturating_sub(height).saturating_add(1);
-						RawTxObservation::Confirmed { height: Some(height), confirmations }
-					},
-					Ok(tip_height) => {
-						log_error!(
-							logger,
-							"swap_query_tx: Esplora tip {} below confirming-block height {} for {} (reorg/race); failing closed",
-							tip_height,
-							height,
-							txid
-						);
-						RawTxObservation::Unreachable
-					},
-					Err(e) => {
-						log_error!(logger, "swap_query_tx: Esplora tip query failed: {}", e);
-						RawTxObservation::Unreachable
-					},
-				}
+		match &self.kind {
+			ChainSourceKind::Esplora(esplora_chain_source) => {
+				esplora_chain_source.swap_query_tx(txid).await
 			},
-			Self::Electrum { electrum_runtime_status, logger, .. } => {
-				let script_pubkey = match script_pubkey {
-					Some(script_pubkey) => script_pubkey.clone(),
-					None => {
-						log_error!(
-							logger,
-							"swap_query_tx: Electrum backend requires a watched scriptPubKey for {} (register via watch_txid)",
-							txid
-						);
-						return RawTxObservation::Unreachable;
-					},
-				};
-				let client = match electrum_runtime_status.read().unwrap().client() {
-					Some(client) => client,
-					None => {
-						log_error!(logger, "swap_query_tx: Electrum chain source not started");
-						return RawTxObservation::Unreachable;
-					},
-				};
-				client.swap_query_tx(txid, script_pubkey).await
+			ChainSourceKind::Electrum(electrum_chain_source) => {
+				electrum_chain_source.swap_query_tx(txid, script_pubkey).await
 			},
-			Self::Bitcoind { api_client, latest_chain_tip, logger, .. } => {
-				match api_client.swap_tx_confirmations(&txid).await {
-					Ok(Some(0)) => RawTxObservation::InMempool,
-					Ok(Some(confirmations)) => {
-						// `getrawtransaction` returns the depth but not the height; derive
-						// it as `tip - (confs - 1)`. B5 LOW-2: read a FRESH best-chain tip
-						// (`get_best_block`) rather than the cached `latest_chain_tip`,
-						// which can lag the real tip and yield a height that is too low —
-						// and thus a CSV/claim deadline armed slightly EARLY. A fresh (or
-						// even a one-block-stale-newer) tip can only err on the LATE/safe
-						// side. Fail-soft on the HEIGHT ONLY: the depth is already
-						// authoritative, so on a tip-read error we fall back to the cached
-						// tip rather than failing the whole query closed.
-						let tip_height = match api_client.get_best_block().await {
-							Ok((_, Some(h))) => Some(h),
-							Ok((_, None)) => {
-								latest_chain_tip.read().unwrap().as_ref().map(|tip| tip.height)
-							},
-							Err(e) => {
-								log_error!(
-									logger,
-									"swap_query_tx: Bitcoind fresh-tip read failed for {} ({:?}); falling back to cached tip for height",
-									txid,
-									e
-								);
-								latest_chain_tip.read().unwrap().as_ref().map(|tip| tip.height)
-							},
-						};
-						let height =
-							tip_height.map(|t| t.saturating_sub(confirmations.saturating_sub(1)));
-						RawTxObservation::Confirmed { height, confirmations }
-					},
-					Ok(None) => RawTxObservation::NotFound,
-					Err(e) => {
-						log_error!(
-							logger,
-							"swap_query_tx: Bitcoind query failed for {}: {}",
-							txid,
-							e
-						);
-						RawTxObservation::Unreachable
-					},
-				}
+			ChainSourceKind::Bitcoind(bitcoind_chain_source) => {
+				bitcoind_chain_source.swap_query_tx(txid).await
+			},
+			ChainSourceKind::Cbf(_) => {
+				// BIP157 cannot query arbitrary raw transactions; PeerSwap is
+				// unavailable under CBF (fail-closed, spec E6).
+				RawTxObservation::Unreachable
 			},
 		}
 	}
