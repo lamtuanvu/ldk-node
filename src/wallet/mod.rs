@@ -2359,7 +2359,7 @@ mod swap_b7_tests {
 	fn swap_key_differs_from_node_identity() {
 		// The node identity secret key is what LDK's KeysManager derives from the
 		// same seed. The swap key MUST come from a different (dedicated) path.
-		let ldk = LdkKeysManager::new(&TEST_SEED, 0, 0);
+		let ldk = LdkKeysManager::new(&TEST_SEED, 0, 0, true);
 		let node_secret = ldk.get_node_secret_key();
 		let secp = Secp256k1::new();
 		let node_pubkey = PublicKey::from_secret_key(&secp, &node_secret);
