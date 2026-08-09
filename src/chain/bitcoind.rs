@@ -1598,6 +1598,22 @@ pub(crate) enum ListenerAction {
 	Deliver,
 	/// The listener already has this exact block on its chain; skip it.
 	AlreadyApplied,
+	/// The block sits BELOW the listener's tip, but our ancestry record does not reach that far,
+	/// so we can neither confirm nor refute that it is on the listener's chain. Skip it — but,
+	/// unlike [`Self::Diverged`], do NOT halt the chain source.
+	///
+	/// This is the *expected* case whenever listener durability skews by more than
+	/// `previous_blocks.len()` (LDK's `BlockLocator` carries `ANTI_REORG_DELAY * 2` = 12
+	/// ancestors, and a locator restored from persistence can carry none at all), which is
+	/// exactly the situation the resume-from-minimum design above sets up. Treating it as
+	/// divergence halts CBF block application permanently for a listener that is merely further
+	/// ahead on the same chain.
+	///
+	/// Nothing is given up by not halting here: the replay keeps climbing, and when it reaches
+	/// `best.height` the same-height arm compares the block hash exactly, and at `best.height + 1`
+	/// the parent hash — both PROVABLE. A listener genuinely sitting on a fork is therefore still
+	/// caught, a few blocks later, by a check that can actually decide it.
+	ReplayUnprovable,
 	/// The listener cannot accept this block without first being rewound.
 	Diverged,
 }
@@ -1631,9 +1647,12 @@ pub(crate) fn listener_action(
 		let idx = (best.height - height - 1) as usize;
 		return match best.previous_blocks.get(idx) {
 			Some(Some(ancestor)) if *ancestor == block_hash => ListenerAction::AlreadyApplied,
-			// Either the ancestor differs (a fork), or we have no record that far back and
-			// therefore cannot prove this block is ours. Both must be treated as divergence.
-			_ => ListenerAction::Diverged,
+			// An ancestor we DO hold at that height and that differs is a proven fork.
+			Some(Some(_)) => ListenerAction::Diverged,
+			// Empty slot (a locator restored from persistence carries no ancestry) or past the
+			// end of the 12-deep window: unprovable either way, and NOT evidence of a fork. See
+			// `ListenerAction::ReplayUnprovable`.
+			Some(None) | None => ListenerAction::ReplayUnprovable,
 		};
 	}
 
@@ -1672,6 +1691,21 @@ impl ChainListener {
 
 	pub(crate) fn take_divergence(&self) -> Option<String> {
 		self.divergence.lock().unwrap().take()
+	}
+
+	/// Logs a replay this listener is too far ahead of for us to prove ancestry for.
+	///
+	/// Deliberately does NOT touch `self.divergence`: this is the ordinary consequence of the
+	/// resume-from-minimum design, not a fork. See [`ListenerAction::ReplayUnprovable`].
+	fn log_unprovable_replay(&self, who: &str, best: &BlockLocator, height: u32) {
+		log_debug!(
+			self.logger,
+			"{} is at height {} and holds no ancestry back to height {}; skipping the replay of \
+			 that block for it (its own tip is re-checked by hash when the replay reaches it).",
+			who,
+			best.height,
+			height,
+		);
 	}
 
 	fn log_divergence(&self, who: &str, best: &BlockLocator, height: u32) {
@@ -1713,6 +1747,9 @@ impl Listen for ChainListener {
 				self.channel_manager.filtered_block_connected(header, txdata, height)
 			},
 			ListenerAction::AlreadyApplied => {},
+			ListenerAction::ReplayUnprovable => {
+				self.log_unprovable_replay("ChannelManager", &cm_best, height)
+			},
 			ListenerAction::Diverged => self.log_divergence("ChannelManager", &cm_best, height),
 		}
 
@@ -1725,6 +1762,9 @@ impl Listen for ChainListener {
 				match listener_action(&monitor_best, block_hash, header.prev_blockhash, height) {
 					ListenerAction::Deliver | ListenerAction::AlreadyApplied => {
 						self.chain_monitor.filtered_block_connected(header, txdata, height)
+					},
+					ListenerAction::ReplayUnprovable => {
+						self.log_unprovable_replay("ChainMonitor", &monitor_best, height)
 					},
 					ListenerAction::Diverged => {
 						self.log_divergence("ChainMonitor", &monitor_best, height)
@@ -1741,6 +1781,9 @@ impl Listen for ChainListener {
 				self.output_sweeper.filtered_block_connected(header, txdata, height)
 			},
 			ListenerAction::AlreadyApplied => {},
+			ListenerAction::ReplayUnprovable => {
+				self.log_unprovable_replay("OutputSweeper", &sweeper_best, height)
+			},
 			ListenerAction::Diverged => self.log_divergence("OutputSweeper", &sweeper_best, height),
 		}
 	}
@@ -1754,6 +1797,9 @@ impl Listen for ChainListener {
 		match listener_action(&cm_best, block_hash, block.header.prev_blockhash, height) {
 			ListenerAction::Deliver => self.channel_manager.block_connected(block, height),
 			ListenerAction::AlreadyApplied => {},
+			ListenerAction::ReplayUnprovable => {
+				self.log_unprovable_replay("ChannelManager", &cm_best, height)
+			},
 			ListenerAction::Diverged => self.log_divergence("ChannelManager", &cm_best, height),
 		}
 
@@ -1768,6 +1814,9 @@ impl Listen for ChainListener {
 					ListenerAction::Deliver | ListenerAction::AlreadyApplied => {
 						self.chain_monitor.block_connected(block, height)
 					},
+					ListenerAction::ReplayUnprovable => {
+						self.log_unprovable_replay("ChainMonitor", &monitor_best, height)
+					},
 					ListenerAction::Diverged => {
 						self.log_divergence("ChainMonitor", &monitor_best, height)
 					},
@@ -1780,6 +1829,9 @@ impl Listen for ChainListener {
 		match listener_action(&sweeper_best, block_hash, block.header.prev_blockhash, height) {
 			ListenerAction::Deliver => self.output_sweeper.block_connected(block, height),
 			ListenerAction::AlreadyApplied => {},
+			ListenerAction::ReplayUnprovable => {
+				self.log_unprovable_replay("OutputSweeper", &sweeper_best, height)
+			},
 			ListenerAction::Diverged => self.log_divergence("OutputSweeper", &sweeper_best, height),
 		}
 	}
@@ -1904,13 +1956,51 @@ mod tests {
 	}
 
 	#[test]
-	fn listener_action_reports_divergence_beyond_known_ancestry() {
+	fn listener_action_reports_an_unprovable_replay_beyond_known_ancestry() {
 		// `previous_blocks` holds 12 ancestors; past that we cannot prove the block is ours, so it
-		// must not be assumed to be a safe replay.
+		// must not be assumed to be a safe replay — it is NOT `AlreadyApplied`, the block is still
+		// withheld from the listener.
+		//
+		// It is not `Diverged` either. Resume-from-minimum deliberately replays blocks to any
+		// listener that persisted further ahead (see `ListenerAction`'s own doc comment), and
+		// listener durability routinely skews by more than 12 blocks — measured live at 20
+		// (wallet 7871 / ChainMonitor 7888 / ChannelManager 7891, all three on the canonical
+		// chain). Calling that divergence halted CBF block application PERMANENTLY on a healthy
+		// node: every later restart re-derived the same minimum, re-hit the same unprovable
+		// replay, and re-halted, so `sync_state` latched `failed` forever.
 		assert_eq!(
 			listener_action(&locator(100, 50), hash(1), hash(0), 50),
-			ListenerAction::Diverged
+			ListenerAction::ReplayUnprovable
 		);
+	}
+
+	#[test]
+	fn listener_action_reports_an_unprovable_replay_when_the_locator_carries_no_ancestry() {
+		// `BlockLocator::new` leaves every ancestry slot empty, which is what a listener restored
+		// from persistence can look like. Inside the window but with nothing recorded is still
+		// "cannot decide", not "forked".
+		let no_ancestry = BlockLocator::new(hash(50), 100);
+		assert_eq!(
+			listener_action(&no_ancestry, hash(48), hash(47), 98),
+			ListenerAction::ReplayUnprovable
+		);
+	}
+
+	#[test]
+	fn an_unprovable_replay_still_meets_a_provable_check_at_the_listeners_own_tip() {
+		// The safety property that makes `ReplayUnprovable` safe to not halt on: the replay keeps
+		// climbing, and at the listener's own height the classifier compares block hashes
+		// exactly. A listener genuinely on a fork is caught there instead of below it.
+		let ahead = locator(100, 50);
+		// Below the tip, past the ancestry window: undecidable, keep going.
+		assert_eq!(listener_action(&ahead, hash(1), hash(0), 50), ListenerAction::ReplayUnprovable);
+		// At the tip on the same chain: a plain replay.
+		assert_eq!(
+			listener_action(&ahead, hash(50), hash(49), 100),
+			ListenerAction::AlreadyApplied
+		);
+		// At the tip on a DIFFERENT chain: still caught, still halts.
+		assert_eq!(listener_action(&ahead, hash(0xbb), hash(0xaa), 100), ListenerAction::Diverged);
 	}
 
 	#[test]
