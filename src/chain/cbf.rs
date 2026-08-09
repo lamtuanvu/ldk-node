@@ -395,6 +395,27 @@ const CBF_MIN_FEERATE_SAT_PER_KWU: u64 = 250;
 /// delays one sample) rather than stalling.
 const CBF_BLOCK_FETCH_TIMEOUT_SECS: u64 = 10;
 
+/// Per-transaction timeout on the kyoto P2P broadcast handoff.
+///
+/// [`Requester::submit_package`] resolves only once a peer has actually PULLED the transaction:
+/// kyoto announces the wtxid in an `inv` and completes the caller's oneshot when it answers the
+/// peer's `getdata`. A peer that already knows the transaction never sends `getdata` — Bitcoin
+/// Core logs `got inv: wtx <id> have peer=N` and drops it — so that future NEVER resolves, and
+/// kyoto attaches no timeout of its own.
+///
+/// Re-broadcasting a transaction the network already has is routine, not exceptional: both sides
+/// of a cooperative close broadcast the same closing transaction, both sides of a force close may
+/// broadcast the same commitment, and LDK re-broadcasts unconfirmed transactions on a timer. Since
+/// [`crate::chain::ChainSource::continuously_process_broadcast_queue`] drains SERIALLY, a single
+/// unresolvable handoff would wedge every LATER broadcast for the lifetime of the node —
+/// including the force-close sweeps that recover a channel balance. Hence the bound, matching the
+/// file's other kyoto-request timeout ([`CBF_BLOCK_FETCH_TIMEOUT_SECS`]).
+///
+/// Timing out does not retract the announcement: the transaction stays in kyoto's broadcast queue
+/// and is still served if a peer asks for it later, and is re-announced to every peer that
+/// completes a handshake afterwards.
+const CBF_P2P_BROADCAST_TIMEOUT_SECS: u64 = 10;
+
 /// Recent per-block coinbase-derived fee rates, keyed by height so we can window on the tip, evict
 /// stale entries, and detect reorged-out blocks (a height whose cached hash no longer matches the
 /// canonical chain). Shared via `Arc` between the fee estimator and the [`BlockApplicator`].
@@ -604,6 +625,46 @@ where
 	}
 	p2p_send(txs).await;
 	BroadcastOutcome::FellThroughToP2p
+}
+
+/// Awaits ONE kyoto broadcast handoff under `hold_timeout`, never propagating a failure.
+///
+/// `submit` is a [`Requester::submit_package`] future; `what` names the transaction (or package)
+/// for the log. Returns `true` only when a peer pulled the transaction inside the budget.
+///
+/// The timeout is the whole point — see [`CBF_P2P_BROADCAST_TIMEOUT_SECS`] for why an unbounded
+/// await here wedges the entire serial broadcast queue. Expiring is logged at INFO rather than
+/// ERROR because the overwhelmingly common cause is benign (the peer already has the transaction);
+/// a genuine relay failure shows up as the transaction never confirming, which the caller's own
+/// re-broadcast timer keeps retrying.
+///
+/// A free function (not a method), generic over the future, so it is unit-testable without a live
+/// kyoto node — the same pattern as [`dispatch_broadcast`].
+async fn bounded_p2p_handoff<T, E, Fut>(
+	logger: &Logger, hold_timeout: Duration, what: &str, submit: Fut,
+) -> bool
+where
+	Fut: std::future::Future<Output = Result<T, E>>,
+	E: std::fmt::Debug,
+{
+	match tokio::time::timeout(hold_timeout, submit).await {
+		Ok(Ok(_)) => true,
+		Ok(Err(e)) => {
+			log_error!(logger, "Failed to broadcast {}: {:?}", what, e);
+			false
+		},
+		Err(_elapsed) => {
+			log_info!(
+				logger,
+				"No peer requested {} within {:?}; it stays queued for relay in the CBF client \
+				 (a peer that already has a transaction never asks for it) and the broadcast \
+				 queue moves on.",
+				what,
+				hold_timeout,
+			);
+			false
+		},
+	}
 }
 
 impl CbfChainSource {
@@ -1252,23 +1313,27 @@ impl CbfChainSource {
 					);
 					return;
 				};
+				let hold_timeout = Duration::from_secs(CBF_P2P_BROADCAST_TIMEOUT_SECS);
 				match Package::from_vec(package.clone()) {
-					Ok(package) => {
-						if let Err(e) = requester.submit_package(package).await {
-							log_error!(logger, "Failed to broadcast transaction package: {:?}", e);
-						}
+					Ok(kyoto_package) => {
+						bounded_p2p_handoff(
+							&logger,
+							hold_timeout,
+							"the transaction package",
+							requester.submit_package(kyoto_package),
+						)
+						.await;
 					},
 					Err(_) => {
 						for tx in package {
-							let txid = tx.compute_txid();
-							if let Err(e) = requester.submit_package(tx).await {
-								log_error!(
-									logger,
-									"Failed to broadcast transaction {}: {:?}",
-									txid,
-									e
-								);
-							}
+							let what = format!("transaction {}", tx.compute_txid());
+							bounded_p2p_handoff(
+								&logger,
+								hold_timeout,
+								&what,
+								requester.submit_package(tx),
+							)
+							.await;
 						}
 					},
 				}
@@ -2066,6 +2131,139 @@ mod tests {
 		assert!(
 			!p2p_attempted.load(Ordering::SeqCst),
 			"the broadcast hook must succeed without the (unavailable) P2P leg ever running"
+		);
+	}
+
+	// ------------------------------------------------------------------------------------------
+	// P2P broadcast handoff (defect P2). `Requester::submit_package` completes only when a peer
+	// PULLS the transaction, so it never completes for a transaction the peer already has — and
+	// `continuously_process_broadcast_queue` drains serially, so one such handoff used to wedge
+	// every broadcast behind it (measured live: a cooperative-close re-broadcast stalled the
+	// queue, and NONE of the force-close sweeps generated over the next nine minutes ever
+	// reached the network).
+	// ------------------------------------------------------------------------------------------
+
+	/// Stand-in for `Requester::submit_package` against a peer that already knows the
+	/// transaction: kyoto queued the announcement, Bitcoin Core answered the `inv` with silence
+	/// (`got inv: wtx <id> have peer=N`), and the oneshot is therefore never completed.
+	fn never_pulled_by_a_peer() -> impl std::future::Future<Output = Result<(), ()>> {
+		std::future::pending()
+	}
+
+	/// Short enough that the never-pulled cases cost the suite nothing, long enough that the
+	/// pulled cases below are never mistaken for one.
+	fn short_handoff_timeout() -> Duration {
+		Duration::from_millis(50)
+	}
+
+	#[tokio::test]
+	async fn a_handoff_no_peer_pulls_is_abandoned_rather_than_awaited_forever() {
+		let logger = test_logger();
+
+		// The outer timeout is what makes this a test rather than a hang: without the bound
+		// inside `bounded_p2p_handoff` the inner future is `Pending` forever.
+		let relayed = tokio::time::timeout(
+			Duration::from_secs(5),
+			bounded_p2p_handoff(
+				&logger,
+				short_handoff_timeout(),
+				"the transaction under test",
+				never_pulled_by_a_peer(),
+			),
+		)
+		.await
+		.expect(
+			"the P2P handoff must return on its own; an unbounded await here is the P2 wedge \
+			 that stops every later broadcast, force-close sweeps included",
+		);
+
+		assert!(!relayed, "a transaction no peer asked for was not relayed");
+	}
+
+	#[tokio::test]
+	async fn a_handoff_a_peer_does_pull_is_awaited_to_completion() {
+		// Non-vacuity for the bound: it must not turn every handoff into a timeout.
+		let logger = test_logger();
+
+		let relayed = bounded_p2p_handoff(
+			&logger,
+			generous_test_timeout(),
+			"the transaction under test",
+			async {
+				tokio::time::sleep(Duration::from_millis(5)).await;
+				Ok::<(), ()>(())
+			},
+		)
+		.await;
+
+		assert!(relayed, "a transaction a peer pulled must be reported as relayed");
+	}
+
+	#[tokio::test]
+	async fn a_handoff_rejected_by_the_cbf_client_reports_failure_without_stalling() {
+		// `submit_package` errors when the kyoto node has stopped. That is a fast, honest
+		// failure and must stay distinct from the timeout path.
+		let logger = test_logger();
+
+		let relayed = bounded_p2p_handoff(
+			&logger,
+			generous_test_timeout(),
+			"the transaction under test",
+			async { Err::<(), &str>("the CBF node has stopped") },
+		)
+		.await;
+
+		assert!(!relayed, "a submit error must not be reported as a relay");
+	}
+
+	#[tokio::test]
+	async fn a_handoff_no_peer_pulls_does_not_wedge_the_broadcasts_behind_it() {
+		// The scenario-10 shape in miniature: the node re-broadcasts a cooperative-close
+		// transaction its counterparty already relayed (so no peer ever pulls it), and the
+		// force-close sweeps queued behind it must still go out. This is the property that
+		// makes the bound load-bearing, because the real drain loop is serial.
+		let logger = test_logger();
+		let relayed: Arc<Mutex<Vec<&str>>> = Arc::new(Mutex::new(Vec::new()));
+
+		// (what, will a peer pull it?)
+		let queue = vec![
+			("the duplicate cooperative-close tx", false),
+			("force-close sweep #1", true),
+			("force-close sweep #2", true),
+		];
+
+		let drained = tokio::time::timeout(Duration::from_secs(5), async {
+			for (what, pulled) in queue {
+				let ok = if pulled {
+					bounded_p2p_handoff(&logger, short_handoff_timeout(), what, async {
+						Ok::<(), ()>(())
+					})
+					.await
+				} else {
+					bounded_p2p_handoff(
+						&logger,
+						short_handoff_timeout(),
+						what,
+						never_pulled_by_a_peer(),
+					)
+					.await
+				};
+				if ok {
+					relayed.lock().expect("lock").push(what);
+				}
+			}
+		})
+		.await;
+
+		assert!(
+			drained.is_ok(),
+			"the serial broadcast drain must finish; hanging here is exactly the fund-safety \
+			 defect (sweeps generated forever, none relayed)"
+		);
+		assert_eq!(
+			*relayed.lock().expect("lock"),
+			vec!["force-close sweep #1", "force-close sweep #2"],
+			"every broadcast queued behind an un-pulled one must still reach a peer"
 		);
 	}
 }
