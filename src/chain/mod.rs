@@ -373,6 +373,7 @@ impl ChainSource {
 					output_sweeper,
 					logger: Arc::clone(&self.logger),
 					divergence: Arc::new(Mutex::new(None)),
+					replay_batch: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
 				};
 				cbf_chain_source.start(chain_listener);
 			},

@@ -5,7 +5,7 @@
 // http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
 // accordance with one or both of these licenses.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -477,6 +477,7 @@ impl BitcoindChainSource {
 			output_sweeper,
 			logger: Arc::clone(&self.logger),
 			divergence: Arc::new(Mutex::new(None)),
+			replay_batch: Arc::new(Mutex::new(BTreeMap::new())),
 		};
 		let mut spv_client =
 			SpvClient::new(chain_tip, chain_poller, HeaderCache::new(), &chain_listener);
@@ -1577,6 +1578,70 @@ pub(crate) struct ChainListener {
 	/// source drains this after each block and must stop advancing when it is set: continuing
 	/// would publish a "synced" tip while a listener sits on a stale chain.
 	pub(crate) divergence: Arc<Mutex<Option<String>>>,
+	/// Per-listener tally of the replay batch in flight, drained at every tip boundary.
+	///
+	/// Exists to tell two outcomes of [`ListenerAction::ReplayUnprovable`] apart, which are
+	/// indistinguishable block by block: a listener that skips a stretch it cannot prove and then
+	/// *reconnects* to the chain (benign — the resume-from-minimum design), and a listener the
+	/// replay can never reach at all (stranded on a fork). See
+	/// [`ChainListener::record_stranded_listeners`].
+	pub(crate) replay_batch: Arc<Mutex<BTreeMap<&'static str, ReplayTally>>>,
+}
+
+/// What one listener decided about the blocks of the replay batch currently in flight.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReplayTally {
+	/// Blocks skipped because ancestry could be neither confirmed nor refuted.
+	pub(crate) unprovable: u32,
+	/// Decisions that could actually be proven: delivered, an exact replay, or a fork.
+	pub(crate) provable: u32,
+	/// The listener's own tip height as of its most recent unprovable skip.
+	pub(crate) tip_height: u32,
+}
+
+/// What a listener's replay batch amounts to once the replay has reached the chain's tip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BatchVerdict {
+	/// Nothing to say: the listener was never asked about a block it could not prove.
+	Ordinary,
+	/// Skipped a stretch it could not prove and then reconnected to the chain. Benign — this is
+	/// what the resume-from-minimum design does on every restart with skewed listener durability.
+	SkippedThenReconnected,
+	/// The replay ended without this listener ever reaching a block it could prove, and its own
+	/// tip is at or above the tip we ended at, so no later replay of this chain can reach it
+	/// either. It is on a chain we can neither extend nor refute.
+	Stranded,
+}
+
+impl ReplayTally {
+	/// Folds one decision into the batch tally.
+	fn note(&mut self, best: &BlockLocator, action: ListenerAction) {
+		match action {
+			ListenerAction::ReplayUnprovable => {
+				self.unprovable = self.unprovable.saturating_add(1);
+				self.tip_height = best.height;
+			},
+			ListenerAction::Deliver | ListenerAction::AlreadyApplied | ListenerAction::Diverged => {
+				self.provable = self.provable.saturating_add(1)
+			},
+		}
+	}
+
+	/// Judges the batch against the tip the replay ended at.
+	///
+	/// `provable == 0` on its own already implies the listener sits at or above `tip_height` — a
+	/// replay passes through every height at or below a listener's tip, and those compare
+	/// provably — but being unreachable is what actually makes the case terminal, so it is checked
+	/// rather than assumed.
+	fn verdict(&self, tip_height: u32) -> BatchVerdict {
+		if self.unprovable == 0 {
+			BatchVerdict::Ordinary
+		} else if self.provable > 0 || self.tip_height < tip_height {
+			BatchVerdict::SkippedThenReconnected
+		} else {
+			BatchVerdict::Stranded
+		}
+	}
 }
 
 /// Whether a listener should be handed a given block.
@@ -1592,7 +1657,7 @@ pub(crate) struct ChainListener {
 /// Classification is deliberately hash-aware. Deciding on height alone would treat a *different*
 /// block at an already-seen height as an ordinary replay and skip it, silently stranding the
 /// listener on a stale fork — a worse failure than the panic being avoided, because it is silent.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ListenerAction {
 	/// The listener expects exactly this block.
 	Deliver,
@@ -1609,10 +1674,19 @@ pub(crate) enum ListenerAction {
 	/// divergence halts CBF block application permanently for a listener that is merely further
 	/// ahead on the same chain.
 	///
-	/// Nothing is given up by not halting here: the replay keeps climbing, and when it reaches
-	/// `best.height` the same-height arm compares the block hash exactly, and at `best.height + 1`
-	/// the parent hash — both PROVABLE. A listener genuinely sitting on a fork is therefore still
-	/// caught, a few blocks later, by a check that can actually decide it.
+	/// The decision is deferred, not dropped — but only for as long as the replay can still reach
+	/// the listener. While it climbs towards `best.height` the same-height arm will compare the
+	/// block hash exactly, and at `best.height + 1` the parent hash — both PROVABLE — so a
+	/// listener genuinely sitting on a fork is caught a few blocks later by a check that can
+	/// decide it.
+	///
+	/// That argument holds only while the chain being replayed is at least as long as the
+	/// listener's own chain. It does NOT cover a reorg that leaves the canonical tip *below* an
+	/// ahead listener's persisted tip (needs to be deeper than the ancestry window, or any depth
+	/// at all against a locator restored from persistence with no ancestors): the replay ends
+	/// before it can prove anything, every block is unprovable, and deferring forever is the same
+	/// as dropping. That geometry is caught at the tip boundary instead — see
+	/// [`ChainListener::record_stranded_listeners`], which fails closed on it.
 	ReplayUnprovable,
 	/// The listener cannot accept this block without first being rewound.
 	Diverged,
@@ -1693,10 +1767,85 @@ impl ChainListener {
 		self.divergence.lock().unwrap().take()
 	}
 
+	/// Records one listener's decision about one replay block in the batch ledger, logs it, and
+	/// hands it back so the caller can act on it.
+	///
+	/// EVERY decision must flow through here. The ledger's whole value is the contrast between a
+	/// listener that skipped some blocks and one that skipped *only* blocks, so a decision that
+	/// bypassed it would read as an absence of evidence.
+	fn note_decision(
+		&self, who: &'static str, best: &BlockLocator, height: u32, action: ListenerAction,
+	) -> ListenerAction {
+		self.replay_batch.lock().unwrap().entry(who).or_default().note(best, action);
+		match action {
+			ListenerAction::ReplayUnprovable => self.log_unprovable_replay(who, best, height),
+			ListenerAction::Diverged => self.log_divergence(who, best, height),
+			ListenerAction::Deliver | ListenerAction::AlreadyApplied => {},
+		}
+		action
+	}
+
+	/// Drains the batch ledger at a tip boundary and fails closed on any listener the replay could
+	/// never prove a connection to.
+	///
+	/// A batch that ends at `tip_height` is the last chance a listener gets: the replay is not
+	/// coming back for it. So a listener that saw nothing but [`ListenerAction::ReplayUnprovable`]
+	/// across the whole batch, and whose own tip is at or above the tip we just reached, is not
+	/// waiting to be caught up — it is stranded on a chain we cannot extend or refute, and the
+	/// deferral promised by `ReplayUnprovable` can never be honoured. Recording it as divergence
+	/// halts the chain source, which is the pre-`ReplayUnprovable` behaviour for exactly this
+	/// (true-positive) case.
+	///
+	/// A listener that skipped a stretch and then reconnected — the ordinary consequence of the
+	/// resume-from-minimum design, and the case `ReplayUnprovable` exists for — has `provable > 0`
+	/// and is merely reported, at a level that does not depend on debug logging being on.
+	///
+	/// Returns `true` when at least one listener was recorded as stranded.
+	pub(crate) fn record_stranded_listeners(&self, tip_height: u32) -> bool {
+		let batch = std::mem::take(&mut *self.replay_batch.lock().unwrap());
+		let mut stranded = false;
+		for (who, tally) in batch {
+			match tally.verdict(tip_height) {
+				BatchVerdict::Ordinary => {},
+				BatchVerdict::SkippedThenReconnected => log_info!(
+					self.logger,
+					"{} skipped {} block(s) of the replay it could not prove ancestry for, then \
+					 reconnected to the chain ({} proven decision(s), listener tip {}).",
+					who,
+					tally.unprovable,
+					tally.provable,
+					tally.tip_height,
+				),
+				BatchVerdict::Stranded => {
+					stranded = true;
+					self.record_divergence(format!(
+						"{} is stranded at height {} above the synced tip {} ({} block(s) \
+						 replayed, none provable): the replay ended without ever reaching a block \
+						 it could prove",
+						who, tally.tip_height, tip_height, tally.unprovable
+					));
+					log_error!(
+						self.logger,
+						"{} sits at height {} while the chain we just synced ends at {}, and none \
+						 of the {} replayed block(s) could be proven to be on its chain. It is on \
+						 a chain we can neither extend nor refute, so it is stranded rather than \
+						 lagging.",
+						who,
+						tally.tip_height,
+						tip_height,
+						tally.unprovable,
+					);
+				},
+			}
+		}
+		stranded
+	}
+
 	/// Logs a replay this listener is too far ahead of for us to prove ancestry for.
 	///
-	/// Deliberately does NOT touch `self.divergence`: this is the ordinary consequence of the
-	/// resume-from-minimum design, not a fork. See [`ListenerAction::ReplayUnprovable`].
+	/// Deliberately does NOT touch `self.divergence`: on its own this is the ordinary consequence
+	/// of the resume-from-minimum design, not a fork. Whether it stayed ordinary is decided at the
+	/// tip boundary by [`Self::record_stranded_listeners`], so this stays at debug level.
 	fn log_unprovable_replay(&self, who: &str, best: &BlockLocator, height: u32) {
 		log_debug!(
 			self.logger,
@@ -1708,14 +1857,20 @@ impl ChainListener {
 		);
 	}
 
-	fn log_divergence(&self, who: &str, best: &BlockLocator, height: u32) {
+	/// Records the first divergence seen since the last drain. Later ones are dropped: the chain
+	/// source halts on the first, and the first is the one that explains the rest.
+	fn record_divergence(&self, reason: String) {
 		let mut recorded = self.divergence.lock().unwrap();
 		if recorded.is_none() {
-			*recorded = Some(format!(
-				"{} diverged at height {} (listener at {}, hash {})",
-				who, height, best.height, best.block_hash
-			));
+			*recorded = Some(reason);
 		}
+	}
+
+	fn log_divergence(&self, who: &str, best: &BlockLocator, height: u32) {
+		self.record_divergence(format!(
+			"{} diverged at height {} (listener at {}, hash {})",
+			who, height, best.height, best.block_hash
+		));
 		log_error!(
 			self.logger,
 			"{} cannot accept the block at height {}: it is at height {} (hash {}). It must be \
@@ -1741,16 +1896,17 @@ impl Listen for ChainListener {
 
 		let block_hash = header.block_hash();
 
+		// `note_decision` does the logging and the batch tally; the arms below decide only what
+		// reaches the listener.
 		let cm_best = self.channel_manager.current_best_block();
-		match listener_action(&cm_best, block_hash, header.prev_blockhash, height) {
+		let cm_action = listener_action(&cm_best, block_hash, header.prev_blockhash, height);
+		match self.note_decision("ChannelManager", &cm_best, height, cm_action) {
 			ListenerAction::Deliver => {
 				self.channel_manager.filtered_block_connected(header, txdata, height)
 			},
-			ListenerAction::AlreadyApplied => {},
-			ListenerAction::ReplayUnprovable => {
-				self.log_unprovable_replay("ChannelManager", &cm_best, height)
-			},
-			ListenerAction::Diverged => self.log_divergence("ChannelManager", &cm_best, height),
+			ListenerAction::AlreadyApplied
+			| ListenerAction::ReplayUnprovable
+			| ListenerAction::Diverged => {},
 		}
 
 		// `ChainMonitor` has no chain-order assertion of its own, but `ChannelMonitor` advances its
@@ -1759,16 +1915,13 @@ impl Listen for ChainListener {
 		// monitor: monitors ahead of that point ignore heights at or below their own tip.
 		match self.min_monitor_best_block() {
 			Some(monitor_best) => {
-				match listener_action(&monitor_best, block_hash, header.prev_blockhash, height) {
+				let action =
+					listener_action(&monitor_best, block_hash, header.prev_blockhash, height);
+				match self.note_decision("ChainMonitor", &monitor_best, height, action) {
 					ListenerAction::Deliver | ListenerAction::AlreadyApplied => {
 						self.chain_monitor.filtered_block_connected(header, txdata, height)
 					},
-					ListenerAction::ReplayUnprovable => {
-						self.log_unprovable_replay("ChainMonitor", &monitor_best, height)
-					},
-					ListenerAction::Diverged => {
-						self.log_divergence("ChainMonitor", &monitor_best, height)
-					},
+					ListenerAction::ReplayUnprovable | ListenerAction::Diverged => {},
 				}
 			},
 			// No monitors: nothing to strand.
@@ -1776,15 +1929,15 @@ impl Listen for ChainListener {
 		}
 
 		let sweeper_best = self.output_sweeper.current_best_block();
-		match listener_action(&sweeper_best, block_hash, header.prev_blockhash, height) {
+		let sweeper_action =
+			listener_action(&sweeper_best, block_hash, header.prev_blockhash, height);
+		match self.note_decision("OutputSweeper", &sweeper_best, height, sweeper_action) {
 			ListenerAction::Deliver => {
 				self.output_sweeper.filtered_block_connected(header, txdata, height)
 			},
-			ListenerAction::AlreadyApplied => {},
-			ListenerAction::ReplayUnprovable => {
-				self.log_unprovable_replay("OutputSweeper", &sweeper_best, height)
-			},
-			ListenerAction::Diverged => self.log_divergence("OutputSweeper", &sweeper_best, height),
+			ListenerAction::AlreadyApplied
+			| ListenerAction::ReplayUnprovable
+			| ListenerAction::Diverged => {},
 		}
 	}
 
@@ -1794,45 +1947,36 @@ impl Listen for ChainListener {
 		let block_hash = block.header.block_hash();
 
 		let cm_best = self.channel_manager.current_best_block();
-		match listener_action(&cm_best, block_hash, block.header.prev_blockhash, height) {
+		let cm_action = listener_action(&cm_best, block_hash, block.header.prev_blockhash, height);
+		match self.note_decision("ChannelManager", &cm_best, height, cm_action) {
 			ListenerAction::Deliver => self.channel_manager.block_connected(block, height),
-			ListenerAction::AlreadyApplied => {},
-			ListenerAction::ReplayUnprovable => {
-				self.log_unprovable_replay("ChannelManager", &cm_best, height)
-			},
-			ListenerAction::Diverged => self.log_divergence("ChannelManager", &cm_best, height),
+			ListenerAction::AlreadyApplied
+			| ListenerAction::ReplayUnprovable
+			| ListenerAction::Diverged => {},
 		}
 
 		match self.min_monitor_best_block() {
 			Some(monitor_best) => {
-				match listener_action(
-					&monitor_best,
-					block_hash,
-					block.header.prev_blockhash,
-					height,
-				) {
+				let action =
+					listener_action(&monitor_best, block_hash, block.header.prev_blockhash, height);
+				match self.note_decision("ChainMonitor", &monitor_best, height, action) {
 					ListenerAction::Deliver | ListenerAction::AlreadyApplied => {
 						self.chain_monitor.block_connected(block, height)
 					},
-					ListenerAction::ReplayUnprovable => {
-						self.log_unprovable_replay("ChainMonitor", &monitor_best, height)
-					},
-					ListenerAction::Diverged => {
-						self.log_divergence("ChainMonitor", &monitor_best, height)
-					},
+					ListenerAction::ReplayUnprovable | ListenerAction::Diverged => {},
 				}
 			},
 			None => self.chain_monitor.block_connected(block, height),
 		}
 
 		let sweeper_best = self.output_sweeper.current_best_block();
-		match listener_action(&sweeper_best, block_hash, block.header.prev_blockhash, height) {
+		let sweeper_action =
+			listener_action(&sweeper_best, block_hash, block.header.prev_blockhash, height);
+		match self.note_decision("OutputSweeper", &sweeper_best, height, sweeper_action) {
 			ListenerAction::Deliver => self.output_sweeper.block_connected(block, height),
-			ListenerAction::AlreadyApplied => {},
-			ListenerAction::ReplayUnprovable => {
-				self.log_unprovable_replay("OutputSweeper", &sweeper_best, height)
-			},
-			ListenerAction::Diverged => self.log_divergence("OutputSweeper", &sweeper_best, height),
+			ListenerAction::AlreadyApplied
+			| ListenerAction::ReplayUnprovable
+			| ListenerAction::Diverged => {},
 		}
 	}
 
@@ -1841,6 +1985,10 @@ impl Listen for ChainListener {
 		self.channel_manager.blocks_disconnected(fork_point_block);
 		self.chain_monitor.blocks_disconnected(fork_point_block);
 		self.output_sweeper.blocks_disconnected(fork_point_block);
+		// Every listener just moved back to the fork point, so the batch tallied against their old
+		// tips describes a chain none of them are on any more. The replay that follows is the one
+		// that gets judged.
+		self.replay_batch.lock().unwrap().clear();
 	}
 }
 
@@ -1881,8 +2029,8 @@ mod tests {
 	use serde_json::json;
 
 	use crate::chain::bitcoind::{
-		listener_action, FeeResponse, GetMempoolEntryResponse, GetRawMempoolResponse,
-		GetRawTransactionResponse, ListenerAction, MempoolMinFeeResponse,
+		listener_action, BatchVerdict, FeeResponse, GetMempoolEntryResponse, GetRawMempoolResponse,
+		GetRawTransactionResponse, ListenerAction, MempoolMinFeeResponse, ReplayTally,
 	};
 
 	fn hash(byte: u8) -> bitcoin::BlockHash {
@@ -1991,6 +2139,10 @@ mod tests {
 		// The safety property that makes `ReplayUnprovable` safe to not halt on: the replay keeps
 		// climbing, and at the listener's own height the classifier compares block hashes
 		// exactly. A listener genuinely on a fork is caught there instead of below it.
+		//
+		// This holds only while the replay can actually GET to that height. When it cannot — a
+		// chain shorter than the listener's own — the tip-boundary check below is what decides,
+		// see `a_replay_that_ends_below_an_ahead_listener_strands_it`.
 		let ahead = locator(100, 50);
 		// Below the tip, past the ancestry window: undecidable, keep going.
 		assert_eq!(listener_action(&ahead, hash(1), hash(0), 50), ListenerAction::ReplayUnprovable);
@@ -2001,6 +2153,119 @@ mod tests {
 		);
 		// At the tip on a DIFFERENT chain: still caught, still halts.
 		assert_eq!(listener_action(&ahead, hash(0xbb), hash(0xaa), 100), ListenerAction::Diverged);
+	}
+
+	/// Replays the blocks of one batch over a single listener locator and returns what the batch
+	/// ledger would hold, using the same fold the live path uses.
+	///
+	/// The locator is held fixed, so this models the listener for as long as the replay has not
+	/// advanced it — which is the entire batch for a listener the replay never reaches, and up to
+	/// its own tip for one it does.
+	fn replay_over(
+		best: &BlockLocator, from: u32, through: u32, chain: impl Fn(u32) -> bitcoin::BlockHash,
+	) -> ReplayTally {
+		let mut tally = ReplayTally::default();
+		for height in from..=through {
+			tally.note(best, listener_action(best, chain(height), chain(height - 1), height));
+		}
+		tally
+	}
+
+	#[test]
+	fn a_replay_that_ends_below_an_ahead_listener_strands_it() {
+		// The geometry the per-block classifier cannot decide: a reorg deeper than the 12-entry
+		// ancestry window that leaves the canonical tip BELOW an ahead listener's persisted tip.
+		// The replay walks the canonical chain and stops at 85, so it never climbs to the
+		// listener's own height where a hash comparison could rule — every block is
+		// `ReplayUnprovable`, and "we'll decide a few blocks later" never comes due.
+		let ahead = locator(100, 100);
+		let canonical = |h: u32| hash(h as u8 + 128);
+
+		let tally = replay_over(&ahead, 76, 85, canonical);
+
+		assert_eq!(tally.unprovable, 10, "every block of the batch was undecidable");
+		assert_eq!(tally.provable, 0, "nothing in the batch could be proven either way");
+		assert_eq!(
+			tally.verdict(85),
+			BatchVerdict::Stranded,
+			"a listener at 100 that the canonical chain ends 15 blocks below is stranded, not \
+			 lagging: no later replay of THIS chain reaches it either"
+		);
+	}
+
+	#[test]
+	fn a_replay_that_ends_below_a_listener_with_no_ancestry_strands_it_at_any_depth() {
+		// The same trap without needing a deep reorg: a locator restored from persistence carries
+		// no ancestors at all, so nothing below its tip is provable and the whole 12-block window
+		// stops helping. Any canonical tip below the listener's own is then unreachable.
+		let restored = BlockLocator::new(hash(100), 100);
+		let canonical = |h: u32| hash(h as u8);
+
+		let tally = replay_over(&restored, 90, 99, canonical);
+
+		assert_eq!(tally.provable, 0);
+		assert_eq!(tally.verdict(99), BatchVerdict::Stranded);
+	}
+
+	#[test]
+	fn a_behind_listener_the_replay_catches_up_to_still_heals() {
+		// The case `ReplayUnprovable` exists for, and the one a stranded-detector must not eat:
+		// listener durability skews on every restart (measured live at 20 blocks), the resume
+		// floor is the minimum across listeners, and a listener with no persisted ancestry cannot
+		// prove ANY of the replay below its tip. It is still perfectly healthy — the proof
+		// arrives when the replay reaches its own height.
+		//
+		// Stopping the replay at the listener's tip is the pessimistic cut: every block above it
+		// is `Deliver`, which only adds proof.
+		let restored = BlockLocator::new(hash(100), 100);
+		let canonical = |h: u32| hash(h as u8);
+
+		let tally = replay_over(&restored, 81, 100, canonical);
+
+		assert_eq!(tally.unprovable, 19, "81..=99 could not be proven");
+		assert_eq!(tally.provable, 1, "its own tip at 100 compares by hash, and matches");
+		assert_eq!(
+			tally.verdict(120),
+			BatchVerdict::SkippedThenReconnected,
+			"skipping a stretch and then reconnecting must never halt the chain source — that \
+			 halt bricked CBF on healthy nodes"
+		);
+	}
+
+	#[test]
+	fn a_batch_that_proved_a_fork_is_not_also_reported_as_stranded() {
+		// Divergence is a proven decision. It halts through its own path, and reporting the same
+		// listener twice for the same batch would misdescribe why.
+		let ahead = locator(100, 100);
+		let forked = |h: u32| hash(h as u8 + 128);
+
+		// 88..=99 are inside the ancestry window and disagree; 100 is the tip and disagrees.
+		let tally = replay_over(&ahead, 80, 100, forked);
+
+		assert!(tally.provable > 0, "the window and the tip both ruled");
+		assert_eq!(tally.verdict(100), BatchVerdict::SkippedThenReconnected);
+	}
+
+	#[test]
+	fn the_stranded_verdict_needs_both_no_proof_and_an_unreachable_tip() {
+		let nothing_skipped = ReplayTally { unprovable: 0, provable: 5, tip_height: 0 };
+		assert_eq!(nothing_skipped.verdict(90), BatchVerdict::Ordinary);
+
+		let skipped_then_proved = ReplayTally { unprovable: 3, provable: 1, tip_height: 100 };
+		assert_eq!(skipped_then_proved.verdict(90), BatchVerdict::SkippedThenReconnected);
+
+		// Defensive: a listener below the tip the replay reached is reachable by construction, so
+		// however it got here it is not the terminal case.
+		let below_the_tip = ReplayTally { unprovable: 3, provable: 0, tip_height: 89 };
+		assert_eq!(below_the_tip.verdict(90), BatchVerdict::SkippedThenReconnected);
+
+		let unreachable = ReplayTally { unprovable: 3, provable: 0, tip_height: 100 };
+		assert_eq!(unreachable.verdict(90), BatchVerdict::Stranded);
+		assert_eq!(
+			unreachable.verdict(100),
+			BatchVerdict::Stranded,
+			"at the tip it is still ahead"
+		);
 	}
 
 	#[test]

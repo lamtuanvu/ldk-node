@@ -313,6 +313,15 @@ impl BlockApplicator {
 				ChainOp::Synced { tip_height } => {
 					log_info!(self.logger, "CBF caught up to tip {}", tip_height);
 					if self.next_height > tip_height {
+						// The last chance a listener gets to be proven on this chain: the replay
+						// ends here and is not coming back. A listener the replay never reached is
+						// stranded, not lagging, and must not be left silently on its own chain
+						// while we advertise this one as synced.
+						if self.chain_listener.record_stranded_listeners(tip_height)
+							&& self.fail_on_divergence().await
+						{
+							return;
+						}
 						// Reaching the tip is the durability boundary: write the deferred chain state
 						// before publishing, so the tip we advertise as applied is also persisted.
 						self.flush_chain_state().await;
