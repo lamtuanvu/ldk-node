@@ -15,6 +15,10 @@
   wallet on a pruned node where the full history is unavailable but the wallet birthday height is
   known. Existing wallets are not rewound, and future heights fail the build. Passing `Some(0)`
   rescans from genesis; passing `None` keeps the default current-tip checkpoint behavior. (#884)
+- The compact-block-filter chain source gains a third compiled mainnet birthday anchor at block
+  965,999 (hash `00000000000000000000dbb4d1e55ad22ed5b5a7d81d4c0fe992fceb8a5302d0`), so a fresh
+  wallet built with `set_chain_source_cbf(.., Some(966_000))` scans from block 966,000 instead of
+  falling back to the taproot-activation anchor and roughly 256,000 blocks of filters.
 - `EsploraSyncConfig` and `ElectrumSyncConfig` now support `force_wallet_full_scan`. When set,
   the on-chain wallet keeps using BDK `full_scan` instead of incremental sync until a full scan
   succeeds, allowing restored wallets to rediscover funds sent to previously-unknown addresses.

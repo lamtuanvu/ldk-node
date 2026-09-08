@@ -421,8 +421,9 @@ impl NodeBuilder {
 	/// starts at the block after the anchor, so the block at the given height is always scanned
 	/// (heights at or below the lowest anchor fall back to a full scan from block 1; the
 	/// genesis block itself is unspendable by consensus and needs no scan). Mainnet anchors are
-	/// 481,823 (one block before SegWit activation) and 709,631 (one block before taproot
-	/// activation). On all other networks a fresh wallet scans from genesis. Passing `None`
+	/// 481,823 (one block before SegWit activation), 709,631 (one block before taproot
+	/// activation) and 965,999 (mined 2026-09-08; a birthday of 966,000 scans from that block).
+	/// On all other networks a fresh wallet scans from genesis. Passing `None`
 	/// also scans from genesis — unlike the Bitcoin Core sources, where `None` anchors at the
 	/// current tip — because CBF has no trusted tip oracle at build time and anchoring lower is
 	/// the only direction that cannot skip wallet history. For a restored seed with older

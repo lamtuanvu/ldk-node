@@ -1513,19 +1513,44 @@ fn resume_anchor(bdk_cp: bdk_chain::CheckPoint, target_height: u32) -> bdk_chain
 ///
 /// Only compiled-in constants are used: CBF has no chain backend at build time, and consulting
 /// a third-party tip oracle would reintroduce exactly the dependency this chain source removes.
-/// Rounding down can only extend the scanned range, never shrink it. Mainnet ships two such
-/// anchors — 481,823 (one block before SegWit activation) and 709,631 (one block before taproot
-/// activation); all other networks resolve to `None`.
+/// Rounding down can only extend the scanned range, never shrink it. Mainnet ships three such
+/// anchors — 481,823 (one block before SegWit activation), 709,631 (one block before taproot
+/// activation) and 965,999 (see [`anchor_965_999`]); all other networks resolve to `None`.
 pub(crate) fn birthday_checkpoint(
 	network: Network, first_scan_height: u32,
 ) -> Option<HashCheckpoint> {
 	if network != Network::Bitcoin {
 		return None;
 	}
-	[HashCheckpoint::segwit_activation(), HashCheckpoint::taproot_activation()]
+	mainnet_anchors()
 		.into_iter()
+		.map(|(cp, _)| cp)
 		.filter(|cp| cp.height < first_scan_height)
 		.max_by_key(|cp| cp.height)
+}
+
+/// Mainnet block 965,999 (mined 2026-09-08), the newest compiled birthday anchor: a wallet
+/// born at block 966,000 or later scans nothing older than that, instead of falling through to
+/// the taproot anchor and ~256,000 blocks of filters. The hash was cross-checked against three
+/// independent explorers (mempool.space, blockstream.info, blockcypher.com) on 2026-09-09,
+/// about 100 blocks below the tip, so no reorg can reach it. Add a newer entry to
+/// [`mainnet_anchors`] when a later birthday is wanted; never edit an existing one — wallets
+/// already anchored on it would latch divergence at the next start.
+fn anchor_965_999() -> HashCheckpoint {
+	let hash = "00000000000000000000dbb4d1e55ad22ed5b5a7d81d4c0fe992fceb8a5302d0"
+		.parse::<bitcoin::BlockHash>()
+		.expect("compiled block hash");
+	HashCheckpoint::new(965_999, hash)
+}
+
+/// Every compiled mainnet birthday anchor, ascending, with the provenance label the startup
+/// log prints beside it.
+fn mainnet_anchors() -> [(HashCheckpoint, &'static str); 3] {
+	[
+		(HashCheckpoint::segwit_activation(), "bip157 segwit_activation constant"),
+		(HashCheckpoint::taproot_activation(), "bip157 taproot_activation constant"),
+		(anchor_965_999(), "ldk-node block 965,999 constant"),
+	]
 }
 
 /// Resolves a configured `wallet_rescan_from_height` into the initial chain tip handed to the
@@ -1542,11 +1567,11 @@ pub(crate) fn resolve_birthday(
 	let requested = wallet_rescan_from_height?;
 	match birthday_checkpoint(network, requested) {
 		Some(cp) => {
-			let provenance = if cp.height == HashCheckpoint::taproot_activation().height {
-				"bip157 taproot_activation constant"
-			} else {
-				"bip157 segwit_activation constant"
-			};
+			let provenance = mainnet_anchors()
+				.into_iter()
+				.find(|(anchor, _)| *anchor == cp)
+				.map(|(_, label)| label)
+				.unwrap_or("compiled anchor");
 			log_info!(
 				logger,
 				"CBF wallet birthday: requested height {} resolved to compiled checkpoint at \
@@ -1627,10 +1652,15 @@ mod tests {
 
 	#[test]
 	fn birthday_anchors_strictly_below_the_first_scan_height() {
+		let newest = anchor_965_999();
 		let taproot = HashCheckpoint::taproot_activation();
 		let segwit = HashCheckpoint::segwit_activation();
 
-		assert_eq!(birthday_checkpoint(Network::Bitcoin, u32::MAX), Some(taproot));
+		assert_eq!(birthday_checkpoint(Network::Bitcoin, u32::MAX), Some(newest));
+		// A wallet born at block 966,000 anchors one block below it and scans from 966,000.
+		assert_eq!(birthday_checkpoint(Network::Bitcoin, 966_000), Some(newest));
+		assert_eq!(birthday_checkpoint(Network::Bitcoin, newest.height + 1), Some(newest));
+		assert_eq!(birthday_checkpoint(Network::Bitcoin, newest.height), Some(taproot));
 		assert_eq!(birthday_checkpoint(Network::Bitcoin, 900_000), Some(taproot));
 		assert_eq!(birthday_checkpoint(Network::Bitcoin, taproot.height + 1), Some(taproot));
 		// Scanning starts strictly after the anchor, so a first transaction exactly at a
@@ -1647,6 +1677,37 @@ mod tests {
 		for network in [Network::Testnet, Network::Signet, Network::Regtest] {
 			assert_eq!(birthday_checkpoint(network, u32::MAX), None);
 		}
+	}
+
+	#[test]
+	fn newest_anchor_is_block_965_999_with_its_published_hash() {
+		let newest = anchor_965_999();
+		assert_eq!(newest.height, 965_999);
+		assert_eq!(
+			newest.hash.to_string(),
+			"00000000000000000000dbb4d1e55ad22ed5b5a7d81d4c0fe992fceb8a5302d0"
+		);
+	}
+
+	#[test]
+	fn mainnet_anchors_are_distinct_and_ascend() {
+		let anchors = mainnet_anchors();
+		for pair in anchors.windows(2) {
+			assert!(pair[0].0.height < pair[1].0.height, "anchors must ascend: {:?}", anchors);
+			assert_ne!(pair[0].0.hash, pair[1].0.hash);
+		}
+	}
+
+	#[test]
+	fn resolve_birthday_anchors_a_966_000_birthday_at_block_965_999() {
+		let logger = test_logger();
+		let anchor =
+			resolve_birthday(&logger, Network::Bitcoin, Some(966_000)).expect("a mainnet anchor");
+		assert_eq!(anchor.height, 965_999);
+		assert_eq!(anchor.block_hash, anchor_965_999().hash);
+		// `None` and non-mainnet networks still root a fresh wallet at genesis.
+		assert!(resolve_birthday(&logger, Network::Bitcoin, None).is_none());
+		assert!(resolve_birthday(&logger, Network::Regtest, Some(966_000)).is_none());
 	}
 
 	fn chain_of(heights: &[u32]) -> bdk_chain::CheckPoint {
