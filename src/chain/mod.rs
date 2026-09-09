@@ -156,10 +156,44 @@ pub enum CbfSyncStatus {
 pub type FeeEstimatesFuture = std::pin::Pin<
 	Box<dyn std::future::Future<Output = Result<std::collections::HashMap<u16, f64>, ()>> + Send>,
 >;
+/// Why an app-supplied broadcast hook did not accept a transaction package.
+///
+/// The two variants ask for opposite handling, which is the whole point of telling them apart:
+/// an [`Unavailable`](Self::Unavailable) service is routed around (the node's own P2P broadcast
+/// carries the package instead), while a [`Rejected`](Self::Rejected) package is a verdict from
+/// the service's own bitcoind on OUR transactions — relaying it over P2P would only buy the
+/// same verdict from every other node, so the CBF chain source stops there and forgets the
+/// rejected transactions in the on-chain wallet, freeing the coins they tried to spend.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BroadcastHookError {
+	/// The external chain service could not be reached, could not be paid, or gave no usable
+	/// answer. Falls through to the node's own P2P broadcast, exactly like a timeout.
+	Unavailable,
+	/// The external chain service's bitcoind refused these transactions (a mempool-policy
+	/// verdict such as `insufficient fee, rejecting replacement`), each with the reason it gave.
+	/// No P2P fallback is attempted; the on-chain wallet evicts every listed transaction it
+	/// knows about so their inputs become spendable again. Transactions of the package that are
+	/// NOT listed here are treated as accepted.
+	Rejected(Vec<(Txid, String)>),
+}
+
+impl std::fmt::Display for BroadcastHookError {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			Self::Unavailable => write!(f, "external chain service unavailable"),
+			Self::Rejected(rejected) => {
+				write!(f, "external chain service rejected {} transaction(s)", rejected.len())
+			},
+		}
+	}
+}
+
 /// A future resolving to `Ok(())` if the external chain service accepted a raw-tx broadcast, or
-/// `Err(())` to fall back to the node's own P2P broadcast.
+/// to a [`BroadcastHookError`] saying whether to fall back to the node's own P2P broadcast
+/// ([`BroadcastHookError::Unavailable`]) or to give the package up as refused
+/// ([`BroadcastHookError::Rejected`]).
 pub type BroadcastFuture =
-	std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ()>> + Send>>;
+	std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), BroadcastHookError>> + Send>>;
 
 /// App-supplied hooks that let an external chain service short-circuit the CBF chain source's
 /// native fee estimation and P2P transaction broadcast.
@@ -185,8 +219,9 @@ pub struct ChainServiceHooks {
 	/// `fee_source` / block-derived estimation.
 	pub fee_estimates: Option<std::sync::Arc<dyn Fn() -> FeeEstimatesFuture + Send + Sync>>,
 	/// Attempt external broadcast of raw txs. Tried even if the underlying CBF/kyoto runtime is
-	/// not currently running. `Err(())`, a timeout, or leaving this unset falls through to P2P
-	/// broadcast.
+	/// not currently running. `Err(BroadcastHookError::Unavailable)`, a timeout, or leaving
+	/// this unset falls through to P2P broadcast; `Err(BroadcastHookError::Rejected(..))` does
+	/// NOT — see [`BroadcastHookError`].
 	pub broadcast:
 		Option<std::sync::Arc<dyn Fn(Vec<Transaction>) -> BroadcastFuture + Send + Sync>>,
 }
@@ -672,6 +707,7 @@ impl ChainSource {
 
 	pub(crate) async fn continuously_process_broadcast_queue(
 		&self, mut stop_tx_bcast_receiver: tokio::sync::watch::Receiver<()>,
+		onchain_wallet: Arc<Wallet>,
 	) {
 		let mut receiver = self.tx_broadcaster.get_broadcast_queue().await;
 		loop {
@@ -712,7 +748,7 @@ impl ChainSource {
 						},
 						ChainSourceKind::Cbf(cbf_chain_source) => {
 							cbf_chain_source
-								.process_broadcast_package(package.into_inner())
+								.process_broadcast_package(package.into_inner(), &onchain_wallet)
 								.await
 						},
 					}

@@ -17,7 +17,7 @@ use tokio::sync::{mpsc, watch};
 
 use crate::chain::bitcoind::ChainListener;
 use crate::chain::electrum::get_electrum_fee_rate_cache_update;
-use crate::chain::{CbfFeeSourceConfig, CbfSyncStatus, ChainServiceHooks};
+use crate::chain::{BroadcastHookError, CbfFeeSourceConfig, CbfSyncStatus, ChainServiceHooks};
 use crate::config::{Config, DEFAULT_FEE_RATE_CACHE_UPDATE_INTERVAL_SECS};
 use crate::error::Error;
 use crate::fee_estimator::{
@@ -588,12 +588,17 @@ where
 }
 
 /// Outcome of trying the app-supplied broadcast hook before falling back to P2P.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum BroadcastOutcome {
 	/// The hook accepted the package; P2P broadcast was not used.
 	HookHandled,
-	/// No hook configured, or the hook declined (`Err(())`); P2P broadcast handled it.
+	/// No hook configured, or the hook could not reach its service
+	/// ([`BroadcastHookError::Unavailable`]) or timed out; P2P broadcast handled it.
 	FellThroughToP2p,
+	/// The hook's service REFUSED the listed transactions ([`BroadcastHookError::Rejected`]);
+	/// P2P broadcast was deliberately not attempted. Package transactions not listed here were
+	/// accepted.
+	Rejected(Vec<(Txid, String)>),
 }
 
 /// Tries the app-supplied broadcast hook before falling back to the node's own P2P broadcast.
@@ -601,11 +606,14 @@ enum BroadcastOutcome {
 /// If `hooks.broadcast` is configured, it is called with the package's transactions, bounded by
 /// `hook_timeout` (production callers pass [`CHAIN_SERVICE_HOOK_TIMEOUT_SECS`]; tests inject a
 /// short duration so a deliberately-hung fake hook doesn't slow the test suite down): `Ok(())`
-/// means the external service accepted the broadcast, so `p2p_send` is NOT called. `Err(())`, a
-/// timeout, or no hook configured at all falls through to `p2p_send` — the existing kyoto
-/// `submit_package`/per-tx broadcast path, unchanged. `p2p_send` is called (and must itself
-/// degrade gracefully, e.g. by logging) even when the underlying kyoto runtime is stopped —
-/// only `p2p_send`'s own implementation depends on kyoto health, not this decision function.
+/// means the external service accepted the broadcast, so `p2p_send` is NOT called.
+/// `Err(BroadcastHookError::Unavailable)`, a timeout, or no hook configured at all falls through
+/// to `p2p_send` — the existing kyoto `submit_package`/per-tx broadcast path, unchanged.
+/// `Err(BroadcastHookError::Rejected(..))` is a verdict on the transactions themselves, so
+/// `p2p_send` is NOT called either and the rejections are handed back to the caller. `p2p_send`
+/// is called (and must itself degrade gracefully, e.g. by logging) even when the underlying
+/// kyoto runtime is stopped — only `p2p_send`'s own implementation depends on kyoto health, not
+/// this decision function.
 ///
 /// A free function (not a method) so it is unit-testable with a fake hook and a fake
 /// `p2p_send`, without a live kyoto node.
@@ -621,7 +629,10 @@ where
 		let hook_result = tokio::time::timeout(hook_timeout, hook(txs.clone())).await;
 		match hook_result {
 			Ok(Ok(())) => return BroadcastOutcome::HookHandled,
-			Ok(Err(())) => {},
+			Ok(Err(BroadcastHookError::Rejected(rejected))) => {
+				return BroadcastOutcome::Rejected(rejected);
+			},
+			Ok(Err(BroadcastHookError::Unavailable)) => {},
 			Err(_elapsed) => {
 				log_debug!(
 					logger,
@@ -1296,7 +1307,23 @@ impl CbfChainSource {
 		Ok(())
 	}
 
-	pub(crate) async fn process_broadcast_package(&self, package: Vec<Transaction>) {
+	/// Relays one broadcast package (hook first, P2P fallback second) and then tells the on-chain
+	/// wallet what just left the node.
+	///
+	/// A CBF chain source has no mempool view of its own: nothing ever feeds it unconfirmed
+	/// transactions the way the bitcoind chain source's mempool poll does. Left alone, the wallet
+	/// would keep treating the coins a just-broadcast transaction spent as unspent until the
+	/// transaction confirms, and the next send would happily double-spend them (bitcoind then
+	/// refuses the second send as an underpaid replacement). So every transaction that was
+	/// handed to the hook or to P2P — the wallet's own sends and LDK's funding/sweep
+	/// transactions alike — is applied as unconfirmed here (BDK keeps only the ones relevant to
+	/// the wallet), and every transaction the hook's service REJECTED is evicted instead, which
+	/// hands its inputs back to the wallet. `Wallet::send_to_address` applies its own
+	/// transaction even earlier, before it is queued, so two back-to-back sends never race the
+	/// broadcast queue; the re-application here is a harmless `last_seen` refresh for those.
+	pub(crate) async fn process_broadcast_package(
+		&self, package: Vec<Transaction>, onchain_wallet: &Wallet,
+	) {
 		// Read the requester (if any) up front, but do NOT bail out when the kyoto runtime is
 		// stopped: the broadcast hook must still be tried (it's payment-agnostic and may be the
 		// only working relay left once the CBF restart loop has given up, e.g. for a
@@ -1312,7 +1339,7 @@ impl CbfChainSource {
 			&self.hooks,
 			&self.logger,
 			Duration::from_secs(CHAIN_SERVICE_HOOK_TIMEOUT_SECS),
-			package,
+			package.clone(),
 			move |package| async move {
 				let Some(requester) = requester else {
 					log_error!(
@@ -1350,11 +1377,45 @@ impl CbfChainSource {
 		)
 		.await;
 
-		if outcome == BroadcastOutcome::HookHandled {
-			log_debug!(
+		let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+		let (unconfirmed, evicted): (Vec<(Transaction, u64)>, Vec<(Txid, u64)>) = match outcome {
+			BroadcastOutcome::HookHandled => {
+				log_debug!(
+					self.logger,
+					"External chain-service broadcast hook accepted the transaction package; P2P \
+					 relay skipped."
+				);
+				(package.into_iter().map(|tx| (tx, now)).collect(), Vec::new())
+			},
+			BroadcastOutcome::FellThroughToP2p => {
+				(package.into_iter().map(|tx| (tx, now)).collect(), Vec::new())
+			},
+			BroadcastOutcome::Rejected(rejected) => {
+				let rejected_txids: HashSet<Txid> =
+					rejected.iter().map(|(txid, _)| *txid).collect();
+				for (txid, reason) in &rejected {
+					log_error!(
+						self.logger,
+						"External chain service rejected transaction {}; giving it up (no P2P \
+						 relay) and releasing its inputs in the on-chain wallet: {}",
+						txid,
+						reason
+					);
+				}
+				let accepted = package
+					.into_iter()
+					.filter(|tx| !rejected_txids.contains(&tx.compute_txid()))
+					.map(|tx| (tx, now))
+					.collect();
+				(accepted, rejected.into_iter().map(|(txid, _)| (txid, now)).collect())
+			},
+		};
+
+		if let Err(e) = onchain_wallet.apply_mempool_txs(unconfirmed, evicted).await {
+			log_error!(
 				self.logger,
-				"External chain-service broadcast hook accepted the transaction package; P2P \
-				 relay skipped."
+				"Failed to record the broadcast package in the on-chain wallet: {}",
+				e
 			);
 		}
 	}
@@ -2095,7 +2156,9 @@ mod tests {
 		let logger = test_logger();
 		let hooks = ChainServiceHooks {
 			fee_estimates: None,
-			broadcast: Some(Arc::new(|_txs| -> BroadcastFuture { Box::pin(async { Err(()) }) })),
+			broadcast: Some(Arc::new(|_txs| -> BroadcastFuture {
+				Box::pin(async { Err(BroadcastHookError::Unavailable) })
+			})),
 		};
 		let p2p_called = Arc::new(AtomicBool::new(false));
 		let p2p_called_clone = Arc::clone(&p2p_called);
@@ -2113,6 +2176,50 @@ mod tests {
 		assert!(
 			p2p_called.load(Ordering::SeqCst),
 			"P2P broadcast must run when the hook declines the package"
+		);
+	}
+
+	#[tokio::test]
+	async fn chain_service_hooks_broadcast_hook_rejected_skips_p2p_and_reports_the_verdict() {
+		// A rejection is bitcoind's policy verdict on OUR transaction (e.g. "insufficient fee,
+		// rejecting replacement"): P2P relay would only collect the same verdict elsewhere, so
+		// the package must NOT fall through, and the verdict must reach the caller so the
+		// on-chain wallet can release the inputs of the refused transaction.
+		let logger = test_logger();
+		let rejected_txid = Txid::all_zeros();
+		let hooks = ChainServiceHooks {
+			fee_estimates: None,
+			broadcast: Some(Arc::new(move |_txs| -> BroadcastFuture {
+				Box::pin(async move {
+					Err(BroadcastHookError::Rejected(vec![(
+						rejected_txid,
+						"insufficient fee, rejecting replacement".to_string(),
+					)]))
+				})
+			})),
+		};
+		let p2p_called = Arc::new(AtomicBool::new(false));
+		let p2p_called_clone = Arc::clone(&p2p_called);
+
+		let outcome =
+			dispatch_broadcast(&hooks, &logger, generous_test_timeout(), Vec::new(), move |_txs| {
+				let p2p_called = Arc::clone(&p2p_called_clone);
+				async move {
+					p2p_called.store(true, Ordering::SeqCst);
+				}
+			})
+			.await;
+
+		assert_eq!(
+			outcome,
+			BroadcastOutcome::Rejected(vec![(
+				rejected_txid,
+				"insufficient fee, rejecting replacement".to_string()
+			)])
+		);
+		assert!(
+			!p2p_called.load(Ordering::SeqCst),
+			"a rejected package must never be relayed over P2P"
 		);
 	}
 

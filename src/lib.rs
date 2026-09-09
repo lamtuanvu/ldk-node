@@ -147,7 +147,7 @@ pub use chain::{ChainStatus, TxStatus};
 /// [`crate::builder::NodeBuilder::set_cbf_chain_service_hooks`]. Unlike the swap-primitive
 /// re-exports above, these are CBF-only and not gated behind the `swaps` feature — matching
 /// [`chain::ChainServiceHooks`]'s own (ungated) definition.
-pub use chain::{BroadcastFuture, ChainServiceHooks, FeeEstimatesFuture};
+pub use chain::{BroadcastFuture, BroadcastHookError, ChainServiceHooks, FeeEstimatesFuture};
 
 /// Optional external fee-estimation backend for [`set_chain_source_cbf`], re-exported from the
 /// otherwise-private `chain` module so a consumer can name it. Not gated behind `swaps`, matching
@@ -700,8 +700,9 @@ impl Node {
 
 		let stop_tx_bcast = self.stop_sender.subscribe();
 		let chain_source = Arc::clone(&self.chain_source);
+		let bcast_wallet = Arc::clone(&self.wallet);
 		self.runtime.spawn_cancellable_background_task(async move {
-			chain_source.continuously_process_broadcast_queue(stop_tx_bcast).await
+			chain_source.continuously_process_broadcast_queue(stop_tx_bcast, bcast_wallet).await
 		});
 
 		let bump_tx_event_handler = Arc::new(BumpTransactionEventHandler::new(
@@ -1400,6 +1401,52 @@ impl Node {
 	#[cfg(feature = "swaps")]
 	pub fn broadcast_swap_tx(&self, tx: &bitcoin::Transaction) {
 		self.tx_broadcaster.broadcast_tx(tx);
+	}
+
+	/// Forgets the given unconfirmed transactions in the on-chain wallet, handing the coins they
+	/// spent back to the spendable balance.
+	///
+	/// Meant for a transaction this node broadcast that the network has since dropped (the app's
+	/// transaction watcher learns this from its chain-service provider): under the CBF chain
+	/// source nothing else ever evicts an unconfirmed transaction, so without this the inputs of
+	/// a dropped send would stay locked until it confirmed — which it never will. Transactions
+	/// the wallet does not know, or already sees confirmed, are ignored. The eviction is
+	/// reversible: seeing the transaction again (a later [`Self::rebroadcast_unconfirmed_tx`],
+	/// or its confirmation) makes it canonical again.
+	pub fn evict_unconfirmed_txs(&self, txids: Vec<bitcoin::Txid>) -> Result<(), Error> {
+		if !*self.is_running.read().expect("lock") {
+			return Err(Error::NotRunning);
+		}
+		if txids.is_empty() {
+			return Ok(());
+		}
+		let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+		let evicted = txids.into_iter().map(|txid| (txid, now)).collect();
+		let wallet = Arc::clone(&self.wallet);
+		self.runtime.block_on(async move { wallet.apply_mempool_txs(Vec::new(), evicted).await })
+	}
+
+	/// Re-queues an unconfirmed transaction the on-chain wallet already holds for broadcast,
+	/// over the same path (chain-service hook first, P2P second) a fresh send takes.
+	///
+	/// Returns [`Error::WalletOperationFailed`] when the wallet does not hold the transaction or
+	/// already sees it confirmed. Fire-and-forget like every other broadcast: the transaction is
+	/// placed on the bounded broadcast queue and this returns immediately.
+	pub fn rebroadcast_unconfirmed_tx(&self, txid: bitcoin::Txid) -> Result<(), Error> {
+		if !*self.is_running.read().expect("lock") {
+			return Err(Error::NotRunning);
+		}
+		let Some(tx) = self.wallet.get_unconfirmed_transaction(&txid) else {
+			log_debug!(
+				self.logger,
+				"Not rebroadcasting {}: the on-chain wallet holds no unconfirmed transaction by \
+				 that id.",
+				txid
+			);
+			return Err(Error::WalletOperationFailed);
+		};
+		self.tx_broadcaster.broadcast_unclassified_transaction(tx);
+		Ok(())
 	}
 
 	/// Estimates the on-chain feerate for a swap transaction at the requested

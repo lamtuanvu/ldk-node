@@ -146,6 +146,17 @@ impl Wallet {
 			.collect()
 	}
 
+	/// The full transaction behind `txid` if the wallet holds it and still sees it unconfirmed
+	/// (the only kind worth rebroadcasting); `None` for unknown or confirmed transactions.
+	pub(crate) fn get_unconfirmed_transaction(&self, txid: &Txid) -> Option<Transaction> {
+		self.inner
+			.lock()
+			.expect("lock")
+			.get_tx(*txid)
+			.filter(|t| t.chain_position.is_unconfirmed())
+			.map(|t| (*t.tx_node.tx).clone())
+	}
+
 	pub(crate) fn latest_checkpoint(&self) -> bdk_chain::local_chain::CheckPoint {
 		self.inner.lock().expect("lock").latest_checkpoint()
 	}
@@ -975,6 +986,39 @@ impl Wallet {
 		})?;
 
 		let txid = tx.compute_txid();
+
+		// Teach the wallet about its own spend BEFORE the broadcast queue takes it. Until the
+		// transaction is applied as unconfirmed, BDK still lists the coins it spends as unspent,
+		// and a second send built in the meantime re-selects them — a double-spend the network
+		// then refuses as an underpaid replacement. Chain sources with a mempool view would
+		// eventually catch up on their own; the CBF chain source never would. Applying here also
+		// records the Pending on-chain payment right away, and makes the unconfirmed change
+		// output spendable by the very next send. The persister is still locked from the build
+		// above, so this deliberately does NOT go through `apply_mempool_txs` (which would take
+		// that same lock).
+		let now = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.map(|d| d.as_secs())
+			.unwrap_or(0);
+		let events = {
+			let mut locked_wallet = self.inner.lock().expect("lock");
+			locked_wallet
+				.events_helper(|wallet| -> Result<(), std::convert::Infallible> {
+					wallet.apply_unconfirmed_txs(vec![(tx.clone(), now)]);
+					Ok(())
+				})
+				.expect("applying an unconfirmed transaction cannot fail")
+		};
+		self.update_payment_store(events).await.map_err(|e| {
+			log_error!(self.logger, "Failed to update payment store: {}", e);
+			Error::PersistenceFailed
+		})?;
+		let change_set = self.inner.lock().expect("lock").take_staged().unwrap_or_default();
+		locked_persister.persist_changeset(change_set).await.map_err(|e| {
+			log_error!(self.logger, "Failed to persist wallet: {}", e);
+			Error::PersistenceFailed
+		})?;
+
 		self.broadcaster.broadcast_unclassified_transaction(tx);
 
 		match send_amount {
@@ -2379,5 +2423,146 @@ mod swap_b7_tests {
 				"swap pubkey at index {index} must never equal the node identity pubkey"
 			);
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	//! The BDK behaviour the "own send is applied as unconfirmed" fix relies on, pinned down on a
+	//! bare `bdk_wallet::Wallet` so it needs no chain source: an own unconfirmed spend takes the
+	//! coins it spent out of `list_unspent` and exposes its change; the next transaction builds
+	//! on that unconfirmed change instead of re-selecting the spent coins; an eviction hands the
+	//! original coins back; and all of it survives a reload from the persisted change set.
+	use bdk_chain::Merge;
+	use bdk_wallet::{ChangeSet, KeychainKind, SignOptions, Wallet as BdkWallet};
+	use bitcoin::hashes::Hash;
+	use bitcoin::{
+		absolute, transaction, Amount, FeeRate, Network, OutPoint, ScriptBuf, Sequence,
+		Transaction, TxIn, TxOut, Txid, WPubkeyHash, Witness,
+	};
+
+	const EXTERNAL_DESCRIPTOR: &str = "wpkh(tprv8ZgxMBicQKsPdy6LMhUtFHAgpocR8GC6QmwMSFpZs7h6Eziw3SpThFfczTDh5rW2krkqffa11UpX3XkeTTB2FvzZKWXqPY54Y6Rq4AQ5R8L/84'/1'/0'/0/*)";
+	const INTERNAL_DESCRIPTOR: &str = "wpkh(tprv8ZgxMBicQKsPdy6LMhUtFHAgpocR8GC6QmwMSFpZs7h6Eziw3SpThFfczTDh5rW2krkqffa11UpX3XkeTTB2FvzZKWXqPY54Y6Rq4AQ5R8L/84'/1'/0'/1/*)";
+	const FUNDING_SATS: u64 = 100_000;
+
+	fn new_wallet() -> BdkWallet {
+		BdkWallet::create(EXTERNAL_DESCRIPTOR, INTERNAL_DESCRIPTOR)
+			.network(Network::Regtest)
+			.create_wallet_no_persist()
+			.expect("valid test descriptors")
+	}
+
+	fn someone_elses_script() -> ScriptBuf {
+		ScriptBuf::new_p2wpkh(&WPubkeyHash::hash(&[0x42u8; 33]))
+	}
+
+	/// An unconfirmed deposit into the wallet, spending an outpoint nobody checks.
+	fn fund(wallet: &mut BdkWallet, last_seen: u64) -> OutPoint {
+		let address = wallet.reveal_next_address(KeychainKind::External).address;
+		let funding = Transaction {
+			version: transaction::Version::TWO,
+			lock_time: absolute::LockTime::ZERO,
+			input: vec![TxIn {
+				previous_output: OutPoint { txid: Txid::from_byte_array([7u8; 32]), vout: 0 },
+				script_sig: ScriptBuf::new(),
+				sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+				witness: Witness::new(),
+			}],
+			output: vec![TxOut {
+				value: Amount::from_sat(FUNDING_SATS),
+				script_pubkey: address.script_pubkey(),
+			}],
+		};
+		let outpoint = OutPoint { txid: funding.compute_txid(), vout: 0 };
+		wallet.apply_unconfirmed_txs(vec![(funding, last_seen)]);
+		outpoint
+	}
+
+	/// Builds, signs and returns a send of `sats` to a foreign script — exactly what
+	/// `Wallet::send_to_address` does before it applies and queues the result.
+	fn build_send(wallet: &mut BdkWallet, sats: u64) -> Transaction {
+		let mut builder = wallet.build_tx();
+		builder
+			.add_recipient(someone_elses_script(), Amount::from_sat(sats))
+			.fee_rate(FeeRate::from_sat_per_vb_u32(1));
+		let mut psbt = builder.finish().expect("the wallet can fund this send");
+		assert!(wallet.sign(&mut psbt, SignOptions::default()).expect("signing works"));
+		psbt.extract_tx().expect("finalized psbt extracts")
+	}
+
+	fn unspent_outpoints(wallet: &BdkWallet) -> Vec<OutPoint> {
+		wallet.list_unspent().map(|u| u.outpoint).collect()
+	}
+
+	#[test]
+	fn own_unconfirmed_spend_locks_its_inputs_and_exposes_its_change() {
+		let mut wallet = new_wallet();
+		let deposit = fund(&mut wallet, 1);
+		assert_eq!(unspent_outpoints(&wallet), vec![deposit]);
+
+		let first = build_send(&mut wallet, 30_000);
+		assert_eq!(first.input[0].previous_output, deposit);
+		wallet.apply_unconfirmed_txs(vec![(first.clone(), 2)]);
+
+		let unspent = unspent_outpoints(&wallet);
+		assert_eq!(unspent.len(), 1, "only the change output is left to spend");
+		assert_eq!(unspent[0].txid, first.compute_txid(), "and it is the first send's change");
+		assert!(!unspent.contains(&deposit), "the spent deposit is no longer offered");
+
+		// The very next send builds on the unconfirmed change instead of re-selecting the
+		// deposit — the second transaction of a block, chained on the first.
+		let second = build_send(&mut wallet, 20_000);
+		assert_eq!(second.input.len(), 1);
+		assert_eq!(second.input[0].previous_output.txid, first.compute_txid());
+	}
+
+	#[test]
+	fn evicting_an_unconfirmed_spend_hands_its_inputs_back() {
+		let mut wallet = new_wallet();
+		let deposit = fund(&mut wallet, 1);
+		let first = build_send(&mut wallet, 30_000);
+		let first_txid = first.compute_txid();
+		wallet.apply_unconfirmed_txs(vec![(first, 2)]);
+		assert!(!unspent_outpoints(&wallet).contains(&deposit));
+
+		// An eviction stamped no earlier than the last sighting wins (BDK: a transaction whose
+		// `last_evicted >= last_seen` is no longer canonical).
+		wallet.apply_evicted_txs(vec![(first_txid, 2)]);
+		assert_eq!(unspent_outpoints(&wallet), vec![deposit], "the deposit is spendable again");
+
+		// The eviction also hides the spend from the canonical view (`get_tx`), which is what
+		// keeps `Wallet::get_unconfirmed_transaction` from rebroadcasting an evicted one...
+		assert!(wallet.get_tx(first_txid).is_none());
+		// ...but the transaction itself is kept, and seeing it again later (a rebroadcast, or
+		// the mempool) makes the spend canonical once more.
+		let again = wallet.tx_graph().get_tx(first_txid).expect("evicted, not forgotten");
+		wallet.apply_unconfirmed_txs(vec![((*again).clone(), 3)]);
+		assert!(!unspent_outpoints(&wallet).contains(&deposit));
+	}
+
+	#[test]
+	fn an_unconfirmed_spend_survives_a_reload_from_the_persisted_change_set() {
+		let mut wallet = new_wallet();
+		let deposit = fund(&mut wallet, 1);
+		let first = build_send(&mut wallet, 30_000);
+		let first_txid = first.compute_txid();
+		wallet.apply_unconfirmed_txs(vec![(first, 2)]);
+
+		let mut persisted = ChangeSet::default();
+		persisted.merge(wallet.take_staged().expect("the wallet staged its creation and spend"));
+
+		let reloaded = BdkWallet::load()
+			.descriptor(KeychainKind::External, Some(EXTERNAL_DESCRIPTOR))
+			.descriptor(KeychainKind::Internal, Some(INTERNAL_DESCRIPTOR))
+			.extract_keys()
+			.check_network(Network::Regtest)
+			.load_wallet_no_persist(persisted)
+			.expect("the change set loads")
+			.expect("the change set describes a wallet");
+
+		let unspent = unspent_outpoints(&reloaded);
+		assert_eq!(unspent.len(), 1);
+		assert_eq!(unspent[0].txid, first_txid, "the reloaded wallet still spends only the change");
+		assert!(!unspent.contains(&deposit), "and still knows the deposit is spent");
 	}
 }
