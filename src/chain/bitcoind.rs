@@ -5,7 +5,7 @@
 // http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
 // accordance with one or both of these licenses.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,6 +14,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::prelude::BASE64_STANDARD;
 use base64::Engine;
+use bitcoin::transaction::Version;
 use bitcoin::{BlockHash, FeeRate, Network, OutPoint, Transaction, Txid};
 use lightning::chain::chaininterface::ConfirmationTarget as LdkConfirmationTarget;
 use lightning::chain::{BlockLocator, Listen};
@@ -41,6 +42,7 @@ use crate::fee_estimator::{
 };
 use crate::io::utils::update_and_persist_node_metrics;
 use crate::logger::{log_bytes, log_debug, log_error, log_info, log_trace, LdkLogger, Logger};
+use crate::tx_broadcaster::SortedTransactions;
 use crate::types::{ChainMonitor, ChannelManager, DynStore, Sweeper, Wallet};
 use crate::{Error, PersistedNodeMetrics};
 
@@ -117,6 +119,80 @@ impl BitcoindChainSource {
 
 	pub(super) fn as_utxo_source(&self) -> UtxoSourceClient {
 		self.api_client.utxo_source()
+	}
+
+	/// Returns the shared on-chain fee estimator backing this chain source
+	/// (Peerswap native primitive B6).
+	#[cfg(feature = "swaps")]
+	pub(super) fn fee_estimator(&self) -> &Arc<OnchainFeeEstimator> {
+		&self.fee_estimator
+	}
+
+	/// Reorg-aware confirmation/eviction query for an ARBITRARY `txid` against
+	/// this Bitcoind backend (Peerswap native primitive B5). See
+	/// [`super::ChainSource::swap_query_tx`] for the fail-closed contract.
+	#[cfg(feature = "swaps")]
+	pub(super) async fn swap_query_tx(&self, txid: Txid) -> super::RawTxObservation {
+		match self.api_client.swap_tx_confirmations(&txid).await {
+			Ok(Some(0)) => super::RawTxObservation::InMempool,
+			Ok(Some(confirmations)) => {
+				// `getrawtransaction` returns the depth but not the height; derive
+				// it as `tip - (confs - 1)`. B5 LOW-2: read a FRESH best-chain tip
+				// (`get_best_block`) rather than the cached `latest_chain_tip`,
+				// which can lag the real tip and yield a height that is too low —
+				// and thus a CSV/claim deadline armed slightly EARLY. A fresh (or
+				// even a one-block-stale-newer) tip can only err on the LATE/safe
+				// side. Fail-soft on the HEIGHT ONLY: the depth is already
+				// authoritative, so on a tip-read error we fall back to the cached
+				// tip rather than failing the whole query closed.
+				let tip_height = match self.api_client.get_best_block().await {
+					Ok((_, Some(h))) => Some(h),
+					Ok((_, None)) => {
+						self.latest_chain_tip.read().unwrap().as_ref().map(|tip| tip.height)
+					},
+					Err(e) => {
+						log_error!(
+							self.logger,
+							"swap_query_tx: Bitcoind fresh-tip read failed for {} ({:?}); falling back to cached tip for height",
+							txid,
+							e
+						);
+						self.latest_chain_tip.read().unwrap().as_ref().map(|tip| tip.height)
+					},
+				};
+				let height = tip_height.map(|t| t.saturating_sub(confirmations.saturating_sub(1)));
+				super::RawTxObservation::Confirmed { height, confirmations }
+			},
+			Ok(None) => super::RawTxObservation::NotFound,
+			Err(e) => {
+				log_error!(self.logger, "swap_query_tx: Bitcoind query failed for {}: {}", txid, e);
+				super::RawTxObservation::Unreachable
+			},
+		}
+	}
+
+	pub(super) async fn validate_zero_fee_commitments_support(&self) -> Result<(), Error> {
+		let node_version_result = tokio::time::timeout(
+			Duration::from_secs(CHAIN_POLLING_TIMEOUT_SECS),
+			self.api_client.get_node_version(),
+		)
+		.await
+		.map_err(|e| {
+			log_error!(self.logger, "Failed to get node version: {:?}", e);
+			Error::ConnectionFailed
+		})?;
+
+		let node_version = node_version_result.map_err(|e| {
+			log_error!(self.logger, "Failed to get node version: {:?}", e);
+			Error::ConnectionFailed
+		})?;
+
+		// v26 first shipped the `submitpackage` RPC, but we need v29 to relay ephemeral dust
+		if node_version < 290000 {
+			log_error!(self.logger, "Bitcoin backend MUST be greater than or equal to v29");
+			return Err(Error::ChainSourceNotSupported);
+		}
+		Ok(())
 	}
 
 	pub(super) async fn continuously_sync_wallets(
@@ -399,6 +475,9 @@ impl BitcoindChainSource {
 			channel_manager: Arc::clone(&channel_manager),
 			chain_monitor: Arc::clone(&chain_monitor),
 			output_sweeper,
+			logger: Arc::clone(&self.logger),
+			divergence: Arc::new(Mutex::new(None)),
+			replay_batch: Arc::new(Mutex::new(BTreeMap::new())),
 		};
 		let mut spv_client =
 			SpvClient::new(chain_tip, chain_poller, HeaderCache::new(), &chain_listener);
@@ -435,11 +514,12 @@ impl BitcoindChainSource {
 					evicted_txids.len(),
 					elapsed_ms,
 				);
-				onchain_wallet.apply_mempool_txs(unconfirmed_txs, evicted_txids).unwrap_or_else(
-					|e| {
+				onchain_wallet
+					.apply_mempool_txs(unconfirmed_txs, evicted_txids)
+					.await
+					.unwrap_or_else(|e| {
 						log_error!(self.logger, "Failed to apply mempool transactions: {:?}", e);
-					},
-				);
+					});
 			},
 			Err(e) => {
 				log_error!(self.logger, "Failed to poll for mempool transactions: {:?}", e);
@@ -571,46 +651,59 @@ impl BitcoindChainSource {
 		Ok(())
 	}
 
-	pub(crate) async fn process_broadcast_package(&self, package: Vec<Transaction>) {
-		// While it's a bit unclear when we'd be able to lean on Bitcoin Core >v28
-		// features, we should eventually switch to use `submitpackage` via the
-		// `rust-bitcoind-json-rpc` crate rather than just broadcasting individual
-		// transactions.
-		for tx in &package {
-			let txid = tx.compute_txid();
-			let timeout_fut = tokio::time::timeout(
-				Duration::from_secs(DEFAULT_TX_BROADCAST_TIMEOUT_SECS),
-				self.api_client.broadcast_transaction(tx),
-			);
-			match timeout_fut.await {
-				Ok(res) => match res {
-					Ok(id) => {
-						debug_assert_eq!(id, txid);
-						log_trace!(self.logger, "Successfully broadcast transaction {}", txid);
+	fn log_broadcast_error(
+		&self, e: impl core::fmt::Display, txids: &[Txid], txs: &SortedTransactions,
+	) {
+		log_error!(self.logger, "Failed to broadcast transaction(s) {:?}: {}", txids, e);
+		log_trace!(self.logger, "Failed broadcast transaction bytes:");
+		for tx in txs.iter() {
+			log_trace!(self.logger, "{}", log_bytes!(tx.encode()));
+		}
+	}
+
+	pub(crate) async fn process_transaction_broadcast(&self, txs: SortedTransactions) {
+		let all_txs_are_v3 = txs.iter().all(|tx| tx.version == Version::non_standard(3));
+		match txs.len() {
+			2.. if all_txs_are_v3 => {
+				let txids: Vec<_> = txs.iter().map(|tx| tx.compute_txid()).collect();
+				let timeout_fut = tokio::time::timeout(
+					Duration::from_secs(DEFAULT_TX_BROADCAST_TIMEOUT_SECS),
+					self.api_client.submit_package(&txs),
+				);
+				match timeout_fut.await {
+					Ok(res) => match res {
+						Ok(result) => {
+							log_trace!(self.logger, "Successfully broadcast package {:?}", txids);
+							log_trace!(self.logger, "Successfully broadcast package {}", result);
+						},
+						Err(e) => self.log_broadcast_error(e, &txids, &txs),
 					},
-					Err(e) => {
-						log_error!(self.logger, "Failed to broadcast transaction {}: {}", txid, e);
-						log_trace!(
-							self.logger,
-							"Failed broadcast transaction bytes: {}",
-							log_bytes!(tx.encode())
-						);
-					},
-				},
-				Err(e) => {
-					log_error!(
-						self.logger,
-						"Failed to broadcast transaction due to timeout {}: {}",
-						txid,
-						e
+					Err(e) => self.log_broadcast_error(e, &txids, &txs),
+				}
+			},
+			_ => {
+				for tx in txs.iter() {
+					let txid = tx.compute_txid();
+					let timeout_fut = tokio::time::timeout(
+						Duration::from_secs(DEFAULT_TX_BROADCAST_TIMEOUT_SECS),
+						self.api_client.broadcast_transaction(tx),
 					);
-					log_trace!(
-						self.logger,
-						"Failed broadcast transaction bytes: {}",
-						log_bytes!(tx.encode())
-					);
-				},
-			}
+					match timeout_fut.await {
+						Ok(res) => match res {
+							Ok(id) => {
+								debug_assert_eq!(id, txid);
+								log_trace!(
+									self.logger,
+									"Successfully broadcast transaction {}",
+									txid
+								);
+							},
+							Err(e) => self.log_broadcast_error(e, &[txid], &txs),
+						},
+						Err(e) => self.log_broadcast_error(e, &[txid], &txs),
+					}
+				}
+			},
 		}
 	}
 }
@@ -748,6 +841,31 @@ impl BitcoindClient {
 		}
 	}
 
+	pub(crate) async fn get_node_version(&self) -> Result<u64, BitcoindClientError> {
+		match self {
+			BitcoindClient::Rpc { rpc_client, .. } => {
+				Self::get_node_version_inner(Arc::clone(rpc_client))
+					.await
+					.map_err(BitcoindClientError::Rpc)
+			},
+			BitcoindClient::Rest { rpc_client, .. } => {
+				// Bitcoin Core's REST interface does not support `getnetworkinfo`
+				// so we use the RPC client.
+				Self::get_node_version_inner(Arc::clone(rpc_client))
+					.await
+					.map_err(BitcoindClientError::Rpc)
+			},
+		}
+	}
+
+	async fn get_node_version_inner(rpc_client: Arc<RpcClient>) -> Result<u64, RpcClientError> {
+		rpc_client.call_method::<serde_json::Value>("getnetworkinfo", &[]).await.and_then(|value| {
+			value["version"].as_u64().ok_or(RpcClientError::InvalidData(String::from(
+				"The version field in the `getnetworkinfo` response should be a u64",
+			)))
+		})
+	}
+
 	/// Broadcasts the provided transaction.
 	pub(crate) async fn broadcast_transaction(
 		&self, tx: &Transaction,
@@ -774,6 +892,38 @@ impl BitcoindClient {
 		let tx_serialized = bitcoin::consensus::encode::serialize_hex(tx);
 		let tx_json = serde_json::json!(tx_serialized);
 		rpc_client.call_method::<Txid>("sendrawtransaction", &[tx_json]).await
+	}
+
+	/// Submits the provided package
+	pub(crate) async fn submit_package(
+		&self, package: &SortedTransactions,
+	) -> Result<String, BitcoindClientError> {
+		match self {
+			BitcoindClient::Rpc { rpc_client, .. } => {
+				Self::submit_package_inner(Arc::clone(rpc_client), package)
+					.await
+					.map_err(BitcoindClientError::Rpc)
+			},
+			BitcoindClient::Rest { rpc_client, .. } => {
+				// Bitcoin Core's REST interface does not support submitting packages
+				// so we use the RPC client.
+				Self::submit_package_inner(Arc::clone(rpc_client), package)
+					.await
+					.map_err(BitcoindClientError::Rpc)
+			},
+		}
+	}
+
+	async fn submit_package_inner(
+		rpc_client: Arc<RpcClient>, package: &SortedTransactions,
+	) -> Result<String, RpcClientError> {
+		let package_serialized: Vec<_> =
+			package.iter().map(|tx| bitcoin::consensus::encode::serialize_hex(tx)).collect();
+		let package_json = serde_json::json!(package_serialized);
+		rpc_client
+			.call_method::<SubmitPackageResponse>("submitpackage", &[package_json])
+			.await
+			.map(|response| response.0)
 	}
 
 	/// Retrieve the fee estimate needed for a transaction to begin
@@ -905,6 +1055,45 @@ impl BitcoindClient {
 			// Check if it's the HTTP NOT_FOUND error code.
 			Err(HttpClientError::Http(http_error)) if http_error.status_code == 404 => Ok(None),
 			Err(e) => Err(e),
+		}
+	}
+
+	/// Confirmation depth for an ARBITRARY `txid` via verbose `getrawtransaction`
+	/// (Peerswap native primitive B5).
+	///
+	/// To locate a tx by its id alone (the swap case — a counterparty opening tx
+	/// that is not in our wallet), the backend must be able to find it, i.e. a
+	/// `-txindex` node (or the tx still resident in the mempool). Returns:
+	/// - `Ok(Some(n))` with `n >= 1` for a tx confirmed `n` blocks deep,
+	/// - `Ok(Some(0))` for a tx seen in the mempool but unconfirmed,
+	/// - `Ok(None)` when the node does not know the tx (RPC error code -5),
+	/// - `Err(..)` for any transport/other failure, so the caller fails closed.
+	#[cfg(feature = "swaps")]
+	pub(crate) async fn swap_tx_confirmations(&self, txid: &Txid) -> std::io::Result<Option<u32>> {
+		let rpc_client = match self {
+			BitcoindClient::Rpc { rpc_client, .. } => Arc::clone(rpc_client),
+			BitcoindClient::Rest { rpc_client, .. } => Arc::clone(rpc_client),
+		};
+		// `getrawtransaction` expects the txid in RPC/display (big-endian) order —
+		// exactly `Txid`'s `Display`. `consensus::encode::serialize_hex` emits the
+		// INTERNAL (little-endian) bytes, i.e. the REVERSED hex, which bitcoind rejects
+		// with -5 "No such transaction". That -5 is mapped to `Ok(None)` below, so the
+		// swap watcher would mistake EVERY confirmed opening tx for NotFound and never
+		// arm the confirmation/CSV ladder — wedging every swap on the bitcoind backend.
+		let txid_hex = txid.to_string();
+		let txid_json = serde_json::json!(txid_hex);
+		let verbose_json = serde_json::json!(true);
+		match rpc_client
+			.call_method::<SwapTxConfirmationResponse>(
+				"getrawtransaction",
+				&[txid_json, verbose_json],
+			)
+			.await
+		{
+			Ok(resp) => Ok(Some(resp.0)),
+			// -5 == "No such mempool or blockchain transaction".
+			Err(RpcClientError::Rpc(rpc_error)) if rpc_error.code == -5 => Ok(None),
+			Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())),
 		}
 	}
 
@@ -1270,6 +1459,21 @@ impl TryInto<GetRawTransactionResponse> for JsonResponse {
 	}
 }
 
+/// Confirmation depth parsed from a verbose `getrawtransaction` result
+/// (Peerswap native primitive B5). The `confirmations` field is absent for an
+/// unconfirmed (mempool) transaction, which we map to `0`.
+#[cfg(feature = "swaps")]
+pub(crate) struct SwapTxConfirmationResponse(pub u32);
+
+#[cfg(feature = "swaps")]
+impl TryInto<SwapTxConfirmationResponse> for JsonResponse {
+	type Error = String;
+	fn try_into(self) -> Result<SwapTxConfirmationResponse, String> {
+		let confirmations = self.0["confirmations"].as_u64().unwrap_or(0);
+		Ok(SwapTxConfirmationResponse(confirmations as u32))
+	}
+}
+
 pub struct GetRawMempoolResponse(Vec<Txid>);
 
 impl TryInto<GetRawMempoolResponse> for JsonResponse {
@@ -1327,6 +1531,23 @@ impl TryInto<GetMempoolEntryResponse> for JsonResponse {
 	}
 }
 
+pub struct SubmitPackageResponse(String);
+
+impl TryInto<SubmitPackageResponse> for JsonResponse {
+	type Error = String;
+	fn try_into(self) -> Result<SubmitPackageResponse, String> {
+		let response = self.0.to_string();
+		let res = self.0.as_object().ok_or("Failed to parse submitpackage response".to_string())?;
+
+		match res["package_msg"].as_str() {
+			Some("success") => Ok(SubmitPackageResponse(response)),
+			Some(_) | None => {
+				return Err(response);
+			},
+		}
+	}
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct MempoolEntry {
 	/// The transaction id
@@ -1344,11 +1565,322 @@ pub(crate) enum FeeRateEstimationMode {
 	Conservative,
 }
 
+#[derive(Clone)]
 pub(crate) struct ChainListener {
 	pub(crate) onchain_wallet: Arc<Wallet>,
 	pub(crate) channel_manager: Arc<ChannelManager>,
 	pub(crate) chain_monitor: Arc<ChainMonitor>,
 	pub(crate) output_sweeper: Arc<Sweeper>,
+	pub(crate) logger: Arc<Logger>,
+	/// Records the first listener divergence seen since the last drain.
+	///
+	/// `Listen` returns `()`, so divergence cannot be propagated through the trait. The chain
+	/// source drains this after each block and must stop advancing when it is set: continuing
+	/// would publish a "synced" tip while a listener sits on a stale chain.
+	pub(crate) divergence: Arc<Mutex<Option<String>>>,
+	/// Per-listener tally of the replay batch in flight, drained at every tip boundary.
+	///
+	/// Exists to tell two outcomes of [`ListenerAction::ReplayUnprovable`] apart, which are
+	/// indistinguishable block by block: a listener that skips a stretch it cannot prove and then
+	/// *reconnects* to the chain (benign — the resume-from-minimum design), and a listener the
+	/// replay can never reach at all (stranded on a fork). See
+	/// [`ChainListener::record_stranded_listeners`].
+	pub(crate) replay_batch: Arc<Mutex<BTreeMap<&'static str, ReplayTally>>>,
+}
+
+/// What one listener decided about the blocks of the replay batch currently in flight.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReplayTally {
+	/// Blocks skipped because ancestry could be neither confirmed nor refuted.
+	pub(crate) unprovable: u32,
+	/// Decisions that could actually be proven: delivered, an exact replay, or a fork.
+	pub(crate) provable: u32,
+	/// The listener's own tip height as of its most recent unprovable skip.
+	pub(crate) tip_height: u32,
+}
+
+/// What a listener's replay batch amounts to once the replay has reached the chain's tip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BatchVerdict {
+	/// Nothing to say: the listener was never asked about a block it could not prove.
+	Ordinary,
+	/// Skipped a stretch it could not prove and then reconnected to the chain. Benign — this is
+	/// what the resume-from-minimum design does on every restart with skewed listener durability.
+	SkippedThenReconnected,
+	/// The replay ended without this listener ever reaching a block it could prove, and its own
+	/// tip is at or above the tip we ended at, so no later replay of this chain can reach it
+	/// either. It is on a chain we can neither extend nor refute.
+	Stranded,
+}
+
+impl ReplayTally {
+	/// Folds one decision into the batch tally.
+	fn note(&mut self, best: &BlockLocator, action: ListenerAction) {
+		match action {
+			ListenerAction::ReplayUnprovable => {
+				self.unprovable = self.unprovable.saturating_add(1);
+				self.tip_height = best.height;
+			},
+			ListenerAction::Deliver | ListenerAction::AlreadyApplied | ListenerAction::Diverged => {
+				self.provable = self.provable.saturating_add(1)
+			},
+		}
+	}
+
+	/// Judges the batch against the tip the replay ended at.
+	///
+	/// `provable == 0` on its own already implies the listener sits at or above `tip_height` — a
+	/// replay passes through every height at or below a listener's tip, and those compare
+	/// provably — but being unreachable is what actually makes the case terminal, so it is checked
+	/// rather than assumed.
+	fn verdict(&self, tip_height: u32) -> BatchVerdict {
+		if self.unprovable == 0 {
+			BatchVerdict::Ordinary
+		} else if self.provable > 0 || self.tip_height < tip_height {
+			BatchVerdict::SkippedThenReconnected
+		} else {
+			BatchVerdict::Stranded
+		}
+	}
+}
+
+/// Whether a listener should be handed a given block.
+///
+/// `ChannelManager` and `OutputSweeper` enforce LDK's `Listen` contract with `assert_eq!` on both
+/// the previous block hash and `height == best + 1`, so handing either one a block it has already
+/// applied panics the node rather than returning an error. Listener durability is not
+/// synchronized — `ChannelManager` is persisted asynchronously by the background processor while
+/// `OutputSweeper` is only marked dirty and flushed periodically — so after a crash they can be
+/// durable at different heights. The chain source resumes from the *minimum* height across all
+/// listeners, which replays blocks to any listener that got further ahead.
+///
+/// Classification is deliberately hash-aware. Deciding on height alone would treat a *different*
+/// block at an already-seen height as an ordinary replay and skip it, silently stranding the
+/// listener on a stale fork — a worse failure than the panic being avoided, because it is silent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ListenerAction {
+	/// The listener expects exactly this block.
+	Deliver,
+	/// The listener already has this exact block on its chain; skip it.
+	AlreadyApplied,
+	/// The block sits BELOW the listener's tip, but our ancestry record does not reach that far,
+	/// so we can neither confirm nor refute that it is on the listener's chain. Skip it — but,
+	/// unlike [`Self::Diverged`], do NOT halt the chain source.
+	///
+	/// This is the *expected* case whenever listener durability skews by more than
+	/// `previous_blocks.len()` (LDK's `BlockLocator` carries `ANTI_REORG_DELAY * 2` = 12
+	/// ancestors, and a locator restored from persistence can carry none at all), which is
+	/// exactly the situation the resume-from-minimum design above sets up. Treating it as
+	/// divergence halts CBF block application permanently for a listener that is merely further
+	/// ahead on the same chain.
+	///
+	/// The decision is deferred, not dropped — but only for as long as the replay can still reach
+	/// the listener. While it climbs towards `best.height` the same-height arm will compare the
+	/// block hash exactly, and at `best.height + 1` the parent hash — both PROVABLE — so a
+	/// listener genuinely sitting on a fork is caught a few blocks later by a check that can
+	/// decide it.
+	///
+	/// That argument holds only while the chain being replayed is at least as long as the
+	/// listener's own chain. It does NOT cover a reorg that leaves the canonical tip *below* an
+	/// ahead listener's persisted tip (needs to be deeper than the ancestry window, or any depth
+	/// at all against a locator restored from persistence with no ancestors): the replay ends
+	/// before it can prove anything, every block is unprovable, and deferring forever is the same
+	/// as dropping. That geometry is caught at the tip boundary instead — see
+	/// [`ChainListener::record_stranded_listeners`], which fails closed on it.
+	ReplayUnprovable,
+	/// The listener cannot accept this block without first being rewound.
+	Diverged,
+}
+
+pub(crate) fn listener_action(
+	best: &BlockLocator, block_hash: bitcoin::BlockHash, prev_blockhash: bitcoin::BlockHash,
+	height: u32,
+) -> ListenerAction {
+	if height == best.height + 1 {
+		// The ordinary case: extends the listener's tip.
+		return if best.block_hash == prev_blockhash {
+			ListenerAction::Deliver
+		} else {
+			ListenerAction::Diverged
+		};
+	}
+
+	if height == best.height {
+		// Same height: an exact replay is safe to skip, a different block is a fork.
+		return if best.block_hash == block_hash {
+			ListenerAction::AlreadyApplied
+		} else {
+			ListenerAction::Diverged
+		};
+	}
+
+	if height < best.height {
+		// Below the tip: only a skip if this exact block is on the listener's own chain.
+		// `previous_blocks` holds ancestors in reverse chronological order starting at
+		// `best.height - 1`, so the ancestor at `height` sits at index `best.height - height - 1`.
+		let idx = (best.height - height - 1) as usize;
+		return match best.previous_blocks.get(idx) {
+			Some(Some(ancestor)) if *ancestor == block_hash => ListenerAction::AlreadyApplied,
+			// An ancestor we DO hold at that height and that differs is a proven fork.
+			Some(Some(_)) => ListenerAction::Diverged,
+			// Empty slot (a locator restored from persistence carries no ancestry) or past the
+			// end of the 12-deep window: unprovable either way, and NOT evidence of a fork. See
+			// `ListenerAction::ReplayUnprovable`.
+			Some(None) | None => ListenerAction::ReplayUnprovable,
+		};
+	}
+
+	// height > best.height + 1: a gap. Delivering would violate the one-call-per-block contract.
+	ListenerAction::Diverged
+}
+
+impl ChainListener {
+	/// Logs a diverged listener. Delivering anyway would panic on LDK's chain-order assertion, and
+	/// silently skipping would strand the listener on a stale chain, so the condition is surfaced
+	/// loudly rather than swallowed.
+	pub(crate) fn get_best_block(&self) -> BlockLocator {
+		let candidates = [
+			self.onchain_wallet.current_best_block(),
+			self.channel_manager.current_best_block(),
+			self.output_sweeper.current_best_block(),
+		];
+		let mut min = candidates.into_iter().min_by_key(|b| b.height).expect("non-empty");
+		if let Some(worst_monitor) = self.min_monitor_best_block() {
+			if worst_monitor.height < min.height {
+				min = worst_monitor;
+			}
+		}
+		min
+	}
+
+	/// The furthest-behind channel monitor, or `None` when there are no monitors.
+	fn min_monitor_best_block(&self) -> Option<BlockLocator> {
+		self.chain_monitor
+			.list_monitors()
+			.iter()
+			.flat_map(|id| self.chain_monitor.get_monitor(*id))
+			.map(|m| m.current_best_block())
+			.min_by_key(|b| b.height)
+	}
+
+	pub(crate) fn take_divergence(&self) -> Option<String> {
+		self.divergence.lock().unwrap().take()
+	}
+
+	/// Records one listener's decision about one replay block in the batch ledger, logs it, and
+	/// hands it back so the caller can act on it.
+	///
+	/// EVERY decision must flow through here. The ledger's whole value is the contrast between a
+	/// listener that skipped some blocks and one that skipped *only* blocks, so a decision that
+	/// bypassed it would read as an absence of evidence.
+	fn note_decision(
+		&self, who: &'static str, best: &BlockLocator, height: u32, action: ListenerAction,
+	) -> ListenerAction {
+		self.replay_batch.lock().unwrap().entry(who).or_default().note(best, action);
+		match action {
+			ListenerAction::ReplayUnprovable => self.log_unprovable_replay(who, best, height),
+			ListenerAction::Diverged => self.log_divergence(who, best, height),
+			ListenerAction::Deliver | ListenerAction::AlreadyApplied => {},
+		}
+		action
+	}
+
+	/// Drains the batch ledger at a tip boundary and fails closed on any listener the replay could
+	/// never prove a connection to.
+	///
+	/// A batch that ends at `tip_height` is the last chance a listener gets: the replay is not
+	/// coming back for it. So a listener that saw nothing but [`ListenerAction::ReplayUnprovable`]
+	/// across the whole batch, and whose own tip is at or above the tip we just reached, is not
+	/// waiting to be caught up — it is stranded on a chain we cannot extend or refute, and the
+	/// deferral promised by `ReplayUnprovable` can never be honoured. Recording it as divergence
+	/// halts the chain source, which is the pre-`ReplayUnprovable` behaviour for exactly this
+	/// (true-positive) case.
+	///
+	/// A listener that skipped a stretch and then reconnected — the ordinary consequence of the
+	/// resume-from-minimum design, and the case `ReplayUnprovable` exists for — has `provable > 0`
+	/// and is merely reported, at a level that does not depend on debug logging being on.
+	///
+	/// Returns `true` when at least one listener was recorded as stranded.
+	pub(crate) fn record_stranded_listeners(&self, tip_height: u32) -> bool {
+		let batch = std::mem::take(&mut *self.replay_batch.lock().unwrap());
+		let mut stranded = false;
+		for (who, tally) in batch {
+			match tally.verdict(tip_height) {
+				BatchVerdict::Ordinary => {},
+				BatchVerdict::SkippedThenReconnected => log_info!(
+					self.logger,
+					"{} skipped {} block(s) of the replay it could not prove ancestry for, then \
+					 reconnected to the chain ({} proven decision(s), listener tip {}).",
+					who,
+					tally.unprovable,
+					tally.provable,
+					tally.tip_height,
+				),
+				BatchVerdict::Stranded => {
+					stranded = true;
+					self.record_divergence(format!(
+						"{} is stranded at height {} above the synced tip {} ({} block(s) \
+						 replayed, none provable): the replay ended without ever reaching a block \
+						 it could prove",
+						who, tally.tip_height, tip_height, tally.unprovable
+					));
+					log_error!(
+						self.logger,
+						"{} sits at height {} while the chain we just synced ends at {}, and none \
+						 of the {} replayed block(s) could be proven to be on its chain. It is on \
+						 a chain we can neither extend nor refute, so it is stranded rather than \
+						 lagging.",
+						who,
+						tally.tip_height,
+						tip_height,
+						tally.unprovable,
+					);
+				},
+			}
+		}
+		stranded
+	}
+
+	/// Logs a replay this listener is too far ahead of for us to prove ancestry for.
+	///
+	/// Deliberately does NOT touch `self.divergence`: on its own this is the ordinary consequence
+	/// of the resume-from-minimum design, not a fork. Whether it stayed ordinary is decided at the
+	/// tip boundary by [`Self::record_stranded_listeners`], so this stays at debug level.
+	fn log_unprovable_replay(&self, who: &str, best: &BlockLocator, height: u32) {
+		log_debug!(
+			self.logger,
+			"{} is at height {} and holds no ancestry back to height {}; skipping the replay of \
+			 that block for it (its own tip is re-checked by hash when the replay reaches it).",
+			who,
+			best.height,
+			height,
+		);
+	}
+
+	/// Records the first divergence seen since the last drain. Later ones are dropped: the chain
+	/// source halts on the first, and the first is the one that explains the rest.
+	fn record_divergence(&self, reason: String) {
+		let mut recorded = self.divergence.lock().unwrap();
+		if recorded.is_none() {
+			*recorded = Some(reason);
+		}
+	}
+
+	fn log_divergence(&self, who: &str, best: &BlockLocator, height: u32) {
+		self.record_divergence(format!(
+			"{} diverged at height {} (listener at {}, hash {})",
+			who, height, best.height, best.block_hash
+		));
+		log_error!(
+			self.logger,
+			"{} cannot accept the block at height {}: it is at height {} (hash {}). It must be \
+			 rewound before it can continue; skipping to avoid a chain-order panic.",
+			who,
+			height,
+			best.height,
+			best.block_hash,
+		);
+	}
 }
 
 impl Listen for ChainListener {
@@ -1356,16 +1888,96 @@ impl Listen for ChainListener {
 		&self, header: &bitcoin::block::Header,
 		txdata: &lightning::chain::transaction::TransactionData, height: u32,
 	) {
+		// The on-chain wallet is deliberately not gated. `Wallet::blocks_disconnected` is a no-op
+		// because BDK expects blocks to be reconnected starting from the point of disagreement, so
+		// a height-based gate would starve it of the new chain after a reorg. BDK also tolerates an
+		// exact duplicate, which is the only case a gate would otherwise guard against.
 		self.onchain_wallet.filtered_block_connected(header, txdata, height);
-		self.channel_manager.filtered_block_connected(header, txdata, height);
-		self.chain_monitor.filtered_block_connected(header, txdata, height);
-		self.output_sweeper.filtered_block_connected(header, txdata, height);
+
+		let block_hash = header.block_hash();
+
+		// `note_decision` does the logging and the batch tally; the arms below decide only what
+		// reaches the listener.
+		let cm_best = self.channel_manager.current_best_block();
+		let cm_action = listener_action(&cm_best, block_hash, header.prev_blockhash, height);
+		match self.note_decision("ChannelManager", &cm_best, height, cm_action) {
+			ListenerAction::Deliver => {
+				self.channel_manager.filtered_block_connected(header, txdata, height)
+			},
+			ListenerAction::AlreadyApplied
+			| ListenerAction::ReplayUnprovable
+			| ListenerAction::Diverged => {},
+		}
+
+		// `ChainMonitor` has no chain-order assertion of its own, but `ChannelMonitor` advances its
+		// tip whenever the incoming height is greater *without validating the parent*, so replaying
+		// a different chain would silently graft a stale ancestor. Gate it on the furthest-behind
+		// monitor: monitors ahead of that point ignore heights at or below their own tip.
+		match self.min_monitor_best_block() {
+			Some(monitor_best) => {
+				let action =
+					listener_action(&monitor_best, block_hash, header.prev_blockhash, height);
+				match self.note_decision("ChainMonitor", &monitor_best, height, action) {
+					ListenerAction::Deliver | ListenerAction::AlreadyApplied => {
+						self.chain_monitor.filtered_block_connected(header, txdata, height)
+					},
+					ListenerAction::ReplayUnprovable | ListenerAction::Diverged => {},
+				}
+			},
+			// No monitors: nothing to strand.
+			None => self.chain_monitor.filtered_block_connected(header, txdata, height),
+		}
+
+		let sweeper_best = self.output_sweeper.current_best_block();
+		let sweeper_action =
+			listener_action(&sweeper_best, block_hash, header.prev_blockhash, height);
+		match self.note_decision("OutputSweeper", &sweeper_best, height, sweeper_action) {
+			ListenerAction::Deliver => {
+				self.output_sweeper.filtered_block_connected(header, txdata, height)
+			},
+			ListenerAction::AlreadyApplied
+			| ListenerAction::ReplayUnprovable
+			| ListenerAction::Diverged => {},
+		}
 	}
+
 	fn block_connected(&self, block: &bitcoin::Block, height: u32) {
 		self.onchain_wallet.block_connected(block, height);
-		self.channel_manager.block_connected(block, height);
-		self.chain_monitor.block_connected(block, height);
-		self.output_sweeper.block_connected(block, height);
+
+		let block_hash = block.header.block_hash();
+
+		let cm_best = self.channel_manager.current_best_block();
+		let cm_action = listener_action(&cm_best, block_hash, block.header.prev_blockhash, height);
+		match self.note_decision("ChannelManager", &cm_best, height, cm_action) {
+			ListenerAction::Deliver => self.channel_manager.block_connected(block, height),
+			ListenerAction::AlreadyApplied
+			| ListenerAction::ReplayUnprovable
+			| ListenerAction::Diverged => {},
+		}
+
+		match self.min_monitor_best_block() {
+			Some(monitor_best) => {
+				let action =
+					listener_action(&monitor_best, block_hash, block.header.prev_blockhash, height);
+				match self.note_decision("ChainMonitor", &monitor_best, height, action) {
+					ListenerAction::Deliver | ListenerAction::AlreadyApplied => {
+						self.chain_monitor.block_connected(block, height)
+					},
+					ListenerAction::ReplayUnprovable | ListenerAction::Diverged => {},
+				}
+			},
+			None => self.chain_monitor.block_connected(block, height),
+		}
+
+		let sweeper_best = self.output_sweeper.current_best_block();
+		let sweeper_action =
+			listener_action(&sweeper_best, block_hash, block.header.prev_blockhash, height);
+		match self.note_decision("OutputSweeper", &sweeper_best, height, sweeper_action) {
+			ListenerAction::Deliver => self.output_sweeper.block_connected(block, height),
+			ListenerAction::AlreadyApplied
+			| ListenerAction::ReplayUnprovable
+			| ListenerAction::Diverged => {},
+		}
 	}
 
 	fn blocks_disconnected(&self, fork_point_block: lightning::chain::BlockLocator) {
@@ -1373,6 +1985,10 @@ impl Listen for ChainListener {
 		self.channel_manager.blocks_disconnected(fork_point_block);
 		self.chain_monitor.blocks_disconnected(fork_point_block);
 		self.output_sweeper.blocks_disconnected(fork_point_block);
+		// Every listener just moved back to the fork point, so the batch tallied against their old
+		// tips describes a chain none of them are on any more. The replay that follows is the one
+		// that gets judged.
+		self.replay_batch.lock().unwrap().clear();
 	}
 }
 
@@ -1405,6 +2021,7 @@ impl std::error::Error for BitcoindClientError {}
 mod tests {
 	use bitcoin::hashes::Hash;
 	use bitcoin::{FeeRate, OutPoint, ScriptBuf, Transaction, TxIn, TxOut, Txid, Witness};
+	use lightning::chain::BlockLocator;
 	use lightning_block_sync::http::JsonResponse;
 	use proptest::arbitrary::any;
 	use proptest::collection::vec;
@@ -1412,9 +2029,253 @@ mod tests {
 	use serde_json::json;
 
 	use crate::chain::bitcoind::{
-		FeeResponse, GetMempoolEntryResponse, GetRawMempoolResponse, GetRawTransactionResponse,
-		MempoolMinFeeResponse,
+		listener_action, BatchVerdict, FeeResponse, GetMempoolEntryResponse, GetRawMempoolResponse,
+		GetRawTransactionResponse, ListenerAction, MempoolMinFeeResponse, ReplayTally,
 	};
+
+	fn hash(byte: u8) -> bitcoin::BlockHash {
+		bitcoin::BlockHash::from_byte_array([byte; 32])
+	}
+
+	/// A listener tip at `height`/`hash_byte` whose ancestors are byte-tagged `hash_byte - n`.
+	fn locator(height: u32, hash_byte: u8) -> BlockLocator {
+		let mut loc = BlockLocator::new(hash(hash_byte), height);
+		for (i, slot) in loc.previous_blocks.iter_mut().enumerate() {
+			*slot = Some(hash(hash_byte.wrapping_sub(i as u8 + 1)));
+		}
+		loc
+	}
+
+	#[test]
+	fn listener_action_delivers_the_next_block_in_order() {
+		// Extends the tip: parent matches, height is best + 1.
+		assert_eq!(
+			listener_action(&locator(100, 50), hash(51), hash(50), 101),
+			ListenerAction::Deliver
+		);
+	}
+
+	#[test]
+	fn listener_action_rejects_a_next_height_block_with_the_wrong_parent() {
+		assert_eq!(
+			listener_action(&locator(100, 50), hash(99), hash(200), 101),
+			ListenerAction::Diverged
+		);
+	}
+
+	#[test]
+	fn listener_action_skips_an_exact_replay_at_the_tip() {
+		// The crash case the gating exists for: the resume floor is the minimum height across all
+		// listeners, so a listener that persisted further ahead is replayed its own blocks.
+		// `ChannelManager` and `OutputSweeper` assert on chain order, so delivering would panic.
+		assert_eq!(
+			listener_action(&locator(100, 50), hash(50), hash(49), 100),
+			ListenerAction::AlreadyApplied
+		);
+	}
+
+	#[test]
+	fn listener_action_skips_an_exact_replay_below_the_tip() {
+		// Two blocks back on the listener's own chain: ancestors are tagged 49, 48, ...
+		assert_eq!(
+			listener_action(&locator(100, 50), hash(48), hash(47), 98),
+			ListenerAction::AlreadyApplied
+		);
+	}
+
+	#[test]
+	fn listener_action_reports_a_different_block_at_the_same_height() {
+		// The bug this classifier exists to prevent. Height alone would call this an ordinary
+		// replay and skip it, silently stranding the listener on the stale fork — worse than the
+		// panic being avoided, because nothing reports it.
+		assert_eq!(
+			listener_action(&locator(100, 50), hash(0xbb), hash(0xaa), 100),
+			ListenerAction::Diverged
+		);
+	}
+
+	#[test]
+	fn listener_action_reports_a_different_block_below_the_tip() {
+		// Right height, but not the block on the listener's chain (ancestor there is tagged 48).
+		assert_eq!(
+			listener_action(&locator(100, 50), hash(0xbb), hash(0xaa), 98),
+			ListenerAction::Diverged
+		);
+	}
+
+	#[test]
+	fn listener_action_reports_an_unprovable_replay_beyond_known_ancestry() {
+		// `previous_blocks` holds 12 ancestors; past that we cannot prove the block is ours, so it
+		// must not be assumed to be a safe replay — it is NOT `AlreadyApplied`, the block is still
+		// withheld from the listener.
+		//
+		// It is not `Diverged` either. Resume-from-minimum deliberately replays blocks to any
+		// listener that persisted further ahead (see `ListenerAction`'s own doc comment), and
+		// listener durability routinely skews by more than 12 blocks — measured live at 20
+		// (wallet 7871 / ChainMonitor 7888 / ChannelManager 7891, all three on the canonical
+		// chain). Calling that divergence halted CBF block application PERMANENTLY on a healthy
+		// node: every later restart re-derived the same minimum, re-hit the same unprovable
+		// replay, and re-halted, so `sync_state` latched `failed` forever.
+		assert_eq!(
+			listener_action(&locator(100, 50), hash(1), hash(0), 50),
+			ListenerAction::ReplayUnprovable
+		);
+	}
+
+	#[test]
+	fn listener_action_reports_an_unprovable_replay_when_the_locator_carries_no_ancestry() {
+		// `BlockLocator::new` leaves every ancestry slot empty, which is what a listener restored
+		// from persistence can look like. Inside the window but with nothing recorded is still
+		// "cannot decide", not "forked".
+		let no_ancestry = BlockLocator::new(hash(50), 100);
+		assert_eq!(
+			listener_action(&no_ancestry, hash(48), hash(47), 98),
+			ListenerAction::ReplayUnprovable
+		);
+	}
+
+	#[test]
+	fn an_unprovable_replay_still_meets_a_provable_check_at_the_listeners_own_tip() {
+		// The safety property that makes `ReplayUnprovable` safe to not halt on: the replay keeps
+		// climbing, and at the listener's own height the classifier compares block hashes
+		// exactly. A listener genuinely on a fork is caught there instead of below it.
+		//
+		// This holds only while the replay can actually GET to that height. When it cannot — a
+		// chain shorter than the listener's own — the tip-boundary check below is what decides,
+		// see `a_replay_that_ends_below_an_ahead_listener_strands_it`.
+		let ahead = locator(100, 50);
+		// Below the tip, past the ancestry window: undecidable, keep going.
+		assert_eq!(listener_action(&ahead, hash(1), hash(0), 50), ListenerAction::ReplayUnprovable);
+		// At the tip on the same chain: a plain replay.
+		assert_eq!(
+			listener_action(&ahead, hash(50), hash(49), 100),
+			ListenerAction::AlreadyApplied
+		);
+		// At the tip on a DIFFERENT chain: still caught, still halts.
+		assert_eq!(listener_action(&ahead, hash(0xbb), hash(0xaa), 100), ListenerAction::Diverged);
+	}
+
+	/// Replays the blocks of one batch over a single listener locator and returns what the batch
+	/// ledger would hold, using the same fold the live path uses.
+	///
+	/// The locator is held fixed, so this models the listener for as long as the replay has not
+	/// advanced it — which is the entire batch for a listener the replay never reaches, and up to
+	/// its own tip for one it does.
+	fn replay_over(
+		best: &BlockLocator, from: u32, through: u32, chain: impl Fn(u32) -> bitcoin::BlockHash,
+	) -> ReplayTally {
+		let mut tally = ReplayTally::default();
+		for height in from..=through {
+			tally.note(best, listener_action(best, chain(height), chain(height - 1), height));
+		}
+		tally
+	}
+
+	#[test]
+	fn a_replay_that_ends_below_an_ahead_listener_strands_it() {
+		// The geometry the per-block classifier cannot decide: a reorg deeper than the 12-entry
+		// ancestry window that leaves the canonical tip BELOW an ahead listener's persisted tip.
+		// The replay walks the canonical chain and stops at 85, so it never climbs to the
+		// listener's own height where a hash comparison could rule — every block is
+		// `ReplayUnprovable`, and "we'll decide a few blocks later" never comes due.
+		let ahead = locator(100, 100);
+		let canonical = |h: u32| hash(h as u8 + 128);
+
+		let tally = replay_over(&ahead, 76, 85, canonical);
+
+		assert_eq!(tally.unprovable, 10, "every block of the batch was undecidable");
+		assert_eq!(tally.provable, 0, "nothing in the batch could be proven either way");
+		assert_eq!(
+			tally.verdict(85),
+			BatchVerdict::Stranded,
+			"a listener at 100 that the canonical chain ends 15 blocks below is stranded, not \
+			 lagging: no later replay of THIS chain reaches it either"
+		);
+	}
+
+	#[test]
+	fn a_replay_that_ends_below_a_listener_with_no_ancestry_strands_it_at_any_depth() {
+		// The same trap without needing a deep reorg: a locator restored from persistence carries
+		// no ancestors at all, so nothing below its tip is provable and the whole 12-block window
+		// stops helping. Any canonical tip below the listener's own is then unreachable.
+		let restored = BlockLocator::new(hash(100), 100);
+		let canonical = |h: u32| hash(h as u8);
+
+		let tally = replay_over(&restored, 90, 99, canonical);
+
+		assert_eq!(tally.provable, 0);
+		assert_eq!(tally.verdict(99), BatchVerdict::Stranded);
+	}
+
+	#[test]
+	fn a_behind_listener_the_replay_catches_up_to_still_heals() {
+		// The case `ReplayUnprovable` exists for, and the one a stranded-detector must not eat:
+		// listener durability skews on every restart (measured live at 20 blocks), the resume
+		// floor is the minimum across listeners, and a listener with no persisted ancestry cannot
+		// prove ANY of the replay below its tip. It is still perfectly healthy — the proof
+		// arrives when the replay reaches its own height.
+		//
+		// Stopping the replay at the listener's tip is the pessimistic cut: every block above it
+		// is `Deliver`, which only adds proof.
+		let restored = BlockLocator::new(hash(100), 100);
+		let canonical = |h: u32| hash(h as u8);
+
+		let tally = replay_over(&restored, 81, 100, canonical);
+
+		assert_eq!(tally.unprovable, 19, "81..=99 could not be proven");
+		assert_eq!(tally.provable, 1, "its own tip at 100 compares by hash, and matches");
+		assert_eq!(
+			tally.verdict(120),
+			BatchVerdict::SkippedThenReconnected,
+			"skipping a stretch and then reconnecting must never halt the chain source — that \
+			 halt bricked CBF on healthy nodes"
+		);
+	}
+
+	#[test]
+	fn a_batch_that_proved_a_fork_is_not_also_reported_as_stranded() {
+		// Divergence is a proven decision. It halts through its own path, and reporting the same
+		// listener twice for the same batch would misdescribe why.
+		let ahead = locator(100, 100);
+		let forked = |h: u32| hash(h as u8 + 128);
+
+		// 88..=99 are inside the ancestry window and disagree; 100 is the tip and disagrees.
+		let tally = replay_over(&ahead, 80, 100, forked);
+
+		assert!(tally.provable > 0, "the window and the tip both ruled");
+		assert_eq!(tally.verdict(100), BatchVerdict::SkippedThenReconnected);
+	}
+
+	#[test]
+	fn the_stranded_verdict_needs_both_no_proof_and_an_unreachable_tip() {
+		let nothing_skipped = ReplayTally { unprovable: 0, provable: 5, tip_height: 0 };
+		assert_eq!(nothing_skipped.verdict(90), BatchVerdict::Ordinary);
+
+		let skipped_then_proved = ReplayTally { unprovable: 3, provable: 1, tip_height: 100 };
+		assert_eq!(skipped_then_proved.verdict(90), BatchVerdict::SkippedThenReconnected);
+
+		// Defensive: a listener below the tip the replay reached is reachable by construction, so
+		// however it got here it is not the terminal case.
+		let below_the_tip = ReplayTally { unprovable: 3, provable: 0, tip_height: 89 };
+		assert_eq!(below_the_tip.verdict(90), BatchVerdict::SkippedThenReconnected);
+
+		let unreachable = ReplayTally { unprovable: 3, provable: 0, tip_height: 100 };
+		assert_eq!(unreachable.verdict(90), BatchVerdict::Stranded);
+		assert_eq!(
+			unreachable.verdict(100),
+			BatchVerdict::Stranded,
+			"at the tip it is still ahead"
+		);
+	}
+
+	#[test]
+	fn listener_action_reports_a_gap() {
+		// More than one block ahead: delivering violates LDK's one-call-per-block contract.
+		assert_eq!(
+			listener_action(&locator(90, 50), hash(60), hash(59), 101),
+			ListenerAction::Diverged
+		);
+	}
 
 	prop_compose! {
 		fn arbitrary_witness()(

@@ -6,6 +6,7 @@
 // accordance with one or both of these licenses.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -15,6 +16,7 @@ use bdk_chain::bdk_core::spk_client::{
 };
 use bdk_electrum::BdkElectrumClient;
 use bdk_wallet::{KeychainKind as BdkKeyChainKind, Update as BdkUpdate};
+use bitcoin::transaction::Version;
 use bitcoin::{FeeRate, Network, Script, ScriptBuf, Transaction, Txid};
 use electrum_client::{
 	Batch, Client as ElectrumClient, ConfigBuilder as ElectrumConfigBuilder, ElectrumApi,
@@ -24,15 +26,19 @@ use lightning::util::ser::Writeable;
 use lightning_transaction_sync::ElectrumSyncClient;
 
 use super::WalletSyncStatus;
-use crate::config::{Config, ElectrumSyncConfig, BDK_CLIENT_STOP_GAP};
+use crate::config::{
+	clamp_full_scan_stop_gap, Config, ElectrumSyncConfig, MAX_FULL_SCAN_STOP_GAP,
+	MIN_FULL_SCAN_STOP_GAP,
+};
 use crate::error::Error;
 use crate::fee_estimator::{
 	apply_post_estimation_adjustments, get_all_conf_targets, get_num_block_defaults_for_target,
 	ConfirmationTarget, OnchainFeeEstimator,
 };
 use crate::io::utils::update_and_persist_node_metrics;
-use crate::logger::{log_bytes, log_debug, log_error, log_trace, LdkLogger, Logger};
+use crate::logger::{log_bytes, log_debug, log_error, log_trace, log_warn, LdkLogger, Logger};
 use crate::runtime::Runtime;
+use crate::tx_broadcaster::SortedTransactions;
 use crate::types::{ChainMonitor, ChannelManager, DynStore, Sweeper, Wallet};
 use crate::PersistedNodeMetrics;
 
@@ -50,6 +56,7 @@ pub(super) struct ElectrumChainSource {
 	config: Arc<Config>,
 	logger: Arc<Logger>,
 	node_metrics: Arc<PersistedNodeMetrics>,
+	force_wallet_full_scan: AtomicBool,
 }
 
 impl ElectrumChainSource {
@@ -61,6 +68,7 @@ impl ElectrumChainSource {
 		let electrum_runtime_status = RwLock::new(ElectrumRuntimeStatus::new());
 		let onchain_wallet_sync_status = Mutex::new(WalletSyncStatus::Completed);
 		let lightning_wallet_sync_status = Mutex::new(WalletSyncStatus::Completed);
+		let force_wallet_full_scan = AtomicBool::new(sync_config.force_wallet_full_scan);
 		Self {
 			server_url,
 			sync_config,
@@ -72,6 +80,7 @@ impl ElectrumChainSource {
 			config,
 			logger: Arc::clone(&logger),
 			node_metrics,
+			force_wallet_full_scan,
 		}
 	}
 
@@ -87,6 +96,41 @@ impl ElectrumChainSource {
 
 	pub(super) fn stop(&self) {
 		self.electrum_runtime_status.write().expect("lock").stop();
+	}
+
+	/// Returns the shared on-chain fee estimator backing this chain source
+	/// (Peerswap native primitive B6).
+	#[cfg(feature = "swaps")]
+	pub(super) fn fee_estimator(&self) -> &Arc<OnchainFeeEstimator> {
+		&self.fee_estimator
+	}
+
+	/// Reorg-aware confirmation/eviction query for an ARBITRARY `txid` against
+	/// this Electrum backend (Peerswap native primitive B5). See
+	/// [`super::ChainSource::swap_query_tx`] for the fail-closed contract.
+	#[cfg(feature = "swaps")]
+	pub(super) async fn swap_query_tx(
+		&self, txid: Txid, script_pubkey: Option<&ScriptBuf>,
+	) -> super::RawTxObservation {
+		let script_pubkey = match script_pubkey {
+			Some(script_pubkey) => script_pubkey.clone(),
+			None => {
+				log_error!(
+					self.logger,
+					"swap_query_tx: Electrum backend requires a watched scriptPubKey for {} (register via watch_txid)",
+					txid
+				);
+				return super::RawTxObservation::Unreachable;
+			},
+		};
+		let client = match self.electrum_runtime_status.read().unwrap().client() {
+			Some(client) => client,
+			None => {
+				log_error!(self.logger, "swap_query_tx: Electrum chain source not started");
+				return super::RawTxObservation::Unreachable;
+			},
+		};
+		client.swap_query_tx(txid, script_pubkey).await
 	}
 
 	pub(crate) async fn sync_onchain_wallet(
@@ -125,9 +169,11 @@ impl ElectrumChainSource {
 			return Err(Error::FeerateEstimationUpdateFailed);
 		};
 		// If this is our first sync, do a full scan with the configured gap limit.
-		// Otherwise just do an incremental sync.
-		let incremental_sync =
+		// Otherwise just do an incremental sync, unless a forced full scan is still pending.
+		let has_prior_sync =
 			self.node_metrics.read().expect("lock").latest_onchain_wallet_sync_timestamp.is_some();
+		let forced_full_scan = self.force_wallet_full_scan.load(Ordering::Acquire);
+		let incremental_sync = has_prior_sync && !forced_full_scan;
 
 		let cached_txs = onchain_wallet.get_cached_txs();
 
@@ -160,6 +206,9 @@ impl ElectrumChainSource {
 			.await
 		};
 
+		if forced_full_scan && res.is_ok() {
+			self.force_wallet_full_scan.store(false, Ordering::Release);
+		}
 		res
 	}
 
@@ -168,7 +217,7 @@ impl ElectrumChainSource {
 		update_res: Result<BdkUpdate, Error>, now: Instant,
 	) -> Result<(), Error> {
 		match update_res {
-			Ok(update) => match onchain_wallet.apply_update(update) {
+			Ok(update) => match onchain_wallet.apply_update(update).await {
 				Ok(()) => {
 					log_debug!(
 						self.logger,
@@ -275,7 +324,14 @@ impl ElectrumChainSource {
 
 		let now = Instant::now();
 
-		let new_fee_rate_cache = electrum_client.get_fee_rate_cache_update().await?;
+		let new_fee_rate_cache = get_electrum_fee_rate_cache_update(
+			Arc::clone(&electrum_client.runtime),
+			Arc::clone(&electrum_client.electrum_client),
+			self.config.network,
+			self.sync_config.timeouts_config.fee_rate_cache_update_timeout_secs,
+			Arc::clone(&self.logger),
+		)
+		.await?;
 		self.fee_estimator.set_fee_rate_cache(new_fee_rate_cache);
 
 		log_debug!(
@@ -294,7 +350,54 @@ impl ElectrumChainSource {
 		Ok(())
 	}
 
-	pub(crate) async fn process_broadcast_package(&self, package: Vec<Transaction>) {
+	pub(crate) async fn validate_zero_fee_commitments_support(&self) -> Result<(), Error> {
+		let electrum_client: Arc<ElectrumRuntimeClient> = if let Some(client) =
+			self.electrum_runtime_status.read().expect("lock").client().as_ref()
+		{
+			Arc::clone(client)
+		} else {
+			debug_assert!(
+				false,
+				"We should have started the chain source before checking submitpackage support"
+			);
+			return Err(Error::ConnectionFailed);
+		};
+
+		// TODO: Use `protocol_version` API once shipped in
+		// https://github.com/bitcoindevkit/rust-electrum-client/pull/213.
+		//
+		// This could still accept an Electrum server running against Bitcoin Core v26
+		// through v28, which does not relay ephemeral dust.
+		let spawn_fut = electrum_client.runtime.spawn_blocking({
+			let electrum_client = Arc::clone(&electrum_client.electrum_client);
+			move || electrum_client.transaction_broadcast_package(&super::dummy_package())
+		});
+		let timeout_fut = tokio::time::timeout(
+			Duration::from_secs(self.sync_config.timeouts_config.tx_broadcast_timeout_secs),
+			spawn_fut,
+		);
+
+		match timeout_fut.await {
+			Ok(Ok(Ok(_))) => Ok(()),
+			Ok(Ok(Err(
+				e @ (electrum_client::Error::Protocol(_)
+				| electrum_client::Error::AllAttemptsErrored(_)),
+			))) => {
+				log_error!(self.logger, "Electrum server does not support submitpackage: {:?}", e);
+				Err(Error::ChainSourceNotSupported)
+			},
+			e => {
+				log_error!(
+					self.logger,
+					"Failed to check support for submitpackage on the Electrum server: {:?}",
+					e
+				);
+				Err(Error::ConnectionFailed)
+			},
+		}
+	}
+
+	pub(crate) async fn process_transaction_broadcast(&self, txs: SortedTransactions) {
 		let electrum_client: Arc<ElectrumRuntimeClient> = if let Some(client) =
 			self.electrum_runtime_status.read().expect("lock").client().as_ref()
 		{
@@ -304,8 +407,14 @@ impl ElectrumChainSource {
 			return;
 		};
 
-		for tx in package {
-			electrum_client.broadcast(tx).await;
+		let all_txs_are_v3 = txs.iter().all(|tx| tx.version == Version::non_standard(3));
+		match txs.len() {
+			2.. if all_txs_are_v3 => electrum_client.submit_package(txs).await,
+			_ => {
+				for tx in txs.into_inner() {
+					electrum_client.broadcast(tx).await
+				}
+			},
 		}
 	}
 }
@@ -426,10 +535,11 @@ impl ElectrumRuntimeClient {
 		);
 		let bdk_electrum_client = Arc::new(BdkElectrumClient::new(Arc::clone(&electrum_client)));
 		let tx_sync = Arc::new(
-			ElectrumSyncClient::new(server_url.clone(), Arc::clone(&logger)).map_err(|e| {
-				log_error!(logger, "Failed to connect to electrum server: {}", e);
-				Error::ConnectionFailed
-			})?,
+			ElectrumSyncClient::from_client(Arc::clone(&electrum_client), Arc::clone(&logger))
+				.map_err(|e| {
+					log_error!(logger, "Failed to connect to electrum server: {}", e);
+					Error::ConnectionFailed
+				})?,
 		);
 		Ok(Self {
 			electrum_client,
@@ -440,6 +550,103 @@ impl ElectrumRuntimeClient {
 			config,
 			logger,
 		})
+	}
+
+	/// Reorg-aware confirmation/eviction query for an ARBITRARY `txid` +
+	/// `script_pubkey` (Peerswap native primitive B5).
+	///
+	/// Electrum exposes no `getrawtransaction`-by-txid-alone RPC; the only
+	/// reorg-aware confirmation signal it exposes is per-scriptPubKey history
+	/// (`blockchain.scripthash.get_history`), so this scans that history for a
+	/// matching `tx_hash` and derives the confirmation depth against a freshly
+	/// polled tip. FAIL-CLOSED (E6) on any transport error or timeout.
+	#[cfg(feature = "swaps")]
+	async fn swap_query_tx(&self, txid: Txid, script_pubkey: ScriptBuf) -> super::RawTxObservation {
+		let electrum_client = Arc::clone(&self.electrum_client);
+		let history_spawn_fut =
+			self.runtime.spawn_blocking(move || electrum_client.script_get_history(&script_pubkey));
+		let history_timeout_fut = tokio::time::timeout(
+			Duration::from_secs(self.sync_config.timeouts_config.per_request_timeout_secs as u64),
+			history_spawn_fut,
+		);
+		let history = match history_timeout_fut.await {
+			Ok(Ok(Ok(history))) => history,
+			Ok(Ok(Err(e))) => {
+				log_error!(
+					self.logger,
+					"swap_query_tx: Electrum history query failed for {}: {}",
+					txid,
+					e
+				);
+				return super::RawTxObservation::Unreachable;
+			},
+			Ok(Err(e)) => {
+				log_error!(
+					self.logger,
+					"swap_query_tx: Electrum history query task failed for {}: {}",
+					txid,
+					e
+				);
+				return super::RawTxObservation::Unreachable;
+			},
+			Err(e) => {
+				log_error!(
+					self.logger,
+					"swap_query_tx: Electrum history query timed out for {}: {}",
+					txid,
+					e
+				);
+				return super::RawTxObservation::Unreachable;
+			},
+		};
+
+		let entry = match history.into_iter().find(|entry| entry.tx_hash == txid) {
+			Some(entry) => entry,
+			None => return super::RawTxObservation::NotFound,
+		};
+
+		// Electrum reports height `0` for a mempool tx, and a negative height for
+		// a mempool tx with an unconfirmed parent; neither is a confirmed height.
+		if entry.height <= 0 {
+			return super::RawTxObservation::InMempool;
+		}
+		let height = entry.height as u32;
+
+		let electrum_client = Arc::clone(&self.electrum_client);
+		let tip_spawn_fut =
+			self.runtime.spawn_blocking(move || electrum_client.block_headers_subscribe());
+		let tip_timeout_fut = tokio::time::timeout(
+			Duration::from_secs(self.sync_config.timeouts_config.per_request_timeout_secs as u64),
+			tip_spawn_fut,
+		);
+		match tip_timeout_fut.await {
+			Ok(Ok(Ok(tip))) if tip.height as u32 >= height => {
+				let confirmations = (tip.height as u32).saturating_sub(height).saturating_add(1);
+				super::RawTxObservation::Confirmed { height: Some(height), confirmations }
+			},
+			Ok(Ok(Ok(tip))) => {
+				log_error!(
+					self.logger,
+					"swap_query_tx: Electrum tip {} below confirming-block height {} for {} (reorg/race); failing closed",
+					tip.height,
+					height,
+					txid
+				);
+				super::RawTxObservation::Unreachable
+			},
+			Ok(Ok(Err(e))) => {
+				log_error!(self.logger, "swap_query_tx: Electrum tip query failed: {}", e);
+				super::RawTxObservation::Unreachable
+			},
+			Ok(Err(e)) => {
+				log_error!(self.logger, "swap_query_tx: Electrum tip query task failed: {}", e);
+				super::RawTxObservation::Unreachable
+			},
+			Err(e) => {
+				log_error!(self.logger, "swap_query_tx: Electrum tip query timed out: {}", e);
+				super::RawTxObservation::Unreachable
+			},
+		}
 	}
 
 	async fn sync_confirmables(
@@ -486,11 +693,12 @@ impl ElectrumRuntimeClient {
 	) -> Result<BdkFullScanResponse<BdkKeyChainKind>, Error> {
 		let bdk_electrum_client = Arc::clone(&self.bdk_electrum_client);
 		bdk_electrum_client.populate_tx_cache(cached_txs);
+		let full_scan_stop_gap = self.bounded_full_scan_stop_gap();
 
 		let spawn_fut = self.runtime.spawn_blocking(move || {
 			bdk_electrum_client.full_scan(
 				request,
-				BDK_CLIENT_STOP_GAP,
+				full_scan_stop_gap,
 				BDK_ELECTRUM_CLIENT_BATCH_SIZE,
 				true,
 			)
@@ -514,6 +722,22 @@ impl ElectrumRuntimeClient {
 				log_error!(self.logger, "Sync of on-chain wallet failed: {}", e);
 				Error::WalletOperationFailed
 			})
+	}
+
+	fn bounded_full_scan_stop_gap(&self) -> usize {
+		let configured = self.sync_config.full_scan_stop_gap;
+		let bounded = clamp_full_scan_stop_gap(configured);
+		if bounded != configured {
+			log_warn!(
+				self.logger,
+				"Configured Electrum on-chain wallet full-scan stop gap {} is outside the allowed range {}..={}; using {}.",
+				configured,
+				MIN_FULL_SCAN_STOP_GAP,
+				MAX_FULL_SCAN_STOP_GAP,
+				bounded
+			);
+		}
+		bounded as usize
 	}
 
 	async fn get_incremental_sync_wallet_update(
@@ -547,14 +771,24 @@ impl ElectrumRuntimeClient {
 			})
 	}
 
+	fn log_broadcast_error(&self, e: impl core::fmt::Display, txids: &[Txid], txs: &[Transaction]) {
+		log_error!(self.logger, "Failed to broadcast transaction(s) {:?}: {}", txids, e);
+		log_trace!(self.logger, "Failed broadcast transaction bytes:");
+		for tx in txs {
+			log_trace!(self.logger, "{}", log_bytes!(tx.encode()));
+		}
+	}
+
 	async fn broadcast(&self, tx: Transaction) {
 		let electrum_client = Arc::clone(&self.electrum_client);
 
 		let txid = tx.compute_txid();
-		let tx_bytes = tx.encode();
+		let tx = Arc::new(tx);
 
-		let spawn_fut =
-			self.runtime.spawn_blocking(move || electrum_client.transaction_broadcast(&tx));
+		let spawn_fut = self.runtime.spawn_blocking({
+			let tx = Arc::clone(&tx);
+			move || electrum_client.transaction_broadcast(tx.as_ref())
+		});
 		let timeout_fut = tokio::time::timeout(
 			Duration::from_secs(self.sync_config.timeouts_config.tx_broadcast_timeout_secs),
 			spawn_fut,
@@ -562,118 +796,135 @@ impl ElectrumRuntimeClient {
 
 		match timeout_fut.await {
 			Ok(res) => match res {
-				Ok(_) => {
+				Ok(Ok(txid)) => {
 					log_trace!(self.logger, "Successfully broadcast transaction {}", txid);
 				},
-				Err(e) => {
-					log_error!(self.logger, "Failed to broadcast transaction {}: {}", txid, e);
-					log_trace!(
-						self.logger,
-						"Failed broadcast transaction bytes: {}",
-						log_bytes!(tx_bytes)
-					);
+				Ok(Err(e)) => {
+					self.log_broadcast_error(e, &[txid], core::slice::from_ref(tx.as_ref()))
 				},
+				Err(e) => self.log_broadcast_error(e, &[txid], core::slice::from_ref(tx.as_ref())),
 			},
-			Err(e) => {
-				log_error!(
-					self.logger,
-					"Failed to broadcast transaction due to timeout {}: {}",
-					txid,
-					e
-				);
-				log_trace!(
-					self.logger,
-					"Failed broadcast transaction bytes: {}",
-					log_bytes!(tx_bytes)
-				);
-			},
+			Err(e) => self.log_broadcast_error(e, &[txid], core::slice::from_ref(tx.as_ref())),
 		}
 	}
 
-	async fn get_fee_rate_cache_update(
-		&self,
-	) -> Result<HashMap<ConfirmationTarget, FeeRate>, Error> {
+	async fn submit_package(&self, package: SortedTransactions) {
 		let electrum_client = Arc::clone(&self.electrum_client);
 
-		let mut batch = Batch::default();
-		let confirmation_targets = get_all_conf_targets();
-		for target in confirmation_targets {
-			let num_blocks = get_num_block_defaults_for_target(target);
-			batch.estimate_fee(num_blocks, None);
-		}
+		let txids: Vec<_> = package.iter().map(|tx| tx.compute_txid()).collect();
+		let package = Arc::new(package);
 
-		let spawn_fut = self.runtime.spawn_blocking(move || electrum_client.batch_call(&batch));
-
+		let spawn_fut = self.runtime.spawn_blocking({
+			let package = Arc::clone(&package);
+			move || electrum_client.transaction_broadcast_package(&package)
+		});
 		let timeout_fut = tokio::time::timeout(
-			Duration::from_secs(
-				self.sync_config.timeouts_config.fee_rate_cache_update_timeout_secs,
-			),
+			Duration::from_secs(self.sync_config.timeouts_config.tx_broadcast_timeout_secs),
 			spawn_fut,
 		);
 
-		let raw_estimates_btc_kvb = timeout_fut
-			.await
-			.map_err(|e| {
-				log_error!(self.logger, "Updating fee rate estimates timed out: {}", e);
-				Error::FeerateEstimationUpdateTimeout
-			})?
-			.map_err(|e| {
-				log_error!(self.logger, "Failed to retrieve fee rate estimates: {}", e);
-				Error::FeerateEstimationUpdateFailed
-			})?
-			.map_err(|e| {
-				log_error!(self.logger, "Failed to retrieve fee rate estimates: {}", e);
-				Error::FeerateEstimationUpdateFailed
-			})?;
+		match timeout_fut.await {
+			Ok(res) => match res {
+				Ok(Ok(result)) => {
+					if result.success {
+						log_trace!(
+							self.logger,
+							"Successfully broadcast transaction(s) {:?}",
+							txids
+						);
+						log_trace!(
+							self.logger,
+							"Successfully broadcast transaction(s) {:?}",
+							result
+						);
+					} else {
+						self.log_broadcast_error(format!("{:?}", result), &txids, &package);
+					}
+				},
+				Ok(Err(e)) => self.log_broadcast_error(e, &txids, &package),
+				Err(e) => self.log_broadcast_error(e, &txids, &package),
+			},
+			Err(e) => self.log_broadcast_error(e, &txids, &package),
+		}
+	}
+}
 
-		if raw_estimates_btc_kvb.len() != confirmation_targets.len()
-			&& self.config.network == Network::Bitcoin
-		{
-			// Ensure we fail if we didn't receive all estimates.
-			debug_assert!(false,
-				"Electrum server didn't return all expected results. This is disallowed on Mainnet."
-			);
-			log_error!(self.logger,
+pub(crate) async fn get_electrum_fee_rate_cache_update(
+	runtime: Arc<Runtime>, electrum_client: Arc<ElectrumClient>, network: Network,
+	fee_rate_cache_update_timeout_secs: u64, logger: Arc<Logger>,
+) -> Result<HashMap<ConfirmationTarget, FeeRate>, Error> {
+	let mut batch = Batch::default();
+	let confirmation_targets = get_all_conf_targets();
+	for target in confirmation_targets {
+		let num_blocks = get_num_block_defaults_for_target(target);
+		batch.estimate_fee(num_blocks, None);
+	}
+
+	let spawn_fut = runtime.spawn_blocking(move || electrum_client.batch_call(&batch));
+
+	let timeout_fut =
+		tokio::time::timeout(Duration::from_secs(fee_rate_cache_update_timeout_secs), spawn_fut);
+
+	let raw_estimates_btc_kvb = timeout_fut
+		.await
+		.map_err(|e| {
+			log_error!(logger, "Updating fee rate estimates timed out: {}", e);
+			Error::FeerateEstimationUpdateTimeout
+		})?
+		.map_err(|e| {
+			log_error!(logger, "Failed to retrieve fee rate estimates: {}", e);
+			Error::FeerateEstimationUpdateFailed
+		})?
+		.map_err(|e| {
+			log_error!(logger, "Failed to retrieve fee rate estimates: {}", e);
+			Error::FeerateEstimationUpdateFailed
+		})?;
+
+	if raw_estimates_btc_kvb.len() != confirmation_targets.len() && network == Network::Bitcoin {
+		// Ensure we fail if we didn't receive all estimates.
+		debug_assert!(
+			false,
+			"Electrum server didn't return all expected results. This is disallowed on Mainnet."
+		);
+		log_error!(logger,
 				"Failed to retrieve fee rate estimates: Electrum server didn't return all expected results. This is disallowed on Mainnet."
 			);
-			return Err(Error::FeerateEstimationUpdateFailed);
-		}
-
-		let mut new_fee_rate_cache = HashMap::with_capacity(10);
-		for (target, raw_fee_rate_btc_per_kvb) in
-			confirmation_targets.into_iter().zip(raw_estimates_btc_kvb.into_iter())
-		{
-			// Parse the retrieved serde_json::Value and fall back to 1 sat/vb (10^3 / 10^8 = 10^-5
-			// = 0.00001 btc/kvb) if we fail or it yields less than that. This is mostly necessary
-			// to continue on `signet`/`regtest` where we might not get estimates (or bogus
-			// values).
-			let fee_rate_btc_per_kvb = raw_fee_rate_btc_per_kvb
-				.as_f64()
-				.map_or(0.00001, |converted| converted.max(0.00001));
-
-			// Electrum, just like Bitcoin Core, gives us a feerate in BTC/KvB.
-			// Thus, we multiply by 25_000_000 (10^8 / 4) to get satoshis/kwu.
-			let fee_rate = {
-				let fee_rate_sat_per_kwu = (fee_rate_btc_per_kvb * 25_000_000.0).round() as u64;
-				FeeRate::from_sat_per_kwu(fee_rate_sat_per_kwu)
-			};
-
-			// LDK 0.0.118 introduced changes to the `ConfirmationTarget` semantics that
-			// require some post-estimation adjustments to the fee rates, which we do here.
-			let adjusted_fee_rate = apply_post_estimation_adjustments(target, fee_rate);
-
-			new_fee_rate_cache.insert(target, adjusted_fee_rate);
-
-			log_trace!(
-				self.logger,
-				"Fee rate estimation updated for {:?}: {} sats/kwu",
-				target,
-				adjusted_fee_rate.to_sat_per_kwu(),
-			);
-		}
-
-		Ok(new_fee_rate_cache)
+		return Err(Error::FeerateEstimationUpdateFailed);
 	}
+
+	let mut new_fee_rate_cache = HashMap::with_capacity(10);
+	for (target, raw_fee_rate_btc_per_kvb) in
+		confirmation_targets.into_iter().zip(raw_estimates_btc_kvb.into_iter())
+	{
+		// Parse the retrieved serde_json::Value and fall back to 1 sat/vb (10^3 / 10^8 = 10^-5
+		// = 0.00001 btc/kvb) if we fail or it yields less than that. This is mostly necessary
+		// to continue on `signet`/`regtest` where we might not get estimates (or bogus
+		// values).
+		let fee_rate_btc_per_kvb =
+			raw_fee_rate_btc_per_kvb.as_f64().map_or(0.00001, |converted| converted.max(0.00001));
+
+		// Electrum, just like Bitcoin Core, gives us a feerate in BTC/KvB.
+		// Thus, we multiply by 25_000_000 (10^8 / 4) to get satoshis/kwu.
+		let fee_rate = {
+			let fee_rate_sat_per_kwu = (fee_rate_btc_per_kvb * 25_000_000.0).round() as u64;
+			FeeRate::from_sat_per_kwu(fee_rate_sat_per_kwu)
+		};
+
+		// LDK 0.0.118 introduced changes to the `ConfirmationTarget` semantics that
+		// require some post-estimation adjustments to the fee rates, which we do here.
+		let adjusted_fee_rate = apply_post_estimation_adjustments(target, fee_rate);
+
+		new_fee_rate_cache.insert(target, adjusted_fee_rate);
+
+		log_trace!(
+			logger,
+			"Fee rate estimation updated for {:?}: {} sats/kwu",
+			target,
+			adjusted_fee_rate.to_sat_per_kwu(),
+		);
+	}
+
+	Ok(new_fee_rate_cache)
 }
 
 impl Filter for ElectrumRuntimeClient {

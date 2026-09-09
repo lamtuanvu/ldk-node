@@ -15,6 +15,7 @@ use lightning::ln::channelmanager::PaymentId;
 use crate::config::Config;
 use crate::error::Error;
 use crate::logger::{log_info, LdkLogger, Logger};
+use crate::runtime::Runtime;
 use crate::types::{ChannelManager, Wallet};
 use crate::wallet::OnchainSendAmount;
 
@@ -47,15 +48,30 @@ pub struct OnchainPayment {
 	channel_manager: Arc<ChannelManager>,
 	config: Arc<Config>,
 	is_running: Arc<RwLock<bool>>,
+	runtime: Arc<Runtime>,
 	logger: Arc<Logger>,
 }
 
 impl OnchainPayment {
 	pub(crate) fn new(
 		wallet: Arc<Wallet>, channel_manager: Arc<ChannelManager>, config: Arc<Config>,
-		is_running: Arc<RwLock<bool>>, logger: Arc<Logger>,
+		is_running: Arc<RwLock<bool>>, runtime: Arc<Runtime>, logger: Arc<Logger>,
 	) -> Self {
-		Self { wallet, channel_manager, config, is_running, logger }
+		Self { wallet, channel_manager, config, is_running, runtime, logger }
+	}
+
+	pub(crate) async fn send_to_address_inner(
+		&self, address: &bitcoin::Address, amount_sats: u64, fee_rate: Option<bitcoin::FeeRate>,
+	) -> Result<Txid, Error> {
+		if !*self.is_running.read().expect("lock") {
+			return Err(Error::NotRunning);
+		}
+
+		let cur_anchor_reserve_sats =
+			crate::total_anchor_channels_reserve_sats(&self.channel_manager, &self.config);
+		let send_amount =
+			OnchainSendAmount::ExactRetainingReserve { amount_sats, cur_anchor_reserve_sats };
+		self.wallet.send_to_address(address, send_amount, fee_rate).await
 	}
 }
 
@@ -63,7 +79,7 @@ impl OnchainPayment {
 impl OnchainPayment {
 	/// Retrieve a new on-chain/funding address.
 	pub fn new_address(&self) -> Result<Address, Error> {
-		let funding_address = self.wallet.get_new_address()?;
+		let funding_address = self.runtime.block_on(self.wallet.get_new_address())?;
 		log_info!(self.logger, "Generated new funding address: {}", funding_address);
 		Ok(funding_address)
 	}
@@ -80,16 +96,8 @@ impl OnchainPayment {
 	pub fn send_to_address(
 		&self, address: &bitcoin::Address, amount_sats: u64, fee_rate: Option<FeeRate>,
 	) -> Result<Txid, Error> {
-		if !*self.is_running.read().expect("lock") {
-			return Err(Error::NotRunning);
-		}
-
-		let cur_anchor_reserve_sats =
-			crate::total_anchor_channels_reserve_sats(&self.channel_manager, &self.config);
-		let send_amount =
-			OnchainSendAmount::ExactRetainingReserve { amount_sats, cur_anchor_reserve_sats };
 		let fee_rate_opt = maybe_map_fee_rate_opt!(fee_rate);
-		self.wallet.send_to_address(address, send_amount, fee_rate_opt)
+		self.runtime.block_on(self.send_to_address_inner(address, amount_sats, fee_rate_opt))
 	}
 
 	/// Send an on-chain payment to the given address, draining the available funds.
@@ -123,7 +131,7 @@ impl OnchainPayment {
 		};
 
 		let fee_rate_opt = maybe_map_fee_rate_opt!(fee_rate);
-		self.wallet.send_to_address(address, send_amount, fee_rate_opt)
+		self.runtime.block_on(self.wallet.send_to_address(address, send_amount, fee_rate_opt))
 	}
 
 	/// Attempt to bump the fee of an unconfirmed transaction using Replace-by-Fee (RBF).
@@ -134,11 +142,22 @@ impl OnchainPayment {
 	/// The new transaction will have the same outputs as the original but with a
 	/// higher fee, resulting in faster confirmation potential.
 	///
+	/// This will respect any on-chain reserve we need to keep, i.e., won't allow to cut into
+	/// [`BalanceDetails::total_anchor_channels_reserve_sats`].
+	///
 	/// Returns the [`Txid`] of the new replacement transaction if successful.
+	///
+	/// [`BalanceDetails::total_anchor_channels_reserve_sats`]: crate::BalanceDetails::total_anchor_channels_reserve_sats
 	pub fn bump_fee_rbf(
 		&self, payment_id: PaymentId, fee_rate: Option<FeeRate>,
 	) -> Result<Txid, Error> {
+		let cur_anchor_reserve_sats =
+			crate::total_anchor_channels_reserve_sats(&self.channel_manager, &self.config);
 		let fee_rate_opt = maybe_map_fee_rate_opt!(fee_rate);
-		self.wallet.bump_fee_rbf(payment_id, fee_rate_opt)
+		self.runtime.block_on(self.wallet.bump_fee_rbf(
+			payment_id,
+			fee_rate_opt,
+			cur_anchor_reserve_sats,
+		))
 	}
 }

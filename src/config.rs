@@ -26,8 +26,14 @@ use crate::logger::LogLevel;
 const DEFAULT_NETWORK: Network = Network::Bitcoin;
 const DEFAULT_BDK_WALLET_SYNC_INTERVAL_SECS: u64 = 80;
 const DEFAULT_LDK_WALLET_SYNC_INTERVAL_SECS: u64 = 30;
-const DEFAULT_FEE_RATE_CACHE_UPDATE_INTERVAL_SECS: u64 = 60 * 10;
+pub(crate) const DEFAULT_FEE_RATE_CACHE_UPDATE_INTERVAL_SECS: u64 = 60 * 10;
 const DEFAULT_PROBING_LIQUIDITY_LIMIT_MULTIPLIER: u64 = 3;
+pub(crate) const DEFAULT_PROBING_INTERVAL_SECS: u64 = 10;
+pub(crate) const MIN_PROBING_INTERVAL: Duration = Duration::from_millis(100);
+pub(crate) const DEFAULT_PROBED_NODE_COOLDOWN_SECS: u64 = 60 * 60; // 1 hour
+pub(crate) const DEFAULT_MAX_PROBE_LOCKED_MSAT: u64 = 100_000_000; // 100k sats
+pub(crate) const DEFAULT_MIN_PROBE_AMOUNT_MSAT: u64 = 1_000_000; // 1k sats
+pub(crate) const DEFAULT_MAX_PROBE_AMOUNT_MSAT: u64 = 10_000_000; // 10k sats
 const DEFAULT_ANCHOR_PER_CHANNEL_RESERVE_SATS: u64 = 25_000;
 
 // The default timeout after which we abort a wallet syncing operation.
@@ -54,12 +60,24 @@ pub const DEFAULT_LOG_FILENAME: &'static str = "ldk_node.log";
 /// The default storage directory.
 pub const DEFAULT_STORAGE_DIR_PATH: &str = "/tmp/ldk_node";
 
-// The default Esplora server we're using.
+// The default Esplora server we're using. It supports `submitpackage`, check using POST on the
+// `/txs/package` endpoint.
 pub(crate) const DEFAULT_ESPLORA_SERVER_URL: &str = "https://blockstream.info/api";
 
-// The 'stop gap' parameter used by BDK's wallet sync. This seems to configure the threshold
-// number of derivation indexes after which BDK stops looking for new scripts belonging to the wallet.
-pub(crate) const BDK_CLIENT_STOP_GAP: usize = 20;
+/// The default stop gap used for BDK full scans of the on-chain wallet.
+///
+/// The current default is 20.
+pub const DEFAULT_FULL_SCAN_STOP_GAP: u32 = 20;
+
+/// The minimum allowed stop gap used for BDK full scans of the on-chain wallet.
+///
+/// Values below 1 are clamped to 1 when a full scan runs.
+pub const MIN_FULL_SCAN_STOP_GAP: u32 = 1;
+
+/// The maximum allowed stop gap used for BDK full scans of the on-chain wallet.
+///
+/// Values above 1000 are clamped to 1000 when a full scan runs.
+pub const MAX_FULL_SCAN_STOP_GAP: u32 = 1000;
 
 // The number of concurrent requests made against the API provider.
 pub(crate) const BDK_CLIENT_CONCURRENCY: usize = 4;
@@ -126,7 +144,7 @@ pub(crate) const LNURL_AUTH_TIMEOUT_SECS: u64 = 15;
 /// | `node_alias`                           | None                                 |
 /// | `trusted_peers_0conf`                  | []                                   |
 /// | `probing_liquidity_limit_multiplier`   | 3                                    |
-/// | `anchor_channels_config`               | Some(..)                             |
+/// | `anchor_channels_config`               | AnchorChannelsConfig::default()      |
 /// | `route_parameters`                     | None                                 |
 /// | `tor_config`                           | None                                 |
 /// | `hrn_config`                           | HumanReadableNamesConfig::default()  |
@@ -170,22 +188,11 @@ pub struct Config {
 	/// used to send pre-flight probes.
 	pub probing_liquidity_limit_multiplier: u64,
 	/// Configuration options pertaining to Anchor channels, i.e., channels for which the
-	/// `option_anchors_zero_fee_htlc_tx` channel type is negotiated.
+	/// `option_zero_fee_commitments` or `option_anchors_zero_fee_htlc_tx` channel type is
+	/// negotiated.
 	///
 	/// Please refer to [`AnchorChannelsConfig`] for further information on Anchor channels.
-	///
-	/// If set to `Some`, we'll try to open new channels with Anchors enabled, i.e., new channels
-	/// will be negotiated with the `option_anchors_zero_fee_htlc_tx` channel type if supported by
-	/// the counterparty. Note that this won't prevent us from opening non-Anchor channels if the
-	/// counterparty doesn't support `option_anchors_zero_fee_htlc_tx`. If set to `None`, new
-	/// channels will be negotiated with the legacy `option_static_remotekey` channel type only.
-	///
-	/// **Note:** If set to `None` *after* some Anchor channels have already been
-	/// opened, no dedicated emergency on-chain reserve will be maintained for these channels,
-	/// which can be dangerous if only insufficient funds are available at the time of channel
-	/// closure. We *will* however still try to get the Anchor spending transactions confirmed
-	/// on-chain with the funds available.
-	pub anchor_channels_config: Option<AnchorChannelsConfig>,
+	pub anchor_channels_config: AnchorChannelsConfig,
 	/// Configuration options for payment routing and pathfinding.
 	///
 	/// Setting the [`RouteParametersConfig`] provides flexibility to customize how payments are routed,
@@ -216,7 +223,7 @@ impl Default for Config {
 			announcement_addresses: None,
 			trusted_peers_0conf: Vec::new(),
 			probing_liquidity_limit_multiplier: DEFAULT_PROBING_LIQUIDITY_LIMIT_MULTIPLIER,
-			anchor_channels_config: Some(AnchorChannelsConfig::default()),
+			anchor_channels_config: AnchorChannelsConfig::default(),
 			tor_config: None,
 			route_parameters: None,
 			node_alias: None,
@@ -281,7 +288,7 @@ impl Default for HumanReadableNamesConfig {
 }
 
 /// Configuration options pertaining to 'Anchor' channels, i.e., channels for which the
-/// `option_anchors_zero_fee_htlc_tx` channel type is negotiated.
+/// `option_zero_fee_commitments` or `option_anchors_zero_fee_htlc_tx` channel type is negotiated.
 ///
 /// Prior to the introduction of Anchor channels, the on-chain fees paying for the transactions
 /// issued on channel closure were pre-determined and locked-in at the time of the channel
@@ -300,10 +307,11 @@ impl Default for HumanReadableNamesConfig {
 ///
 /// ### Defaults
 ///
-/// | Parameter                  | Value  |
-/// |----------------------------|--------|
-/// | `trusted_peers_no_reserve` | []     |
-/// | `per_channel_reserve_sats` | 25000  |
+/// | Parameter                     | Value  |
+/// |-------------------------------|--------|
+/// | `trusted_peers_no_reserve`    | []     |
+/// | `per_channel_reserve_sats`    | 25000  |
+/// | `enable_zero_fee_commitments` | false  |
 ///
 ///
 /// [BOLT 3]: https://github.com/lightning/bolts/blob/master/03-transactions.md#htlc-timeout-and-htlc-success-transactions
@@ -339,6 +347,21 @@ pub struct AnchorChannelsConfig {
 	/// might not suffice to successfully spend the Anchor output and have the HTLC transactions
 	/// confirmed on-chain, i.e., you may want to adjust this value accordingly.
 	pub per_channel_reserve_sats: u64,
+	/// If set, we will first attempt to negotiate `option_zero_fee_commitments` before falling
+	/// back to `option_anchors_zero_fee_htlc_tx` and `option_static_remotekey`, as supported by
+	/// the peer. Zero-fee commitment channels remove all commitment feerate negotiation from
+	/// the channel, which eliminates a very common source of channel force-closures. These
+	/// channels instead source *all* the fees required to confirm the commitment from the
+	/// anchor reserve of the channel closer at the time of force-close. If set, your chain
+	/// source *must* support the `submitpackage` Bitcoin Core RPC, and relay [TRUC], [P2A],
+	/// and [Ephemeral Dust].
+	/// See [BOLT 3] for more technical details.
+	///
+	/// [TRUC]: https://github.com/bitcoin/bips/blob/master/bip-0431.mediawiki
+	/// [P2A]: https://github.com/bitcoin/bips/blob/master/bip-0433.mediawiki
+	/// [Ephemeral Dust]: https://bitcoincore.org/en/releases/29.0
+	/// [BOLT 3]: https://github.com/lightning/bolts/blob/master/03-transactions.md#shared_anchor-output-zero_fee_commitments
+	pub enable_zero_fee_commitments: bool,
 }
 
 impl Default for AnchorChannelsConfig {
@@ -346,6 +369,7 @@ impl Default for AnchorChannelsConfig {
 		Self {
 			trusted_peers_no_reserve: Vec::new(),
 			per_channel_reserve_sats: DEFAULT_ANCHOR_PER_CHANNEL_RESERVE_SATS,
+			enable_zero_fee_commitments: false,
 		}
 	}
 }
@@ -401,12 +425,37 @@ pub(crate) fn default_user_config(config: &Config) -> UserConfig {
 	// will mostly be relevant for inbound channels.
 	let mut user_config = UserConfig::default();
 	user_config.channel_handshake_limits.force_announced_channel_preference = false;
-	user_config.channel_handshake_config.negotiate_anchors_zero_fee_htlc_tx =
-		config.anchor_channels_config.is_some();
+	user_config.channel_handshake_config.negotiate_anchor_zero_fee_commitments =
+		config.anchor_channels_config.enable_zero_fee_commitments;
 	user_config.reject_inbound_splices = false;
+	// Allow full-capacity HTLCs. LDK's max-inbound-HTLC-in-flight percentages default well below
+	// 100%, which fails any forward larger than that fraction of the channel with
+	// `temporary_channel_failure`. Onboarding sweep needs to push ~70% of a single-channel
+	// capacity through its LSP in one HTLC, so we raise the cap to 100% for every channel this
+	// node negotiates (both as opener and as accepting peer).
+	user_config
+		.channel_handshake_config
+		.announced_channel_max_inbound_htlc_value_in_flight_percentage = 100;
+	user_config
+		.channel_handshake_config
+		.unannounced_channel_max_inbound_htlc_value_in_flight_percentage = 100;
+	// Permit forwarding HTLCs over private channels regardless of whether
+	// this node has a publicly-announceable identity. Onboarding's HODL-peer
+	// flow relies on a private last hop (Alice→Bob inbound channel kept
+	// private so the buyer's invoice carries a route hint). Without this,
+	// ChannelManager's `can_forward_htlc_to_outgoing_channel` short-circuits
+	// with `unknown_next_peer (0x400a)` whenever an HTLC is targeted at a
+	// private channel — this is by design in upstream LDK to hide
+	// private-channel existence from forwarders, but it breaks any
+	// leaf-LSP topology that relies on private channels as forwardable
+	// hops. The two settings (forwarding-over-private-channels vs
+	// announcing-our-own-channels) are conceptually independent, so we
+	// leave this enabled even when `may_announce_channel` reports the
+	// node is missing alias/addresses; only the gossip-related toggles
+	// are gated on announceability.
+	user_config.accept_forwards_to_priv_channels = true;
 
 	if may_announce_channel(config).is_err() {
-		user_config.accept_forwards_to_priv_channels = false;
 		user_config.channel_handshake_config.announce_for_forwarding = false;
 		user_config.channel_handshake_limits.force_announced_channel_preference = true;
 	}
@@ -506,6 +555,28 @@ pub struct EsploraSyncConfig {
 	pub background_sync_config: Option<BackgroundSyncConfig>,
 	/// Sync timeouts configuration.
 	pub timeouts_config: SyncTimeoutsConfig,
+	/// The stop gap used for BDK full scans of the on-chain wallet.
+	///
+	/// A full scan for each keychain stops after this many consecutive script pubkeys
+	/// with no associated transactions. This value is only used for BDK `full_scan`
+	/// calls, which ldk-node performs on the first on-chain wallet sync or when
+	/// [`Self::force_wallet_full_scan`] is set. Incremental BDK `sync` calls do not use it.
+	///
+	/// **Default:** 20 ([`DEFAULT_FULL_SCAN_STOP_GAP`])
+	///
+	/// **Allowed values:** 1 ([`MIN_FULL_SCAN_STOP_GAP`]) to 1000
+	/// ([`MAX_FULL_SCAN_STOP_GAP`]), inclusive. Values outside this range will be clamped to the
+	/// nearest bound and a warning will be logged when the full scan runs.
+	///
+	/// **Note:** Large values can cause many Esplora requests, hit server rate limits,
+	/// take a long time to complete, or cause syncs to fail with
+	/// [`SyncTimeoutsConfig::onchain_wallet_sync_timeout_secs`].
+	pub full_scan_stop_gap: u32,
+	/// Whether to force BDK full scans until one succeeds.
+	///
+	/// This can be useful when restoring a wallet from seed on a node that has already synced
+	/// before, but may be missing funds sent to previously-unknown addresses.
+	pub force_wallet_full_scan: bool,
 }
 
 impl Default for EsploraSyncConfig {
@@ -513,6 +584,8 @@ impl Default for EsploraSyncConfig {
 		Self {
 			background_sync_config: Some(BackgroundSyncConfig::default()),
 			timeouts_config: SyncTimeoutsConfig::default(),
+			full_scan_stop_gap: DEFAULT_FULL_SCAN_STOP_GAP,
+			force_wallet_full_scan: false,
 		}
 	}
 }
@@ -533,6 +606,28 @@ pub struct ElectrumSyncConfig {
 	pub background_sync_config: Option<BackgroundSyncConfig>,
 	/// Sync timeouts configuration.
 	pub timeouts_config: SyncTimeoutsConfig,
+	/// The stop gap used for BDK full scans of the on-chain wallet.
+	///
+	/// A full scan for each keychain stops after this many consecutive script pubkeys
+	/// with no associated transactions. This value is only used for BDK `full_scan`
+	/// calls, which ldk-node performs on the first on-chain wallet sync or when
+	/// [`Self::force_wallet_full_scan`] is set. Incremental BDK `sync` calls do not use it.
+	///
+	/// **Default:** 20 ([`DEFAULT_FULL_SCAN_STOP_GAP`])
+	///
+	/// **Allowed values:** 1 ([`MIN_FULL_SCAN_STOP_GAP`]) to 1000
+	/// ([`MAX_FULL_SCAN_STOP_GAP`]), inclusive. Values outside this range will be clamped to the
+	/// nearest bound and a warning will be logged when the full scan runs.
+	///
+	/// **Note:** Large values can cause many Electrum requests, hit server rate limits,
+	/// take a long time to complete, or cause syncs to fail with
+	/// [`SyncTimeoutsConfig::onchain_wallet_sync_timeout_secs`].
+	pub full_scan_stop_gap: u32,
+	/// Whether to force BDK full scans until one succeeds.
+	///
+	/// This can be useful when restoring a wallet from seed on a node that has already synced
+	/// before, but may be missing funds sent to previously-unknown addresses.
+	pub force_wallet_full_scan: bool,
 }
 
 impl Default for ElectrumSyncConfig {
@@ -540,8 +635,14 @@ impl Default for ElectrumSyncConfig {
 		Self {
 			background_sync_config: Some(BackgroundSyncConfig::default()),
 			timeouts_config: SyncTimeoutsConfig::default(),
+			full_scan_stop_gap: DEFAULT_FULL_SCAN_STOP_GAP,
+			force_wallet_full_scan: false,
 		}
 	}
+}
+
+pub(crate) fn clamp_full_scan_stop_gap(full_scan_stop_gap: u32) -> u32 {
+	full_scan_stop_gap.clamp(MIN_FULL_SCAN_STOP_GAP, MAX_FULL_SCAN_STOP_GAP)
 }
 
 /// Configuration for syncing with Bitcoin Core backend via REST.
@@ -699,7 +800,11 @@ pub enum AsyncPaymentsRole {
 mod tests {
 	use std::str::FromStr;
 
-	use super::{may_announce_channel, AnnounceError, Config, NodeAlias, SocketAddress};
+	use super::{
+		clamp_full_scan_stop_gap, may_announce_channel, AnnounceError, Config, ElectrumSyncConfig,
+		EsploraSyncConfig, NodeAlias, SocketAddress, DEFAULT_FULL_SCAN_STOP_GAP,
+		MAX_FULL_SCAN_STOP_GAP, MIN_FULL_SCAN_STOP_GAP,
+	};
 
 	#[test]
 	fn node_announce_channel() {
@@ -745,5 +850,23 @@ mod tests {
 			addresses.push(socket_address);
 		}
 		assert!(may_announce_channel(&node_config).is_ok());
+	}
+
+	#[test]
+	fn full_scan_stop_gap_defaults() {
+		assert_eq!(EsploraSyncConfig::default().full_scan_stop_gap, DEFAULT_FULL_SCAN_STOP_GAP);
+		assert_eq!(ElectrumSyncConfig::default().full_scan_stop_gap, DEFAULT_FULL_SCAN_STOP_GAP);
+	}
+
+	#[test]
+	fn full_scan_stop_gap_is_clamped_to_valid_range() {
+		assert_eq!(clamp_full_scan_stop_gap(MIN_FULL_SCAN_STOP_GAP), MIN_FULL_SCAN_STOP_GAP);
+		assert_eq!(
+			clamp_full_scan_stop_gap(DEFAULT_FULL_SCAN_STOP_GAP),
+			DEFAULT_FULL_SCAN_STOP_GAP
+		);
+		assert_eq!(clamp_full_scan_stop_gap(MAX_FULL_SCAN_STOP_GAP), MAX_FULL_SCAN_STOP_GAP);
+		assert_eq!(clamp_full_scan_stop_gap(0), MIN_FULL_SCAN_STOP_GAP);
+		assert_eq!(clamp_full_scan_stop_gap(MAX_FULL_SCAN_STOP_GAP + 1), MAX_FULL_SCAN_STOP_GAP);
 	}
 }

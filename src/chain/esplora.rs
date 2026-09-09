@@ -6,24 +6,30 @@
 // accordance with one or both of these licenses.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bdk_esplora::EsploraAsyncExt;
-use bitcoin::{FeeRate, Network, Script, Transaction, Txid};
+use bitcoin::transaction::Version;
+use bitcoin::{FeeRate, Network, Script, Txid};
 use esplora_client::AsyncClient as EsploraAsyncClient;
 use lightning::chain::{Confirm, Filter, WatchedOutput};
 use lightning::util::ser::Writeable;
 use lightning_transaction_sync::EsploraSyncClient;
 
 use super::WalletSyncStatus;
-use crate::config::{Config, EsploraSyncConfig, BDK_CLIENT_CONCURRENCY, BDK_CLIENT_STOP_GAP};
+use crate::config::{
+	clamp_full_scan_stop_gap, Config, EsploraSyncConfig, BDK_CLIENT_CONCURRENCY,
+	MAX_FULL_SCAN_STOP_GAP, MIN_FULL_SCAN_STOP_GAP,
+};
 use crate::fee_estimator::{
 	apply_post_estimation_adjustments, get_all_conf_targets, get_num_block_defaults_for_target,
 	OnchainFeeEstimator,
 };
 use crate::io::utils::update_and_persist_node_metrics;
-use crate::logger::{log_bytes, log_debug, log_error, log_trace, LdkLogger, Logger};
+use crate::logger::{log_bytes, log_debug, log_error, log_trace, log_warn, LdkLogger, Logger};
+use crate::tx_broadcaster::SortedTransactions;
 use crate::types::{ChainMonitor, ChannelManager, DynStore, Sweeper, Wallet};
 use crate::{Error, PersistedNodeMetrics};
 
@@ -38,6 +44,7 @@ pub(super) struct EsploraChainSource {
 	config: Arc<Config>,
 	logger: Arc<Logger>,
 	node_metrics: Arc<PersistedNodeMetrics>,
+	force_wallet_full_scan: AtomicBool,
 }
 
 impl EsploraChainSource {
@@ -62,6 +69,7 @@ impl EsploraChainSource {
 
 		let onchain_wallet_sync_status = Mutex::new(WalletSyncStatus::Completed);
 		let lightning_wallet_sync_status = Mutex::new(WalletSyncStatus::Completed);
+		let force_wallet_full_scan = AtomicBool::new(sync_config.force_wallet_full_scan);
 		Ok(Self {
 			sync_config,
 			esplora_client,
@@ -73,7 +81,105 @@ impl EsploraChainSource {
 			config,
 			logger,
 			node_metrics,
+			force_wallet_full_scan,
 		})
+	}
+
+	/// Returns the shared on-chain fee estimator backing this chain source
+	/// (Peerswap native primitive B6).
+	#[cfg(feature = "swaps")]
+	pub(super) fn fee_estimator(&self) -> &Arc<OnchainFeeEstimator> {
+		&self.fee_estimator
+	}
+
+	/// Reorg-aware confirmation/eviction query for an ARBITRARY `txid` against
+	/// this Esplora backend (Peerswap native primitive B5). See
+	/// [`super::ChainSource::swap_query_tx`] for the fail-closed contract.
+	#[cfg(feature = "swaps")]
+	pub(super) async fn swap_query_tx(&self, txid: Txid) -> super::RawTxObservation {
+		let status = match self.esplora_client.get_tx_status(&txid).await {
+			Ok(status) => status,
+			Err(esplora_client::Error::HttpResponse { status: 404, .. }) => {
+				// Definitive "not in the chain or mempool" answer.
+				return super::RawTxObservation::NotFound;
+			},
+			Err(e) => {
+				log_error!(
+					self.logger,
+					"swap_query_tx: Esplora status query failed for {}: {}",
+					txid,
+					e
+				);
+				return super::RawTxObservation::Unreachable;
+			},
+		};
+		if !status.confirmed {
+			return super::RawTxObservation::InMempool;
+		}
+		let height = match status.block_height {
+			Some(height) => height,
+			None => {
+				log_error!(
+					self.logger,
+					"swap_query_tx: Esplora reported a confirmed tx {} without a block height",
+					txid
+				);
+				return super::RawTxObservation::Unreachable;
+			},
+		};
+		// B5 LOW-2: the confirming-block height and the tip come from two
+		// separate Esplora calls; a block/reorg in the gap can make them
+		// inconsistent. Detect the one observable inconsistency — a tip BELOW
+		// the tx's confirming block (impossible on a single consistent chain)
+		// — and FAIL CLOSED (treat as unverifiable) rather than reporting a
+		// bogus `1`-confirmation from the saturating arithmetic. The benign
+		// gap (tip one block ahead of the status snapshot) only over-counts
+		// confirmations by ≤1, which errs on the safe/late side for deadlines.
+		match self.esplora_client.get_height().await {
+			Ok(tip_height) if tip_height >= height => {
+				let confirmations = tip_height.saturating_sub(height).saturating_add(1);
+				super::RawTxObservation::Confirmed { height: Some(height), confirmations }
+			},
+			Ok(tip_height) => {
+				log_error!(
+					self.logger,
+					"swap_query_tx: Esplora tip {} below confirming-block height {} for {} (reorg/race); failing closed",
+					tip_height,
+					height,
+					txid
+				);
+				super::RawTxObservation::Unreachable
+			},
+			Err(e) => {
+				log_error!(self.logger, "swap_query_tx: Esplora tip query failed: {}", e);
+				super::RawTxObservation::Unreachable
+			},
+		}
+	}
+
+	pub(super) async fn validate_zero_fee_commitments_support(&self) -> Result<(), Error> {
+		// This could still accept an Esplora server running against Bitcoin Core v26
+		// through v28, which does not relay ephemeral dust.
+		self.esplora_client.submit_package(&super::dummy_package(), None, None).await.map_err(
+			|e| {
+				if let esplora_client::Error::HttpResponse { status: 404, message } = e {
+					log_error!(
+						self.logger,
+						"Esplora server does not support submitpackage: {}",
+						message
+					);
+					Error::ChainSourceNotSupported
+				} else {
+					log_error!(
+						self.logger,
+						"Failed to check support for submitpackage on the Esplora server: {}",
+						e
+					);
+					Error::ConnectionFailed
+				}
+			},
+		)?;
+		Ok(())
 	}
 
 	pub(super) async fn sync_onchain_wallet(
@@ -101,16 +207,18 @@ impl EsploraChainSource {
 
 	async fn sync_onchain_wallet_inner(&self, onchain_wallet: Arc<Wallet>) -> Result<(), Error> {
 		// If this is our first sync, do a full scan with the configured gap limit.
-		// Otherwise just do an incremental sync.
-		let incremental_sync =
+		// Otherwise just do an incremental sync, unless a forced full scan is still pending.
+		let has_prior_sync =
 			self.node_metrics.read().expect("lock").latest_onchain_wallet_sync_timestamp.is_some();
+		let forced_full_scan = self.force_wallet_full_scan.load(Ordering::Acquire);
+		let incremental_sync = has_prior_sync && !forced_full_scan;
 
 		macro_rules! get_and_apply_wallet_update {
 			($sync_future: expr) => {{
 				let now = Instant::now();
 				match $sync_future.await {
 					Ok(res) => match res {
-						Ok(update) => match onchain_wallet.apply_update(update) {
+						Ok(update) => match onchain_wallet.apply_update(update).await {
 							Ok(()) => {
 								log_debug!(
 									self.logger,
@@ -177,7 +285,7 @@ impl EsploraChainSource {
 			}}
 		}
 
-		if incremental_sync {
+		let res = if incremental_sync {
 			let sync_request = onchain_wallet.get_incremental_sync_request();
 			let wallet_sync_timeout_fut = tokio::time::timeout(
 				Duration::from_secs(
@@ -188,18 +296,39 @@ impl EsploraChainSource {
 			get_and_apply_wallet_update!(wallet_sync_timeout_fut)
 		} else {
 			let full_scan_request = onchain_wallet.get_full_scan_request();
+			let full_scan_stop_gap = self.bounded_full_scan_stop_gap();
 			let wallet_sync_timeout_fut = tokio::time::timeout(
 				Duration::from_secs(
 					self.sync_config.timeouts_config.onchain_wallet_sync_timeout_secs,
 				),
 				self.esplora_client.full_scan(
 					full_scan_request,
-					BDK_CLIENT_STOP_GAP,
+					full_scan_stop_gap,
 					BDK_CLIENT_CONCURRENCY,
 				),
 			);
 			get_and_apply_wallet_update!(wallet_sync_timeout_fut)
+		};
+		if forced_full_scan && res.is_ok() {
+			self.force_wallet_full_scan.store(false, Ordering::Release);
 		}
+		res
+	}
+
+	fn bounded_full_scan_stop_gap(&self) -> usize {
+		let configured = self.sync_config.full_scan_stop_gap;
+		let bounded = clamp_full_scan_stop_gap(configured);
+		if bounded != configured {
+			log_warn!(
+				self.logger,
+				"Configured Esplora on-chain wallet full-scan stop gap {} is outside the allowed range {}..={}; using {}.",
+				configured,
+				MIN_FULL_SCAN_STOP_GAP,
+				MAX_FULL_SCAN_STOP_GAP,
+				bounded
+			);
+		}
+		bounded as usize
 	}
 
 	pub(super) async fn sync_lightning_wallet(
@@ -355,74 +484,111 @@ impl EsploraChainSource {
 		Ok(())
 	}
 
-	pub(crate) async fn process_broadcast_package(&self, package: Vec<Transaction>) {
-		for tx in &package {
-			let txid = tx.compute_txid();
-			let timeout_fut = tokio::time::timeout(
-				Duration::from_secs(self.sync_config.timeouts_config.tx_broadcast_timeout_secs),
-				self.esplora_client.broadcast(tx),
-			);
-			match timeout_fut.await {
-				Ok(res) => match res {
-					Ok(()) => {
-						log_trace!(self.logger, "Successfully broadcast transaction {}", txid);
-					},
-					Err(e) => match e {
-						esplora_client::Error::HttpResponse { status, message } => {
-							if status == 400 {
-								// Log 400 at lesser level, as this often just means bitcoind already knows the
-								// transaction.
-								// FIXME: We can further differentiate here based on the error
-								// message which will be available with rust-esplora-client 0.7 and
-								// later.
-								log_trace!(
-									self.logger,
-									"Failed to broadcast due to HTTP connection error: {}",
-									message
-								);
-							} else {
-								log_error!(
-									self.logger,
-									"Failed to broadcast due to HTTP connection error: {} - {}",
-									status,
-									message
-								);
-							}
-							log_trace!(
-								self.logger,
-								"Failed broadcast transaction bytes: {}",
-								log_bytes!(tx.encode())
-							);
-						},
-						_ => {
-							log_error!(
-								self.logger,
-								"Failed to broadcast transaction {}: {}",
-								txid,
-								e
-							);
-							log_trace!(
-								self.logger,
-								"Failed broadcast transaction bytes: {}",
-								log_bytes!(tx.encode())
-							);
-						},
-					},
-				},
-				Err(e) => {
-					log_error!(
-						self.logger,
-						"Failed to broadcast transaction due to timeout {}: {}",
-						txid,
-						e
-					);
+	fn log_http_error(&self, e: esplora_client::Error, txids: &[Txid], txs: &SortedTransactions) {
+		match e {
+			esplora_client::Error::HttpResponse { status, message } => {
+				if status == 400 && txs.len() == 1 {
+					// Log 400 at lesser level, as this often just means bitcoind already knows the
+					// transaction.
+					// FIXME: We can further differentiate here based on the error
+					// message which will be available with rust-esplora-client 0.7 and
+					// later.
 					log_trace!(
 						self.logger,
-						"Failed broadcast transaction bytes: {}",
-						log_bytes!(tx.encode())
+						"Failed to broadcast due to HTTP connection error: {}",
+						message
 					);
-				},
-			}
+					log_trace!(self.logger, "Failed to broadcast transaction(s) {:?}", txids);
+				} else {
+					log_error!(
+						self.logger,
+						"Failed to broadcast due to HTTP connection error: {} - {}",
+						status,
+						message
+					);
+					log_error!(self.logger, "Failed to broadcast transaction(s) {:?}", txids);
+				}
+				log_trace!(self.logger, "Failed broadcast transaction(s) bytes:");
+				for tx in txs.iter() {
+					log_trace!(self.logger, "{}", log_bytes!(tx.encode()));
+				}
+			},
+			_ => {
+				log_error!(self.logger, "Failed to broadcast transaction(s) {:?}: {}", txids, e);
+				log_trace!(self.logger, "Failed broadcast transaction(s) bytes:");
+				for tx in txs.iter() {
+					log_trace!(self.logger, "{}", log_bytes!(tx.encode()));
+				}
+			},
+		}
+	}
+
+	fn log_broadcast_error(
+		&self, e: impl core::fmt::Display, txids: &[Txid], txs: &SortedTransactions,
+	) {
+		log_error!(self.logger, "Failed to broadcast transaction(s) {:?}: {}", txids, e);
+		log_trace!(self.logger, "Failed broadcast transaction bytes:");
+		for tx in txs.iter() {
+			log_trace!(self.logger, "{}", log_bytes!(tx.encode()));
+		}
+	}
+
+	pub(crate) async fn process_transaction_broadcast(&self, txs: SortedTransactions) {
+		let all_txs_are_v3 = txs.iter().all(|tx| tx.version == Version::non_standard(3));
+		match txs.len() {
+			2.. if all_txs_are_v3 => {
+				let txids: Vec<_> = txs.iter().map(|tx| tx.compute_txid()).collect();
+				let timeout_fut = tokio::time::timeout(
+					Duration::from_secs(self.sync_config.timeouts_config.tx_broadcast_timeout_secs),
+					self.esplora_client.submit_package(&txs, None, None),
+				);
+				match timeout_fut.await {
+					Ok(res) => match res {
+						Ok(result) => {
+							if result.package_msg.eq_ignore_ascii_case("success") {
+								log_trace!(
+									self.logger,
+									"Successfully broadcast transactions {:?}",
+									txids
+								);
+								log_trace!(
+									self.logger,
+									"Successfully broadcast transactions {:?}",
+									result
+								);
+							} else {
+								self.log_broadcast_error(format!("{:?}", result), &txids, &txs);
+							}
+						},
+						Err(e) => self.log_http_error(e, &txids, &txs),
+					},
+					Err(e) => self.log_broadcast_error(e, &txids, &txs),
+				}
+			},
+			_ => {
+				for tx in txs.iter() {
+					let txid = tx.compute_txid();
+					let timeout_fut = tokio::time::timeout(
+						Duration::from_secs(
+							self.sync_config.timeouts_config.tx_broadcast_timeout_secs,
+						),
+						self.esplora_client.broadcast(tx),
+					);
+					match timeout_fut.await {
+						Ok(res) => match res {
+							Ok(()) => {
+								log_trace!(
+									self.logger,
+									"Successfully broadcast transaction {}",
+									txid
+								);
+							},
+							Err(e) => self.log_http_error(e, &[txid], &txs),
+						},
+						Err(e) => self.log_broadcast_error(e, &[txid], &txs),
+					}
+				}
+			},
 		}
 	}
 }

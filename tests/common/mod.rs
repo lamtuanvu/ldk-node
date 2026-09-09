@@ -30,6 +30,7 @@ use std::time::Duration;
 use bitcoin::hashes::hex::FromHex;
 use bitcoin::hashes::sha256::Hash as Sha256;
 use bitcoin::hashes::Hash;
+use bitcoin::secp256k1::PublicKey;
 use bitcoin::{
 	Address, Amount, Network, OutPoint, ScriptBuf, Sequence, Transaction, Txid, Witness,
 };
@@ -42,7 +43,8 @@ use ldk_node::config::{
 };
 use ldk_node::entropy::{generate_entropy_mnemonic, NodeEntropy};
 use ldk_node::io::sqlite_store::SqliteStore;
-use ldk_node::payment::{PaymentDirection, PaymentKind, PaymentStatus};
+use ldk_node::payment::{PaymentDirection, PaymentKind, PaymentStatus, TransactionType};
+use ldk_node::probing::ProbingConfig;
 use ldk_node::{
 	Builder, ChannelShutdownState, CustomTlvRecord, Event, LightningBalance, Node, NodeError,
 	PendingSweepBalance, UserChannelId,
@@ -50,7 +52,7 @@ use ldk_node::{
 use lightning::io;
 use lightning::ln::msgs::SocketAddress;
 use lightning::routing::gossip::NodeAlias;
-use lightning::util::persist::KVStore;
+use lightning::util::persist::{KVStore, PageToken, PaginatedKVStore, PaginatedListResponse};
 use lightning_invoice::{Bolt11InvoiceDescription, Description};
 use lightning_persister::fs_store::v1::FilesystemStore;
 use lightning_types::payment::{PaymentHash, PaymentPreimage};
@@ -61,7 +63,7 @@ use serde_json::{json, Value};
 
 #[path = "../../src/io/in_memory_store.rs"]
 mod in_memory_store;
-use in_memory_store::InMemoryStore;
+pub(crate) use in_memory_store::InMemoryStore;
 
 /// Shared timeout (in seconds) for waiting on LDK events and external node operations.
 pub(crate) const INTEROP_TIMEOUT_SECS: u64 = 60;
@@ -312,6 +314,10 @@ pub(crate) fn setup_bitcoind_and_electrsd() -> (BitcoinD, ElectrsD) {
 	let mut bitcoind_conf = corepc_node::Conf::default();
 	bitcoind_conf.network = "regtest";
 	bitcoind_conf.args.push("-rest");
+	// Enable P2P and compact block filters so the CBF (BIP157) chain source can connect and sync.
+	bitcoind_conf.p2p = corepc_node::P2P::Yes;
+	bitcoind_conf.args.push("-blockfilterindex=1");
+	bitcoind_conf.args.push("-peerblockfilters=1");
 	let bitcoind = BitcoinD::with_conf(bitcoind_exe, &bitcoind_conf).unwrap();
 
 	let electrs_exe = env::var("ELECTRS_EXE")
@@ -328,7 +334,14 @@ pub(crate) fn setup_bitcoind_and_electrsd() -> (BitcoinD, ElectrsD) {
 pub(crate) fn random_chain_source<'a>(
 	bitcoind: &'a BitcoinD, electrsd: &'a ElectrsD,
 ) -> TestChainSource<'a> {
-	let r = rand::random_range(0..3);
+	let r = match std::env::var("LDK_TEST_CHAIN_SOURCE").ok().as_deref() {
+		Some("esplora") => 0,
+		Some("electrum") => 1,
+		Some("bitcoind-rpc") => 2,
+		Some("bitcoind-rest") => 3,
+		Some("cbf") => 4,
+		_ => rand::random_range(0..3),
+	};
 	match r {
 		0 => {
 			println!("Randomly setting up Esplora chain syncing...");
@@ -345,6 +358,10 @@ pub(crate) fn random_chain_source<'a>(
 		3 => {
 			println!("Randomly setting up Bitcoind REST chain syncing...");
 			TestChainSource::BitcoindRestSync(bitcoind)
+		},
+		4 => {
+			println!("Randomly setting up CBF compact block filter syncing...");
+			TestChainSource::Cbf(bitcoind)
 		},
 		_ => unreachable!(),
 	}
@@ -377,11 +394,12 @@ pub(crate) fn random_node_alias() -> Option<NodeAlias> {
 	Some(NodeAlias(bytes))
 }
 
-pub(crate) fn random_config(anchor_channels: bool) -> TestConfig {
+pub(crate) fn random_config() -> TestConfig {
 	let mut node_config = Config::default();
 
-	if !anchor_channels {
-		node_config.anchor_channels_config = None;
+	#[cfg(zero_fee_commitment_tests)]
+	{
+		node_config.anchor_channels_config.enable_zero_fee_commitments = true;
 	}
 
 	node_config.network = Network::Regtest;
@@ -403,9 +421,128 @@ pub(crate) fn random_config(anchor_channels: bool) -> TestConfig {
 }
 
 #[cfg(feature = "uniffi")]
-type TestNode = Arc<Node>;
+pub(crate) type TestNode = Arc<Node>;
 #[cfg(not(feature = "uniffi"))]
-type TestNode = Node;
+pub(crate) type TestNode = Node;
+
+fn has_onchain_tx_type<F: Fn(&TransactionType) -> bool>(node: &TestNode, predicate: F) -> bool {
+	node.list_payments().into_iter().any(|payment| {
+		matches!(
+			payment.kind,
+			PaymentKind::Onchain { tx_type: Some(ref tx_type), .. } if predicate(tx_type)
+		)
+	})
+}
+
+fn assert_any_node_has_onchain_tx_type<F: Fn(&TransactionType) -> bool + Copy>(
+	nodes: &[(&str, &TestNode)], tx_type_name: &str, predicate: F,
+) {
+	if nodes.iter().any(|(_, node)| has_onchain_tx_type(node, predicate)) {
+		return;
+	}
+
+	let observed: Vec<String> = nodes
+		.iter()
+		.flat_map(|(name, node)| {
+			node.list_payments().into_iter().filter_map(move |payment| match payment.kind {
+				PaymentKind::Onchain { tx_type, .. } => Some(format!("{}:{:?}", name, tx_type)),
+				_ => None,
+			})
+		})
+		.collect();
+	panic!("Expected on-chain payment with tx_type {}; observed {:?}", tx_type_name, observed);
+}
+
+fn assert_all_nodes_have_onchain_tx_type<F: Fn(&TransactionType) -> bool + Copy>(
+	nodes: &[(&str, &TestNode)], panic_msg: &str, tx_type_name: &str, predicate: F,
+) {
+	if nodes.iter().all(|(_, node)| has_onchain_tx_type(node, predicate)) {
+		return;
+	}
+
+	let observed: Vec<String> = nodes
+		.iter()
+		.flat_map(|(name, node)| {
+			node.list_payments().into_iter().filter_map(move |payment| match payment.kind {
+				PaymentKind::Onchain { tx_type, .. } => Some(format!("{}:{:?}", name, tx_type)),
+				_ => None,
+			})
+		})
+		.collect();
+	panic!(
+		"Expected {}nodes to have on-chain payment with tx_type {}; observed {:?}",
+		panic_msg, tx_type_name, observed
+	);
+}
+
+async fn settle_force_close_balance<E: ElectrumApi>(
+	node: &TestNode, counterparty_node_id: PublicKey, peer_node: &TestNode,
+	bitcoind: &BitcoindClient, electrsd: &E,
+) {
+	let balances = node.list_balances();
+	if balances.lightning_balances.len() == 1 {
+		match balances.lightning_balances[0] {
+			LightningBalance::ClaimableAwaitingConfirmations {
+				counterparty_node_id: actual_counterparty_node_id,
+				confirmation_height,
+				..
+			} => {
+				assert_eq!(actual_counterparty_node_id, counterparty_node_id);
+				let cur_height = node.status().current_best_block.height;
+				let blocks_to_go = confirmation_height - cur_height;
+				let new_height =
+					generate_blocks_and_wait(bitcoind, electrsd, blocks_to_go as usize).await;
+				wait_for_node_tip(node, new_height).await;
+				wait_for_node_tip(peer_node, new_height).await;
+				node.sync_wallets().unwrap();
+				peer_node.sync_wallets().unwrap();
+			},
+			_ => panic!("Unexpected balance state!"),
+		}
+	} else {
+		assert!(balances.lightning_balances.is_empty(), "Unexpected balance state: {:?}", balances);
+		assert_eq!(balances.pending_balances_from_channel_closures.len(), 1);
+	}
+
+	for _ in 0..6 {
+		if node.list_balances().lightning_balances.is_empty() {
+			break;
+		}
+		let new_height = generate_blocks_and_wait(bitcoind, electrsd, 1).await;
+		wait_for_node_tip(node, new_height).await;
+		wait_for_node_tip(peer_node, new_height).await;
+		node.sync_wallets().unwrap();
+		peer_node.sync_wallets().unwrap();
+	}
+
+	let balances = node.list_balances();
+	assert!(balances.lightning_balances.is_empty(), "Unexpected balance state: {:?}", balances);
+	assert_eq!(balances.pending_balances_from_channel_closures.len(), 1);
+	match balances.pending_balances_from_channel_closures[0] {
+		PendingSweepBalance::BroadcastAwaitingConfirmation { .. } => {
+			let new_height = generate_blocks_and_wait(bitcoind, electrsd, 1).await;
+			wait_for_node_tip(node, new_height).await;
+			wait_for_node_tip(peer_node, new_height).await;
+			node.sync_wallets().unwrap();
+			peer_node.sync_wallets().unwrap();
+
+			assert!(node.list_balances().lightning_balances.is_empty());
+			assert_eq!(node.list_balances().pending_balances_from_channel_closures.len(), 1);
+			match node.list_balances().pending_balances_from_channel_closures[0] {
+				PendingSweepBalance::AwaitingThresholdConfirmations { .. } => {},
+				_ => panic!("Unexpected balance state!"),
+			}
+		},
+		PendingSweepBalance::AwaitingThresholdConfirmations { .. } => {},
+		_ => panic!("Unexpected balance state!"),
+	}
+
+	let new_height = generate_blocks_and_wait(bitcoind, electrsd, 5).await;
+	wait_for_node_tip(node, new_height).await;
+	wait_for_node_tip(peer_node, new_height).await;
+	node.sync_wallets().unwrap();
+	peer_node.sync_wallets().unwrap();
+}
 
 #[derive(Clone)]
 pub(crate) enum TestChainSource<'a> {
@@ -413,6 +550,7 @@ pub(crate) enum TestChainSource<'a> {
 	Electrum(&'a ElectrsD),
 	BitcoindRpcSync(&'a BitcoinD),
 	BitcoindRestSync(&'a BitcoinD),
+	Cbf(&'a BitcoinD),
 }
 
 #[derive(Clone, Copy)]
@@ -435,7 +573,10 @@ pub(crate) struct TestConfig {
 	pub store_type: TestStoreType,
 	pub node_entropy: NodeEntropy,
 	pub async_payments_role: Option<AsyncPaymentsRole>,
-	pub recovery_mode: bool,
+	pub wallet_rescan_from_height: Option<u32>,
+	pub force_wallet_full_scan: bool,
+	pub full_scan_stop_gap: Option<u32>,
+	pub probing: Option<ProbingConfig>,
 }
 
 impl Default for TestConfig {
@@ -447,14 +588,19 @@ impl Default for TestConfig {
 		let mnemonic = generate_entropy_mnemonic(None);
 		let node_entropy = NodeEntropy::from_bip39_mnemonic(mnemonic, None);
 		let async_payments_role = None;
-		let recovery_mode = false;
+		let wallet_rescan_from_height = None;
+		let force_wallet_full_scan = false;
+		let full_scan_stop_gap = None;
 		TestConfig {
 			node_config,
 			log_writer,
 			store_type,
 			node_entropy,
 			async_payments_role,
-			recovery_mode,
+			wallet_rescan_from_height,
+			force_wallet_full_scan,
+			full_scan_stop_gap,
+			probing: None,
 		}
 	}
 }
@@ -474,24 +620,22 @@ pub(crate) use setup_builder;
 pub(crate) mod scenarios;
 
 pub(crate) fn setup_two_nodes(
-	chain_source: &TestChainSource, allow_0conf: bool, anchor_channels: bool,
-	anchors_trusted_no_reserve: bool,
+	chain_source: &TestChainSource, allow_0conf: bool, anchors_trusted_no_reserve: bool,
 ) -> (TestNode, TestNode) {
 	setup_two_nodes_with_store(
 		chain_source,
 		allow_0conf,
-		anchor_channels,
 		anchors_trusted_no_reserve,
 		TestStoreType::TestSyncStore,
 	)
 }
 
 pub(crate) fn setup_two_nodes_with_store(
-	chain_source: &TestChainSource, allow_0conf: bool, anchor_channels: bool,
-	anchors_trusted_no_reserve: bool, store_type: TestStoreType,
+	chain_source: &TestChainSource, allow_0conf: bool, anchors_trusted_no_reserve: bool,
+	store_type: TestStoreType,
 ) -> (TestNode, TestNode) {
 	println!("== Node A ==");
-	let mut config_a = random_config(anchor_channels);
+	let mut config_a = random_config();
 	config_a.store_type = store_type;
 
 	if cfg!(hrn_tests) {
@@ -502,7 +646,7 @@ pub(crate) fn setup_two_nodes_with_store(
 	let node_a = setup_node(chain_source, config_a);
 
 	println!("\n== Node B ==");
-	let mut config_b = random_config(anchor_channels);
+	let mut config_b = random_config();
 	config_b.store_type = store_type;
 
 	if cfg!(hrn_tests) {
@@ -517,14 +661,8 @@ pub(crate) fn setup_two_nodes_with_store(
 	if allow_0conf {
 		config_b.node_config.trusted_peers_0conf.push(node_a.node_id());
 	}
-	if anchor_channels && anchors_trusted_no_reserve {
-		config_b
-			.node_config
-			.anchor_channels_config
-			.as_mut()
-			.unwrap()
-			.trusted_peers_no_reserve
-			.push(node_a.node_id());
+	if anchors_trusted_no_reserve {
+		config_b.node_config.anchor_channels_config.trusted_peers_no_reserve.push(node_a.node_id());
 	}
 	let node_b = setup_node(chain_source, config_b);
 	(node_a, node_b)
@@ -537,12 +675,20 @@ pub(crate) fn setup_node(chain_source: &TestChainSource, config: TestConfig) -> 
 			let esplora_url = format!("http://{}", electrsd.esplora_url.as_ref().unwrap());
 			let mut sync_config = EsploraSyncConfig::default();
 			sync_config.background_sync_config = None;
+			sync_config.force_wallet_full_scan = config.force_wallet_full_scan;
+			if let Some(full_scan_stop_gap) = config.full_scan_stop_gap {
+				sync_config.full_scan_stop_gap = full_scan_stop_gap;
+			}
 			builder.set_chain_source_esplora(esplora_url.clone(), Some(sync_config));
 		},
 		TestChainSource::Electrum(electrsd) => {
 			let electrum_url = format!("tcp://{}", electrsd.electrum_url);
 			let mut sync_config = ElectrumSyncConfig::default();
 			sync_config.background_sync_config = None;
+			sync_config.force_wallet_full_scan = config.force_wallet_full_scan;
+			if let Some(full_scan_stop_gap) = config.full_scan_stop_gap {
+				sync_config.full_scan_stop_gap = full_scan_stop_gap;
+			}
 			builder.set_chain_source_electrum(electrum_url.clone(), Some(sync_config));
 		},
 		TestChainSource::BitcoindRpcSync(bitcoind) => {
@@ -551,7 +697,13 @@ pub(crate) fn setup_node(chain_source: &TestChainSource, config: TestConfig) -> 
 			let values = bitcoind.params.get_cookie_values().unwrap().unwrap();
 			let rpc_user = values.user;
 			let rpc_password = values.password;
-			builder.set_chain_source_bitcoind_rpc(rpc_host, rpc_port, rpc_user, rpc_password);
+			builder.set_chain_source_bitcoind_rpc(
+				rpc_host,
+				rpc_port,
+				rpc_user,
+				rpc_password,
+				config.wallet_rescan_from_height,
+			);
 		},
 		TestChainSource::BitcoindRestSync(bitcoind) => {
 			let rpc_host = bitcoind.params.rpc_socket.ip().to_string();
@@ -568,7 +720,13 @@ pub(crate) fn setup_node(chain_source: &TestChainSource, config: TestConfig) -> 
 				rpc_port,
 				rpc_user,
 				rpc_password,
+				config.wallet_rescan_from_height,
 			);
+		},
+		TestChainSource::Cbf(bitcoind) => {
+			let p2p_socket = bitcoind.params.p2p_socket.expect("P2P must be enabled for CBF");
+			let peer_addr = format!("{}", p2p_socket);
+			builder.set_chain_source_cbf(vec![peer_addr], None, config.wallet_rescan_from_height);
 		},
 	}
 
@@ -586,8 +744,8 @@ pub(crate) fn setup_node(chain_source: &TestChainSource, config: TestConfig) -> 
 
 	builder.set_async_payments_role(config.async_payments_role).unwrap();
 
-	if config.recovery_mode {
-		builder.set_wallet_recovery_mode();
+	if let Some(probing) = config.probing {
+		builder.set_probing_config(probing.into());
 	}
 
 	let node = match config.store_type {
@@ -601,10 +759,6 @@ pub(crate) fn setup_node(chain_source: &TestChainSource, config: TestConfig) -> 
 		},
 	};
 
-	if config.recovery_mode {
-		builder.set_wallet_recovery_mode();
-	}
-
 	node.start().unwrap();
 	assert!(node.status().is_running);
 	assert!(node.status().latest_fee_rate_cache_update_timestamp.is_some());
@@ -613,7 +767,7 @@ pub(crate) fn setup_node(chain_source: &TestChainSource, config: TestConfig) -> 
 
 pub(crate) async fn generate_blocks_and_wait<E: ElectrumApi>(
 	bitcoind: &BitcoindClient, electrs: &E, num: usize,
-) {
+) -> usize {
 	let _ = bitcoind.create_wallet("ldk_node_test");
 	let _ = bitcoind.load_wallet("ldk_node_test");
 	print!("Generating {} blocks...", num);
@@ -622,9 +776,11 @@ pub(crate) async fn generate_blocks_and_wait<E: ElectrumApi>(
 	let address = bitcoind.new_address().expect("failed to get new address");
 	// TODO: expect this Result once the WouldBlock issue is resolved upstream.
 	let _block_hashes_res = bitcoind.generate_to_address(num, &address);
-	wait_for_block(electrs, cur_height as usize + num).await;
+	let new_height = cur_height as usize + num;
+	wait_for_block(bitcoind, electrs, new_height).await;
 	print!(" Done!");
 	println!("\n");
+	return new_height;
 }
 
 pub(crate) fn invalidate_blocks(bitcoind: &BitcoindClient, num_blocks: usize) {
@@ -642,27 +798,25 @@ pub(crate) fn invalidate_blocks(bitcoind: &BitcoindClient, num_blocks: usize) {
 	assert!(new_cur_height + num_blocks == cur_height);
 }
 
-pub(crate) async fn wait_for_block<E: ElectrumApi>(electrs: &E, min_height: usize) {
-	let mut header = match electrs.block_headers_subscribe() {
-		Ok(header) => header,
-		Err(_) => {
-			// While subscribing should succeed the first time around, we ran into some cases where
-			// it didn't. Since we can't proceed without subscribing, we try again after a delay
-			// and panic if it still fails.
-			tokio::time::sleep(Duration::from_secs(3)).await;
-			electrs.block_headers_subscribe().expect("failed to subscribe to block headers")
-		},
-	};
-	loop {
-		if header.height >= min_height {
-			break;
+pub(crate) async fn wait_for_block<E: ElectrumApi>(
+	bitcoind: &BitcoindClient, electrs: &E, min_height: usize,
+) {
+	let expected_block_hash = exponential_backoff_poll(|| {
+		let bitcoind_height =
+			bitcoind.get_blockchain_info().expect("failed to get blockchain info").blocks as usize;
+		if bitcoind_height < min_height {
+			return None;
 		}
-		header = exponential_backoff_poll(|| {
-			electrs.ping().expect("failed to ping electrs");
-			electrs.block_headers_pop().expect("failed to pop block header")
-		})
-		.await;
-	}
+		bitcoind.get_block_hash(min_height as u64).ok()?.block_hash().ok()
+	})
+	.await;
+	// A height-only wait can return the old header during a same-height reorg. Require the
+	// replacement hash so callers cannot sync against the stale chain by mistake.
+	exponential_backoff_poll(|| {
+		let header = electrs.block_header(min_height).ok()?;
+		(header.block_hash() == expected_block_hash).then_some(())
+	})
+	.await;
 }
 
 pub(crate) async fn wait_for_tx<E: ElectrumApi>(electrs: &E, txid: Txid) {
@@ -681,16 +835,53 @@ pub(crate) async fn wait_for_outpoint_spend<E: ElectrumApi>(electrs: &E, outpoin
 	let tx = electrs.transaction_get(&outpoint.txid).unwrap();
 	let txout_script = tx.output.get(outpoint.vout as usize).unwrap().clone().script_pubkey;
 
-	let is_spent = !electrs.script_get_history(&txout_script).unwrap().is_empty();
-	if is_spent {
-		return;
-	}
-
+	// Script history already contains the funding transaction itself, so wait until the exact
+	// funding outpoint leaves the unspent set instead of treating any history as a spend.
 	exponential_backoff_poll(|| {
 		electrs.ping().unwrap();
 
-		let is_spent = !electrs.script_get_history(&txout_script).unwrap().is_empty();
+		let is_spent = !electrs.script_list_unspent(&txout_script).unwrap().iter().any(|output| {
+			output.tx_hash == outpoint.txid && output.tx_pos == outpoint.vout as usize
+		});
 		is_spent.then_some(())
+	})
+	.await;
+}
+
+/// Polls the channel from `source_node` to `counterparty_node` until it reports `is_usable`
+/// and can carry an HTLC of `min_amount_msat` from `source_node`'s side.
+///
+/// After `ChannelReady`, channel-monitor persistence can lag for tens of seconds on slow
+/// CI runners; during that window `send_probe`/`send_payment` reject with
+/// `ParameterError("...monitor update is in progress...")`. This helper gives tests a
+/// deterministic readiness gate instead of racing the monitor-update pipeline.
+pub(crate) async fn wait_for_channel_ready_to_send(
+	source_node: &TestNode, counterparty_node: &TestNode, min_amount_msat: u64,
+) {
+	let counterparty = counterparty_node.node_id();
+	let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+	while tokio::time::Instant::now() < deadline {
+		let ready = source_node.list_channels().iter().any(|c| {
+			c.counterparty.node_id == counterparty
+				&& c.is_usable
+				&& c.next_outbound_htlc_limit_msat >= min_amount_msat
+		});
+		if ready {
+			return;
+		}
+		tokio::time::sleep(Duration::from_millis(100)).await;
+	}
+	panic!(
+		"channel from {} to {} not ready to send {} msat within 180s",
+		source_node.node_id(),
+		counterparty,
+		min_amount_msat,
+	);
+}
+
+pub(crate) async fn wait_for_node_tip(node: &Node, height: usize) {
+	exponential_backoff_poll(|| {
+		(node.status().current_best_block.height as usize >= height).then_some(())
 	})
 	.await;
 }
@@ -820,12 +1011,18 @@ pub async fn open_channel(
 	node_a: &TestNode, node_b: &TestNode, funding_amount_sat: u64, should_announce: bool,
 	electrsd: &ElectrsD,
 ) -> OutPoint {
-	open_channel_push_amt(node_a, node_b, funding_amount_sat, None, should_announce, electrsd).await
+	let funding_txo =
+		open_channel_no_wait(node_a, node_b, funding_amount_sat, None, should_announce).await;
+	wait_for_tx(&electrsd.client, funding_txo.txid).await;
+	funding_txo
 }
 
-pub async fn open_channel_push_amt(
+/// Like [`open_channel`] but skips the `wait_for_tx` electrum check so that
+/// multiple channels can be opened back-to-back before any blocks are mined.
+/// The caller is responsible for mining blocks and confirming the funding txs.
+pub async fn open_channel_no_wait(
 	node_a: &TestNode, node_b: &TestNode, funding_amount_sat: u64, push_amount_msat: Option<u64>,
-	should_announce: bool, electrsd: &ElectrsD,
+	should_announce: bool,
 ) -> OutPoint {
 	if should_announce {
 		node_a
@@ -853,9 +1050,18 @@ pub async fn open_channel_push_amt(
 	let funding_txo_a = expect_channel_pending_event!(node_a, node_b.node_id());
 	let funding_txo_b = expect_channel_pending_event!(node_b, node_a.node_id());
 	assert_eq!(funding_txo_a, funding_txo_b);
-	wait_for_tx(&electrsd.client, funding_txo_a.txid).await;
-
 	funding_txo_a
+}
+
+pub async fn open_channel_push_amt(
+	node_a: &TestNode, node_b: &TestNode, funding_amount_sat: u64, push_amount_msat: Option<u64>,
+	should_announce: bool, electrsd: &ElectrsD,
+) -> OutPoint {
+	let funding_txo =
+		open_channel_no_wait(node_a, node_b, funding_amount_sat, push_amount_msat, should_announce)
+			.await;
+	wait_for_tx(&electrsd.client, funding_txo.txid).await;
+	funding_txo
 }
 
 pub async fn open_channel_with_all(
@@ -989,7 +1195,9 @@ pub(crate) async fn do_channel_full_cycle<E: ElectrumApi>(
 	wait_for_tx(electrsd, funding_txo_a.txid).await;
 
 	if !allow_0conf {
-		generate_blocks_and_wait(&bitcoind, electrsd, 6).await;
+		let new_height = generate_blocks_and_wait(&bitcoind, electrsd, 6).await;
+		wait_for_node_tip(&node_a, new_height).await;
+		wait_for_node_tip(&node_b, new_height).await;
 	}
 
 	node_a.sync_wallets().unwrap();
@@ -1022,7 +1230,8 @@ pub(crate) async fn do_channel_full_cycle<E: ElectrumApi>(
 	let node_b_anchor_reserve_sat = if node_b
 		.config()
 		.anchor_channels_config
-		.map_or(true, |acc| acc.trusted_peers_no_reserve.contains(&node_a.node_id()))
+		.trusted_peers_no_reserve
+		.contains(&node_a.node_id())
 	{
 		0
 	} else {
@@ -1360,17 +1569,25 @@ pub(crate) async fn do_channel_full_cycle<E: ElectrumApi>(
 	);
 
 	// Mine a block to give time for the HTLC to resolve
-	generate_blocks_and_wait(&bitcoind, electrsd, 1).await;
+	let new_height = generate_blocks_and_wait(&bitcoind, electrsd, 1).await;
+	wait_for_node_tip(&node_a, new_height).await;
+	wait_for_node_tip(&node_b, new_height).await;
 
 	println!("\nB splices out to pay A");
 	let addr_a = node_a.onchain_payment().new_address().unwrap();
-	let splice_out_sat = funding_amount_sat / 2;
+	let available_splice_out_sat = node_b.list_channels()[0].outbound_capacity_msat / 1000;
+	let splice_out_sat = available_splice_out_sat / 2;
+	assert!(splice_out_sat > 500_000);
 	node_b.splice_out(&user_channel_id_b, node_a.node_id(), &addr_a, splice_out_sat).unwrap();
 
 	expect_splice_negotiated_event!(node_a, node_b.node_id());
 	expect_splice_negotiated_event!(node_b, node_a.node_id());
 
-	generate_blocks_and_wait(&bitcoind, electrsd, 6).await;
+	tokio::time::sleep(Duration::from_secs(2)).await;
+
+	let new_height = generate_blocks_and_wait(&bitcoind, electrsd, 6).await;
+	wait_for_node_tip(&node_a, new_height).await;
+	wait_for_node_tip(&node_b, new_height).await;
 	node_a.sync_wallets().unwrap();
 	node_b.sync_wallets().unwrap();
 
@@ -1392,7 +1609,10 @@ pub(crate) async fn do_channel_full_cycle<E: ElectrumApi>(
 	expect_splice_negotiated_event!(node_a, node_b.node_id());
 	expect_splice_negotiated_event!(node_b, node_a.node_id());
 
-	generate_blocks_and_wait(&bitcoind, electrsd, 6).await;
+	tokio::time::sleep(Duration::from_secs(5)).await;
+	let new_height = generate_blocks_and_wait(&bitcoind, electrsd, 6).await;
+	wait_for_node_tip(&node_a, new_height).await;
+	wait_for_node_tip(&node_b, new_height).await;
 	node_a.sync_wallets().unwrap();
 	node_b.sync_wallets().unwrap();
 
@@ -1411,10 +1631,8 @@ pub(crate) async fn do_channel_full_cycle<E: ElectrumApi>(
 		let node_a_outbound_capacity_msat = node_a.list_channels()[0].outbound_capacity_msat;
 		let node_a_reserve_msat =
 			node_a.list_channels()[0].unspendable_punishment_reserve.unwrap() * 1000;
-		// TODO: Zero-fee commitment channels are anchor channels, but do not allocate any
-		// funds to the anchor, so this will need to be updated when we ship these channels
-		// in ldk-node.
-		let node_a_anchors_msat = if expect_anchor_channel { 2 * 330 * 1000 } else { 0 };
+		let zero_fee_commitments = node_a.list_channels()[0].feerate_sat_per_1000_weight == 0;
+		let node_a_anchors_msat = if zero_fee_commitments { 0 } else { 2 * 330 * 1000 };
 		let funding_amount_msat = node_a.list_channels()[0].channel_value_sats * 1000;
 		// Node B does not have any reserve, so we only subtract a few items on node A's
 		// side to arrive at node B's capacity
@@ -1444,8 +1662,10 @@ pub(crate) async fn do_channel_full_cycle<E: ElectrumApi>(
 	tokio::time::sleep(Duration::from_secs(1)).await;
 	if force_close {
 		node_a.force_close_channel(&user_channel_id_a, node_b.node_id(), None).unwrap();
+		tokio::time::sleep(Duration::from_secs(2)).await;
 	} else {
 		node_a.close_channel(&user_channel_id_a, node_b.node_id()).unwrap();
+		tokio::time::sleep(Duration::from_secs(2)).await;
 		// The cooperative shutdown may complete before we get to check, but if the channel
 		// is still visible it must already be in a shutdown state.
 		if let Some(channel) =
@@ -1467,89 +1687,18 @@ pub(crate) async fn do_channel_full_cycle<E: ElectrumApi>(
 
 	wait_for_outpoint_spend(electrsd, funding_txo_b).await;
 
-	generate_blocks_and_wait(&bitcoind, electrsd, 1).await;
+	let new_height = generate_blocks_and_wait(&bitcoind, electrsd, 1).await;
+	wait_for_node_tip(&node_a, new_height).await;
+	wait_for_node_tip(&node_b, new_height).await;
 	node_a.sync_wallets().unwrap();
 	node_b.sync_wallets().unwrap();
 
 	if force_close {
-		// Check node_b properly sees all balances and sweeps them.
-		assert_eq!(node_b.list_balances().lightning_balances.len(), 1);
-		match node_b.list_balances().lightning_balances[0] {
-			LightningBalance::ClaimableAwaitingConfirmations {
-				counterparty_node_id,
-				confirmation_height,
-				..
-			} => {
-				assert_eq!(counterparty_node_id, node_a.node_id());
-				let cur_height = node_b.status().current_best_block.height;
-				let blocks_to_go = confirmation_height - cur_height;
-				generate_blocks_and_wait(&bitcoind, electrsd, blocks_to_go as usize).await;
-				node_b.sync_wallets().unwrap();
-				node_a.sync_wallets().unwrap();
-			},
-			_ => panic!("Unexpected balance state!"),
-		}
-
-		assert!(node_b.list_balances().lightning_balances.is_empty());
-		assert_eq!(node_b.list_balances().pending_balances_from_channel_closures.len(), 1);
-		match node_b.list_balances().pending_balances_from_channel_closures[0] {
-			PendingSweepBalance::BroadcastAwaitingConfirmation { .. } => {},
-			_ => panic!("Unexpected balance state!"),
-		}
-		generate_blocks_and_wait(&bitcoind, electrsd, 1).await;
-		node_b.sync_wallets().unwrap();
-		node_a.sync_wallets().unwrap();
-
-		assert!(node_b.list_balances().lightning_balances.is_empty());
-		assert_eq!(node_b.list_balances().pending_balances_from_channel_closures.len(), 1);
-		match node_b.list_balances().pending_balances_from_channel_closures[0] {
-			PendingSweepBalance::AwaitingThresholdConfirmations { .. } => {},
-			_ => panic!("Unexpected balance state!"),
-		}
-		generate_blocks_and_wait(&bitcoind, electrsd, 5).await;
-		node_b.sync_wallets().unwrap();
-		node_a.sync_wallets().unwrap();
-
+		settle_force_close_balance(&node_b, node_a.node_id(), &node_a, &bitcoind, electrsd).await;
 		assert!(node_b.list_balances().lightning_balances.is_empty());
 		assert_eq!(node_b.list_balances().pending_balances_from_channel_closures.len(), 1);
 
-		// Check node_a properly sees all balances and sweeps them.
-		assert_eq!(node_a.list_balances().lightning_balances.len(), 1);
-		match node_a.list_balances().lightning_balances[0] {
-			LightningBalance::ClaimableAwaitingConfirmations {
-				counterparty_node_id,
-				confirmation_height,
-				..
-			} => {
-				assert_eq!(counterparty_node_id, node_b.node_id());
-				let cur_height = node_a.status().current_best_block.height;
-				let blocks_to_go = confirmation_height - cur_height;
-				generate_blocks_and_wait(&bitcoind, electrsd, blocks_to_go as usize).await;
-				node_a.sync_wallets().unwrap();
-				node_b.sync_wallets().unwrap();
-			},
-			_ => panic!("Unexpected balance state!"),
-		}
-
-		assert!(node_a.list_balances().lightning_balances.is_empty());
-		assert_eq!(node_a.list_balances().pending_balances_from_channel_closures.len(), 1);
-		match node_a.list_balances().pending_balances_from_channel_closures[0] {
-			PendingSweepBalance::BroadcastAwaitingConfirmation { .. } => {},
-			_ => panic!("Unexpected balance state!"),
-		}
-		generate_blocks_and_wait(&bitcoind, electrsd, 1).await;
-		node_a.sync_wallets().unwrap();
-		node_b.sync_wallets().unwrap();
-
-		assert!(node_a.list_balances().lightning_balances.is_empty());
-		assert_eq!(node_a.list_balances().pending_balances_from_channel_closures.len(), 1);
-		match node_a.list_balances().pending_balances_from_channel_closures[0] {
-			PendingSweepBalance::AwaitingThresholdConfirmations { .. } => {},
-			_ => panic!("Unexpected balance state!"),
-		}
-		generate_blocks_and_wait(&bitcoind, electrsd, 5).await;
-		node_a.sync_wallets().unwrap();
-		node_b.sync_wallets().unwrap();
+		settle_force_close_balance(&node_a, node_b.node_id(), &node_b, &bitcoind, electrsd).await;
 	} else {
 		assert_eq!(node_a.list_balances().lightning_balances.len(), 1);
 		assert!(node_a.list_balances().pending_balances_from_channel_closures.is_empty());
@@ -1585,7 +1734,10 @@ pub(crate) async fn do_channel_full_cycle<E: ElectrumApi>(
 
 		assert_eq!(node_a_blocks_to_go, node_b_blocks_to_go);
 
-		generate_blocks_and_wait(&bitcoind, electrsd, node_a_blocks_to_go as usize).await;
+		let new_height =
+			generate_blocks_and_wait(&bitcoind, electrsd, node_a_blocks_to_go as usize).await;
+		wait_for_node_tip(&node_a, new_height).await;
+		wait_for_node_tip(&node_b, new_height).await;
 		node_a.sync_wallets().unwrap();
 		node_b.sync_wallets().unwrap();
 
@@ -1593,6 +1745,38 @@ pub(crate) async fn do_channel_full_cycle<E: ElectrumApi>(
 		assert!(node_a.list_balances().pending_balances_from_channel_closures.is_empty());
 		assert!(node_b.list_balances().lightning_balances.is_empty());
 		assert!(node_b.list_balances().pending_balances_from_channel_closures.is_empty());
+	}
+
+	if force_close {
+		// The recovery reconnect completed while the force-close settled, so the peer no longer
+		// needs to remain persisted.
+		assert!(
+			!node_a.list_peers().iter().any(|p| p.node_id == node_b.node_id() && p.is_persisted),
+			"node_b should be removed from node_a peer store after the recovery reconnect"
+		);
+		assert_all_nodes_have_onchain_tx_type(
+			&[("node_a", &node_a), ("node_b", &node_b)],
+			"no ",
+			"UnilateralClose",
+			|tx_type| !matches!(tx_type, TransactionType::UnilateralClose { .. }),
+		);
+		assert_any_node_has_onchain_tx_type(
+			&[("node_a", &node_a), ("node_b", &node_b)],
+			"Sweep",
+			|tx_type| matches!(tx_type, TransactionType::Sweep { .. }),
+		);
+	} else {
+		assert_all_nodes_have_onchain_tx_type(
+			&[("node_a", &node_a), ("node_b", &node_b)],
+			"all ",
+			"CooperativeClose",
+			|tx_type| matches!(tx_type, TransactionType::CooperativeClose { .. }),
+		);
+		// Peer removed after cooperative close — no further reason to reconnect.
+		assert!(
+			!node_a.list_peers().iter().any(|p| p.node_id == node_b.node_id() && p.is_persisted),
+			"node_b should be removed from node_a peer store after cooperative close"
+		);
 	}
 
 	let sum_of_all_payments_sat = (push_msat
@@ -1617,20 +1801,20 @@ pub(crate) async fn do_channel_full_cycle<E: ElectrumApi>(
 	assert_eq!(node_b.list_balances().total_anchor_channels_reserve_sats, 0);
 
 	// Now we should have seen the channel closing transaction on-chain.
-	assert_eq!(
-		node_a
-			.list_payments_with_filter(|p| p.direction == PaymentDirection::Inbound
-				&& matches!(p.kind, PaymentKind::Onchain { .. }))
-			.len(),
-		3
-	);
-	assert_eq!(
-		node_b
-			.list_payments_with_filter(|p| p.direction == PaymentDirection::Inbound
-				&& matches!(p.kind, PaymentKind::Onchain { .. }))
-			.len(),
-		2
-	);
+	let node_a_inbound_onchain_count = node_a
+		.list_payments_with_filter(|p| {
+			p.direction == PaymentDirection::Inbound
+				&& matches!(p.kind, PaymentKind::Onchain { .. })
+		})
+		.len();
+	let node_b_inbound_onchain_count = node_b
+		.list_payments_with_filter(|p| {
+			p.direction == PaymentDirection::Inbound
+				&& matches!(p.kind, PaymentKind::Onchain { .. })
+		})
+		.len();
+	assert!(node_a_inbound_onchain_count >= 3);
+	assert!(node_b_inbound_onchain_count >= 2);
 
 	// Check we handled all events
 	assert_eq!(node_a.next_event(), None);
@@ -1700,6 +1884,21 @@ impl KVStore for TestSyncStore {
 	}
 }
 
+impl PaginatedKVStore for TestSyncStore {
+	fn list_paginated(
+		&self, primary_namespace: &str, secondary_namespace: &str, page_token: Option<PageToken>,
+	) -> impl Future<Output = Result<PaginatedListResponse, io::Error>> + 'static + Send {
+		let primary_namespace = primary_namespace.to_string();
+		let secondary_namespace = secondary_namespace.to_string();
+		let inner = Arc::clone(&self.inner);
+		async move {
+			inner
+				.list_paginated_internal_async(&primary_namespace, &secondary_namespace, page_token)
+				.await
+		}
+	}
+}
+
 struct TestSyncStoreInner {
 	serializer: tokio::sync::RwLock<()>,
 	test_store: InMemoryStore,
@@ -1761,6 +1960,37 @@ impl TestSyncStoreInner {
 	) -> lightning::io::Result<Vec<String>> {
 		let _guard = self.serializer.read().await;
 		self.do_list_async(primary_namespace, secondary_namespace).await
+	}
+
+	async fn list_paginated_internal_async(
+		&self, primary_namespace: &str, secondary_namespace: &str, page_token: Option<PageToken>,
+	) -> lightning::io::Result<PaginatedListResponse> {
+		let _guard = self.serializer.read().await;
+		let sqlite_res = PaginatedKVStore::list_paginated(
+			&self.sqlite_store,
+			primary_namespace,
+			secondary_namespace,
+			page_token.clone(),
+		)
+		.await;
+		let test_res = PaginatedKVStore::list_paginated(
+			&self.test_store,
+			primary_namespace,
+			secondary_namespace,
+			page_token,
+		)
+		.await;
+
+		match sqlite_res {
+			Ok(sqlite_response) => {
+				assert_eq!(sqlite_response, test_res.unwrap());
+				Ok(sqlite_response)
+			},
+			Err(e) => {
+				assert!(test_res.is_err());
+				Err(e)
+			},
+		}
 	}
 
 	async fn read_internal_async(
@@ -1873,4 +2103,27 @@ impl TestSyncStoreInner {
 			},
 		}
 	}
+}
+
+/// The PostgreSQL connection string used by the Postgres-backed tests, overridable via the
+/// `TEST_POSTGRES_URL` environment variable.
+#[cfg(feature = "postgres")]
+pub(crate) fn test_connection_string() -> String {
+	std::env::var("TEST_POSTGRES_URL")
+		.unwrap_or_else(|_| "host=localhost user=postgres password=postgres".to_string())
+}
+
+/// Drops the given table from the `ldk_db` database, ignoring the case where the database doesn't
+/// exist yet. Used to ensure a clean slate before and after Postgres-backed tests.
+#[cfg(feature = "postgres")]
+pub(crate) async fn drop_table(table_name: &str) {
+	let connection_string = format!("{} dbname=ldk_db", test_connection_string());
+	let Ok((client, connection)) =
+		tokio_postgres::connect(&connection_string, tokio_postgres::NoTls).await
+	else {
+		// Database doesn't exist yet — nothing to drop.
+		return;
+	};
+	tokio::spawn(connection);
+	let _ = client.execute(&format!("DROP TABLE IF EXISTS {table_name}"), &[]).await;
 }

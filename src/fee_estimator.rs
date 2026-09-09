@@ -87,7 +87,11 @@ impl LdkFeeEstimator for OnchainFeeEstimator {
 pub(crate) fn get_num_block_defaults_for_target(target: ConfirmationTarget) -> usize {
 	match target {
 		ConfirmationTarget::OnchainPayment => 6,
-		ConfirmationTarget::ChannelFunding => 12,
+		// Funding txs target ~3 blocks (mempool's "fast" tier) so they confirm
+		// promptly. The prior 12-block target resolved to a fee low enough that
+		// funding txs could sit unconfirmed for hours during normal congestion,
+		// stalling channels in `sync` (never reaching `channel_ready`).
+		ConfirmationTarget::ChannelFunding => 3,
 		ConfirmationTarget::Lightning(ldk_target) => match ldk_target {
 			LdkConfirmationTarget::MaximumFeeEstimate => 1,
 			LdkConfirmationTarget::UrgentOnChainSweep => 6,
@@ -162,5 +166,200 @@ pub(crate) fn apply_post_estimation_adjustments(
 			FeeRate::from_sat_per_kwu(slightly_bump)
 		},
 		_ => estimated_rate,
+	}
+}
+
+/// The most we are willing to pay for a channel funding transaction: `1.5x` our funding feerate
+/// estimate. Used as the `max_feerate` ceiling for splices and their RBF fee bumps.
+pub(crate) fn max_funding_feerate(estimate: FeeRate) -> FeeRate {
+	FeeRate::from_sat_per_kwu(estimate.to_sat_per_kwu() * 3 / 2)
+}
+
+/// Picks the `(target, max)` feerates for replacing a pending splice's in-flight funding
+/// transaction via RBF, or `None` if the RBF can't be done within our fee ceiling.
+///
+/// `max` is the most we are willing to pay (see [`max_funding_feerate`]), which tracks our current
+/// estimate and so may have risen or fallen since the original splice; it is never inflated to meet
+/// the RBF minimum. `target` is what we actually pay — our current estimate, or the template's RBF
+/// minimum if that is higher (required to replace the transaction). If that minimum exceeds `max`,
+/// we can't RBF.
+pub(crate) fn rbf_splice_feerates(
+	estimate: FeeRate, min_rbf_feerate: FeeRate,
+) -> Option<(FeeRate, FeeRate)> {
+	let max = max_funding_feerate(estimate);
+	let target = estimate.max(min_rbf_feerate);
+	(target <= max).then_some((target, max))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn rbf_splice_feerates_target_and_max() {
+		let kwu = FeeRate::from_sat_per_kwu;
+		// Estimate below the RBF minimum but within our ceiling: pay the minimum to replace the
+		// transaction; the max stays 1.5x the estimate (never inflated) and already clears it.
+		assert_eq!(rbf_splice_feerates(kwu(253), kwu(278)), Some((kwu(278), kwu(253 * 3 / 2))));
+		// Estimate risen above the RBF minimum: pay the higher estimate, not the stale minimum.
+		assert_eq!(rbf_splice_feerates(kwu(500), kwu(278)), Some((kwu(500), kwu(500 * 3 / 2))));
+		// RBF minimum above our max (1.5x a fallen estimate): we can't RBF within our ceiling.
+		assert_eq!(rbf_splice_feerates(kwu(100), kwu(278)), None);
+	}
+}
+
+/// Public fee-priority selector for on-chain swap transactions (Peerswap
+/// native primitives, B-series).
+///
+/// This is the **public** surface used by swap code to ask for a fee rate
+/// without exposing the crate-internal [`ConfirmationTarget`] enum. Each
+/// variant maps onto an existing internal target via [`From`], so no new
+/// `ConfirmationTarget` variant is introduced and every existing exhaustive
+/// match is left untouched.
+#[cfg(feature = "swaps")]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum SwapFeeTarget {
+	/// Fee target for broadcasting a swap funding (HTLC opening) transaction.
+	///
+	/// Maps to [`ConfirmationTarget::ChannelFunding`] so the funding output
+	/// confirms promptly (~3 blocks) and the swap can proceed without stalling.
+	Funding,
+	/// Fee target for time-sensitive claim/sweep transactions.
+	///
+	/// A swap claim is bounded by an on-chain timelock, so it must confirm
+	/// urgently. Maps to [`LdkConfirmationTarget::UrgentOnChainSweep`].
+	Claim,
+	/// Fee target for refund / cooperative-spend transactions.
+	///
+	/// Less time-critical than a [`SwapFeeTarget::Claim`]; maps to the standard
+	/// [`ConfirmationTarget::OnchainPayment`] priority.
+	Refund,
+}
+
+#[cfg(feature = "swaps")]
+impl From<SwapFeeTarget> for ConfirmationTarget {
+	fn from(value: SwapFeeTarget) -> Self {
+		match value {
+			SwapFeeTarget::Funding => ConfirmationTarget::ChannelFunding,
+			SwapFeeTarget::Claim => {
+				ConfirmationTarget::Lightning(LdkConfirmationTarget::UrgentOnChainSweep)
+			},
+			SwapFeeTarget::Refund => ConfirmationTarget::OnchainPayment,
+		}
+	}
+}
+
+/// Provenance of a swap feerate estimate (Peerswap native primitive B6 /
+/// plan FIX-B).
+///
+/// Lets a swap caller distinguish a live estimate sourced from the chain
+/// backend from a static fallback/relay-floor value, so it can refuse to fund
+/// (fail-closed) on an estimate it does not trust.
+#[cfg(feature = "swaps")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SwapFeerateSource {
+	/// A live estimate sourced from the chain backend's fee-rate cache.
+	Native,
+	/// No live estimate was available; a per-target fallback rate (or the
+	/// `FEERATE_FLOOR_SATS_PER_KW` relay floor) was used instead.
+	Static,
+}
+
+/// A swap feerate estimate carrying its [`SwapFeerateSource`] provenance
+/// (Peerswap native primitive B6 / plan FIX-B).
+///
+/// This is intentionally NOT a bare `u64`/[`FeeRate`]: swap funding decisions
+/// are fail-closed, so the consumer must be able to tell a live estimate from a
+/// fallback/floor before committing funds.
+#[cfg(feature = "swaps")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FeerateQuote {
+	/// The estimated feerate in satoshis per virtual byte (rounded up so the
+	/// transaction is never under-funded relative to the estimate).
+	pub sat_vb: u64,
+	/// Whether `sat_vb` came from a live estimate or a static fallback/floor.
+	pub source: SwapFeerateSource,
+}
+
+#[cfg(feature = "swaps")]
+impl OnchainFeeEstimator {
+	/// Estimate the on-chain fee rate for a swap transaction at the requested
+	/// [`SwapFeeTarget`] priority.
+	///
+	/// Thin wrapper over [`FeeEstimator::estimate_fee_rate`] that maps the
+	/// public [`SwapFeeTarget`] onto the internal [`ConfirmationTarget`]. The
+	/// returned [`FeeRate`] is subject to the same `FEERATE_FLOOR_SATS_PER_KW`
+	/// lower bound as every other estimate, and falls back to the per-target
+	/// fallback rate when the cache is empty.
+	pub(crate) fn estimate_swap_fee_rate(&self, target: SwapFeeTarget) -> FeeRate {
+		self.estimate_fee_rate(target.into())
+	}
+
+	/// Source-bearing swap feerate estimate (B6 / FIX-B).
+	///
+	/// Returns the estimate in sat/vB together with its [`SwapFeerateSource`]:
+	/// [`SwapFeerateSource::Native`] when a live cached estimate exists for the
+	/// mapped target, [`SwapFeerateSource::Static`] when the per-target
+	/// fallback / relay floor had to be used (cache empty). Callers MUST treat
+	/// a `Static` quote as untrusted for fail-closed funding decisions.
+	pub(crate) fn estimate_swap_feerate_quote(&self, target: SwapFeeTarget) -> FeerateQuote {
+		let conf_target: ConfirmationTarget = target.into();
+		let source = if self.fee_rate_cache.read().unwrap().contains_key(&conf_target) {
+			SwapFeerateSource::Native
+		} else {
+			SwapFeerateSource::Static
+		};
+		let rate = self.estimate_fee_rate(conf_target);
+		FeerateQuote { sat_vb: rate.to_sat_per_vb_ceil(), source }
+	}
+}
+
+#[cfg(all(test, feature = "swaps"))]
+mod swap_b6_tests {
+	use super::*;
+
+	// An empty cache must yield a `Static` quote (fallback/floor), never a
+	// `Native` one — the fail-closed default for swap funding decisions.
+	#[test]
+	fn empty_cache_quote_is_static() {
+		let estimator = OnchainFeeEstimator::new();
+		for target in [SwapFeeTarget::Funding, SwapFeeTarget::Claim, SwapFeeTarget::Refund] {
+			let quote = estimator.estimate_swap_feerate_quote(target);
+			assert_eq!(quote.source, SwapFeerateSource::Static);
+			// The fallback is always at least the relay floor, so sat/vB is > 0.
+			assert!(quote.sat_vb > 0);
+		}
+	}
+
+	// A live cached estimate for the mapped target must yield a `Native` quote
+	// whose sat/vB reflects the cached rate (here well above the relay floor).
+	#[test]
+	fn cached_estimate_quote_is_native() {
+		let estimator = OnchainFeeEstimator::new();
+		let target = SwapFeeTarget::Funding;
+		let conf_target: ConfirmationTarget = target.into();
+		// 2500 sat/kwu == 10 sat/vB, comfortably above FEERATE_FLOOR_SATS_PER_KW.
+		let mut update = HashMap::new();
+		update.insert(conf_target, FeeRate::from_sat_per_kwu(2500));
+		estimator.set_fee_rate_cache(update);
+
+		let quote = estimator.estimate_swap_feerate_quote(target);
+		assert_eq!(quote.source, SwapFeerateSource::Native);
+		assert_eq!(quote.sat_vb, 10);
+	}
+
+	// A target absent from a populated cache still fails closed to `Static`.
+	#[test]
+	fn missing_target_in_populated_cache_is_static() {
+		let estimator = OnchainFeeEstimator::new();
+		let mut update = HashMap::new();
+		update.insert(
+			Into::<ConfirmationTarget>::into(SwapFeeTarget::Funding),
+			FeeRate::from_sat_per_kwu(2500),
+		);
+		estimator.set_fee_rate_cache(update);
+
+		let quote = estimator.estimate_swap_feerate_quote(SwapFeeTarget::Claim);
+		assert_eq!(quote.source, SwapFeerateSource::Static);
 	}
 }

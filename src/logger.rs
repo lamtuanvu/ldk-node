@@ -19,7 +19,7 @@ use lightning::ln::types::ChannelId;
 use lightning::types::payment::PaymentHash;
 pub use lightning::util::logger::Level as LogLevel;
 pub(crate) use lightning::util::logger::{Logger as LdkLogger, Record as LdkRecord};
-pub(crate) use lightning::{log_bytes, log_debug, log_error, log_info, log_trace};
+pub(crate) use lightning::{log_bytes, log_debug, log_error, log_info, log_trace, log_warn};
 use log::{Level as LogFacadeLevel, Record as LogFacadeRecord};
 
 /// A unit of logging output with metadata to enable filtering `module_path`,
@@ -251,7 +251,8 @@ impl LogWriter for Writer {
 	}
 }
 
-pub(crate) struct Logger {
+/// A logger for LDK Node that can write to files, the log facade, or custom writers.
+pub struct Logger {
 	/// Specifies the logger's writer.
 	writer: Writer,
 }
@@ -275,10 +276,12 @@ impl Logger {
 		Ok(Self { writer: Writer::FileWriter { file_path, max_log_level } })
 	}
 
+	/// Creates a new logger that forwards logs to the `log` facade.
 	pub fn new_log_facade() -> Self {
 		Self { writer: Writer::LogFacadeWriter }
 	}
 
+	/// Creates a new logger with a custom writer.
 	pub fn new_custom_writer(log_writer: Arc<dyn LogWriter>) -> Self {
 		Self { writer: Writer::CustomWriter(log_writer) }
 	}

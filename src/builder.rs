@@ -37,21 +37,23 @@ use lightning::routing::scoring::{
 use lightning::sign::{EntropySource, NodeSigner};
 use lightning::util::config::HTLCInterceptionFlags;
 use lightning::util::persist::{
-	KVStore, CHANNEL_MANAGER_PERSISTENCE_KEY, CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE,
-	CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE,
+	KVStore, PaginatedKVStore, CHANNEL_MANAGER_PERSISTENCE_KEY,
+	CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE, CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE,
 };
 use lightning::util::ser::ReadableArgs;
 use lightning::util::sweep::OutputSweeper;
 use lightning_dns_resolver::OMDomainResolver;
 use vss_client::headers::VssHeaderProvider;
 
-use crate::chain::ChainSource;
+use crate::chain::{CbfFeeSourceConfig, ChainServiceHooks, ChainSource};
 use crate::config::{
 	default_user_config, may_announce_channel, AnnounceError, AsyncPaymentsRole,
 	BitcoindRestClientConfig, Config, ElectrumSyncConfig, EsploraSyncConfig, HRNResolverConfig,
 	TorConfig, DEFAULT_ESPLORA_SERVER_URL, DEFAULT_LOG_FILENAME, DEFAULT_LOG_LEVEL,
+	DEFAULT_MAX_PROBE_AMOUNT_MSAT, DEFAULT_MIN_PROBE_AMOUNT_MSAT,
 };
 use crate::connection::ConnectionManager;
+use crate::custom_gossip::CustomGossipMessageHandler;
 use crate::entropy::NodeEntropy;
 use crate::event::EventQueue;
 use crate::fee_estimator::OnchainFeeEstimator;
@@ -68,14 +70,16 @@ use crate::io::{
 	PENDING_PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE,
 	PENDING_PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE,
 };
-use crate::liquidity::{
-	LSPS1ClientConfig, LSPS2ClientConfig, LSPS2ServiceConfig, LiquiditySourceBuilder,
-};
+use crate::liquidity::{LSPS2ServiceConfig, LiquiditySourceBuilder, LspConfig};
 use crate::lnurl_auth::LnurlAuth;
-use crate::logger::{log_error, LdkLogger, LogLevel, LogWriter, Logger};
+use crate::logger::{log_error, log_info, LdkLogger, LogLevel, LogWriter, Logger};
 use crate::message_handler::NodeCustomMessageHandler;
 use crate::payment::asynchronous::om_mailbox::OnionMessageMailbox;
 use crate::peer_store::PeerStore;
+use crate::probing::{
+	HighDegreeStrategy, Prober, ProbingConfig, ProbingStrategy, ProbingStrategyKind,
+	RandomWalkStrategy,
+};
 use crate::runtime::{Runtime, RuntimeSpawner};
 use crate::tx_broadcaster::TransactionBroadcaster;
 use crate::types::{
@@ -107,6 +111,12 @@ enum ChainDataSourceConfig {
 		rpc_user: String,
 		rpc_password: String,
 		rest_client_config: Option<BitcoindRestClientConfig>,
+		wallet_rescan_from_height: Option<u32>,
+	},
+	Cbf {
+		peers: Vec<String>,
+		fee_source_config: Option<CbfFeeSourceConfig>,
+		wallet_rescan_from_height: Option<u32>,
 	},
 }
 
@@ -123,10 +133,8 @@ struct PathfindingScoresSyncConfig {
 
 #[derive(Debug, Clone, Default)]
 struct LiquiditySourceConfig {
-	// Act as an LSPS1 client connecting to the given service.
-	lsps1_client: Option<LSPS1ClientConfig>,
-	// Act as an LSPS2 client connecting to the given service.
-	lsps2_client: Option<LSPS2ClientConfig>,
+	// Acts for both LSPS1 and LSPS2 clients connecting to the given service.
+	lsp_nodes: Vec<LspConfig>,
 	// Act as an LSPS2 service.
 	lsps2_service: Option<LSPS2ServiceConfig>,
 }
@@ -200,6 +208,15 @@ pub enum BuildError {
 	AsyncPaymentsConfigMismatch,
 	/// An attempt to setup a DNS Resolver failed.
 	DNSResolverSetupFailed,
+	/// We failed to determine the current chain tip on first startup.
+	///
+	/// Returned when a fresh node is built against a Bitcoin Core RPC or REST chain source that
+	/// is unreachable or misconfigured, so we cannot learn the tip height/hash to use as the
+	/// wallet birthday. Falling back to genesis would silently force a full-history rescan on
+	/// the next successful startup, so we abort instead.
+	ChainTipFetchFailed,
+	/// The configured wallet rescan height is above the current chain tip.
+	WalletRescanHeightTooHigh,
 }
 
 impl fmt::Display for BuildError {
@@ -237,6 +254,15 @@ impl fmt::Display for BuildError {
 			Self::DNSResolverSetupFailed => {
 				write!(f, "An attempt to setup a DNS resolver has failed.")
 			},
+			Self::ChainTipFetchFailed => {
+				write!(
+					f,
+					"Failed to determine the current chain tip on first startup. Verify the chain data source is reachable and correctly configured."
+				)
+			},
+			Self::WalletRescanHeightTooHigh => {
+				write!(f, "Wallet rescan height is above the current chain tip.")
+			},
 		}
 	}
 }
@@ -258,7 +284,7 @@ impl std::error::Error for BuildError {}
 /// - [`build`] uses an SQLite database (recommended default).
 /// - [`build_with_fs_store`] uses a filesystem-based store.
 /// - [`build_with_vss_store`] and variants use a [VSS] remote store (**experimental**).
-/// - [`build_with_store`] allows providing a custom [`KVStore`] implementation.
+/// - [`build_with_store`] allows providing a custom [`PaginatedKVStore`] implementation.
 ///
 /// ### Logging
 ///
@@ -274,7 +300,7 @@ impl std::error::Error for BuildError {}
 /// [`build_with_vss_store`]: Self::build_with_vss_store
 /// [`build_with_store`]: Self::build_with_store
 /// [VSS]: https://github.com/lightningdevkit/vss-server/blob/main/README.md
-/// [`KVStore`]: lightning::util::persist::KVStore
+/// [`PaginatedKVStore`]: lightning::util::persist::PaginatedKVStore
 /// [`DEFAULT_LOG_LEVEL`]: crate::config::DEFAULT_LOG_LEVEL
 /// [`set_filesystem_logger`]: Self::set_filesystem_logger
 /// [`set_log_facade_logger`]: Self::set_log_facade_logger
@@ -285,13 +311,15 @@ impl std::error::Error for BuildError {}
 pub struct NodeBuilder {
 	config: Config,
 	chain_data_source_config: Option<ChainDataSourceConfig>,
+	cbf_chain_service_hooks: ChainServiceHooks,
 	gossip_source_config: Option<GossipSourceConfig>,
 	liquidity_source_config: Option<LiquiditySourceConfig>,
 	log_writer_config: Option<LogWriterConfig>,
 	async_payments_role: Option<AsyncPaymentsRole>,
 	runtime_handle: Option<tokio::runtime::Handle>,
 	pathfinding_scores_sync_config: Option<PathfindingScoresSyncConfig>,
-	recovery_mode: bool,
+	probing_config: Option<ProbingConfig>,
+	custom_gossip_enabled: bool,
 }
 
 impl NodeBuilder {
@@ -309,17 +337,20 @@ impl NodeBuilder {
 		let log_writer_config = None;
 		let runtime_handle = None;
 		let pathfinding_scores_sync_config = None;
-		let recovery_mode = false;
+		let probing_config = None;
+		let custom_gossip_enabled = false;
 		Self {
 			config,
 			chain_data_source_config,
+			cbf_chain_service_hooks: ChainServiceHooks::default(),
 			gossip_source_config,
 			liquidity_source_config,
 			log_writer_config,
 			runtime_handle,
 			async_payments_role: None,
 			pathfinding_scores_sync_config,
-			recovery_mode,
+			probing_config,
+			custom_gossip_enabled,
 		}
 	}
 
@@ -376,6 +407,58 @@ impl NodeBuilder {
 		self
 	}
 
+	/// Configures the [`Node`] instance to source chain data via compact block filters
+	/// (BIP157/BIP158), connecting to the given peers (`ip:port`).
+	///
+	/// `fee_source_config` optionally delegates fee estimation to an Esplora or Electrum server;
+	/// if `None`, fee rates are derived from recent blocks.
+	///
+	/// `wallet_rescan_from_height` is an optional wallet birthday: the lowest height whose block
+	/// the wallet must still scan. It applies only while the wallet's persisted chain state is
+	/// still rooted at genesis; a wallet with a persisted block is never rewound. Because no
+	/// chain backend is reachable at build time, the wallet is anchored on the highest
+	/// checkpoint compiled into the `bip157` crate *strictly below* the given height — scanning
+	/// starts at the block after the anchor, so the block at the given height is always scanned
+	/// (heights at or below the lowest anchor fall back to a full scan from block 1; the
+	/// genesis block itself is unspendable by consensus and needs no scan). Mainnet anchors are
+	/// 481,823 (one block before SegWit activation), 709,631 (one block before taproot
+	/// activation) and 965,999 (mined 2026-09-08; a birthday of 966,000 scans from that block).
+	/// On all other networks a fresh wallet scans from genesis. Passing `None`
+	/// also scans from genesis — unlike the Bitcoin Core sources, where `None` anchors at the
+	/// current tip — because CBF has no trusted tip oracle at build time and anchoring lower is
+	/// the only direction that cannot skip wallet history. For a restored seed with older
+	/// on-chain activity, pass a height at or below its first transaction (or `None`).
+	pub fn set_chain_source_cbf(
+		&mut self, peers: Vec<String>, fee_source_config: Option<CbfFeeSourceConfig>,
+		wallet_rescan_from_height: Option<u32>,
+	) -> &mut Self {
+		self.chain_data_source_config = Some(ChainDataSourceConfig::Cbf {
+			peers,
+			fee_source_config,
+			wallet_rescan_from_height,
+		});
+		self
+	}
+
+	/// Configures app-supplied external chain-service hooks for the CBF chain source.
+	///
+	/// `hooks.fee_estimates`, if set, is tried before CBF's own fee estimation (native
+	/// block-derived, or the [`CbfFeeSourceConfig`] passed to [`set_chain_source_cbf`]) on every
+	/// fee-update cycle; an `Err` result (or no hook at all) falls through to that configured
+	/// behavior unchanged. `hooks.broadcast`, if set, is tried before CBF's P2P broadcast on
+	/// every outgoing transaction package; an `Err` result (or no hook at all) falls through to
+	/// P2P broadcast unchanged.
+	///
+	/// Only meaningful when paired with [`set_chain_source_cbf`]; a no-op for every other chain
+	/// source. This is intentionally payment-agnostic: the fork never learns anything about how
+	/// (or whether) a hook is backed by L402 or any other payment protocol.
+	///
+	/// [`set_chain_source_cbf`]: Self::set_chain_source_cbf
+	pub fn set_cbf_chain_service_hooks(&mut self, hooks: ChainServiceHooks) -> &mut Self {
+		self.cbf_chain_service_hooks = hooks;
+		self
+	}
+
 	/// Configures the [`Node`] instance to connect to a Bitcoin Core node via RPC.
 	///
 	/// This method establishes an RPC connection that enables all essential chain operations including
@@ -384,8 +467,13 @@ impl NodeBuilder {
 	/// ## Parameters:
 	/// * `rpc_host`, `rpc_port`, `rpc_user`, `rpc_password` - Required parameters for the Bitcoin Core RPC
 	///   connection.
+	/// * `wallet_rescan_from_height` - Optional wallet birthday height to rescan from on first
+	///   startup, before wallet state exists. Existing wallets are not rewound. The height must
+	///   be at or below the current tip. Passing `Some(0)` rescans from genesis; passing `None`
+	///   checkpoints at the current tip.
 	pub fn set_chain_source_bitcoind_rpc(
 		&mut self, rpc_host: String, rpc_port: u16, rpc_user: String, rpc_password: String,
+		wallet_rescan_from_height: Option<u32>,
 	) -> &mut Self {
 		self.chain_data_source_config = Some(ChainDataSourceConfig::Bitcoind {
 			rpc_host,
@@ -393,6 +481,7 @@ impl NodeBuilder {
 			rpc_user,
 			rpc_password,
 			rest_client_config: None,
+			wallet_rescan_from_height,
 		});
 		self
 	}
@@ -406,9 +495,13 @@ impl NodeBuilder {
 	/// * `rest_host`, `rest_port` - Required parameters for the Bitcoin Core REST connection.
 	/// * `rpc_host`, `rpc_port`, `rpc_user`, `rpc_password` - Required parameters for the Bitcoin Core RPC
 	///   connection
+	/// * `wallet_rescan_from_height` - Optional wallet birthday height to rescan from on first
+	///   startup, before wallet state exists. Existing wallets are not rewound. The height must
+	///   be at or below the current tip. Passing `Some(0)` rescans from genesis; passing `None`
+	///   checkpoints at the current tip.
 	pub fn set_chain_source_bitcoind_rest(
 		&mut self, rest_host: String, rest_port: u16, rpc_host: String, rpc_port: u16,
-		rpc_user: String, rpc_password: String,
+		rpc_user: String, rpc_password: String, wallet_rescan_from_height: Option<u32>,
 	) -> &mut Self {
 		self.chain_data_source_config = Some(ChainDataSourceConfig::Bitcoind {
 			rpc_host,
@@ -416,6 +509,7 @@ impl NodeBuilder {
 			rpc_user,
 			rpc_password,
 			rest_client_config: Some(BitcoindRestClientConfig { rest_host, rest_port }),
+			wallet_rescan_from_height,
 		});
 
 		self
@@ -443,45 +537,36 @@ impl NodeBuilder {
 		self
 	}
 
-	/// Configures the [`Node`] instance to source inbound liquidity from the given
-	/// [bLIP-51 / LSPS1] service.
+	/// Configures the [`Node`] instance to source inbound liquidity from the given LSP.
 	///
-	/// Will mark the LSP as trusted for 0-confirmation channels, see [`Config::trusted_peers_0conf`].
-	///
-	/// The given `token` will be used by the LSP to authenticate the user.
-	///
-	/// [bLIP-51 / LSPS1]: https://github.com/lightning/blips/blob/master/blip-0051.md
-	pub fn set_liquidity_source_lsps1(
-		&mut self, node_id: PublicKey, address: SocketAddress, token: Option<String>,
-	) -> &mut Self {
-		// Mark the LSP as trusted for 0conf
-		self.config.trusted_peers_0conf.push(node_id.clone());
-
-		let liquidity_source_config =
-			self.liquidity_source_config.get_or_insert(LiquiditySourceConfig::default());
-		let lsps1_client_config = LSPS1ClientConfig { node_id, address, token };
-		liquidity_source_config.lsps1_client = Some(lsps1_client_config);
-		self
-	}
-
-	/// Configures the [`Node`] instance to source just-in-time inbound liquidity from the given
-	/// [bLIP-52 / LSPS2] service.
-	///
-	/// Will mark the LSP as trusted for 0-confirmation channels, see [`Config::trusted_peers_0conf`].
+	/// The node will discover the LSP's supported protocols (LSPS1/LSPS2) on startup via [bLIP-50 / LSPS0]
+	/// and select the appropriate protocol per request automatically.
 	///
 	/// The given `token` will be used by the LSP to authenticate the user.
+	/// `trust_peer_0conf` controls whether the node will additionally accept
+	/// 0-confirmation channels opened by this LSP. If `false`, 0-confirmation
+	/// acceptance for this peer falls back to [`Config::trusted_peers_0conf`].
 	///
-	/// [bLIP-52 / LSPS2]: https://github.com/lightning/blips/blob/master/blip-0052.md
-	pub fn set_liquidity_source_lsps2(
+	/// May be called multiple times to register several LSPs. Duplicate `node_id`s are ignored.
+	///
+	/// [bLIP-50 / LSPS0]: https://github.com/lightning/blips/blob/master/blip-0050.md
+	pub fn add_liquidity_source(
 		&mut self, node_id: PublicKey, address: SocketAddress, token: Option<String>,
+		trust_peer_0conf: bool,
 	) -> &mut Self {
-		// Mark the LSP as trusted for 0conf
-		self.config.trusted_peers_0conf.push(node_id.clone());
-
 		let liquidity_source_config =
 			self.liquidity_source_config.get_or_insert(LiquiditySourceConfig::default());
-		let lsps2_client_config = LSPS2ClientConfig { node_id, address, token };
-		liquidity_source_config.lsps2_client = Some(lsps2_client_config);
+
+		if liquidity_source_config.lsp_nodes.iter().any(|n| n.node_id == node_id) {
+			return self;
+		}
+
+		liquidity_source_config.lsp_nodes.push(LspConfig {
+			node_id,
+			address,
+			token,
+			trust_peer_0conf,
+		});
 		self
 	}
 
@@ -491,12 +576,24 @@ impl NodeBuilder {
 	/// **Caution**: LSP service support is in **alpha** and is considered an experimental feature.
 	///
 	/// [LSPS2]: https://github.com/BitcoinAndLightningLayerSpecs/lsp/blob/main/LSPS2/README.md
-	pub fn set_liquidity_provider_lsps2(
-		&mut self, service_config: LSPS2ServiceConfig,
+	pub fn enable_liquidity_provider(
+		&mut self, lsps2_service_config: LSPS2ServiceConfig,
 	) -> &mut Self {
 		let liquidity_source_config =
 			self.liquidity_source_config.get_or_insert(LiquiditySourceConfig::default());
-		liquidity_source_config.lsps2_service = Some(service_config);
+		liquidity_source_config.lsps2_service = Some(lsps2_service_config);
+		self
+	}
+
+	/// Enables custom gossip message support for the [`Node`] instance.
+	///
+	/// When enabled, the node will be able to send and receive custom gossip messages
+	/// containing metadata extensions to the standard Lightning gossip protocol.
+	///
+	/// Custom gossip messages use message type 32769 and can contain arbitrary metadata
+	/// up to 4096 bytes in length.
+	pub fn enable_custom_gossip(&mut self) -> &mut Self {
+		self.custom_gossip_enabled = true;
 		self
 	}
 
@@ -615,13 +712,27 @@ impl NodeBuilder {
 		Ok(self)
 	}
 
-	/// Configures the [`Node`] to resync chain data from genesis on first startup, recovering any
-	/// historical wallet funds.
+	/// Sets background probing config.
 	///
-	/// This should only be set on first startup when importing an older wallet from a previously
-	/// used [`NodeEntropy`].
-	pub fn set_wallet_recovery_mode(&mut self) -> &mut Self {
-		self.recovery_mode = true;
+	/// Use [`ProbingConfigBuilder`] to build the configuration:
+	/// ```no_run
+	/// # #[cfg(not(feature = "uniffi"))]
+	/// # {
+	/// use std::time::Duration;
+	///
+	/// use ldk_node::probing::ProbingConfigBuilder;
+	/// use ldk_node::Builder;
+	///
+	/// let mut builder = Builder::new();
+	/// builder.set_probing_config(
+	/// 	ProbingConfigBuilder::high_degree(100).interval(Duration::from_secs(30)).build(),
+	/// );
+	/// # }
+	/// ```
+	///
+	/// [`ProbingConfigBuilder`]: crate::probing::ProbingConfigBuilder
+	pub fn set_probing_config(&mut self, config: ProbingConfig) -> &mut Self {
+		self.probing_config = Some(config);
 		self
 	}
 
@@ -826,7 +937,7 @@ impl NodeBuilder {
 	}
 
 	/// Builds a [`Node`] instance according to the options previously configured.
-	pub fn build_with_store<S: KVStore + Send + Sync + 'static>(
+	pub fn build_with_store<S: PaginatedKVStore + Send + Sync + 'static>(
 		&self, node_entropy: NodeEntropy, kv_store: S,
 	) -> Result<Node, BuildError> {
 		let logger = setup_logger(&self.log_writer_config, &self.config)?;
@@ -845,14 +956,14 @@ impl NodeBuilder {
 		}
 	}
 
-	fn build_with_store_and_logger<S: KVStore + Send + Sync + 'static>(
+	fn build_with_store_and_logger<S: PaginatedKVStore + Send + Sync + 'static>(
 		&self, node_entropy: NodeEntropy, kv_store: S, logger: Arc<Logger>,
 	) -> Result<Node, BuildError> {
 		let runtime = self.setup_runtime(&logger)?;
 		self.build_with_store_runtime_and_logger(node_entropy, kv_store, runtime, logger)
 	}
 
-	fn build_with_store_runtime_and_logger<S: KVStore + Send + Sync + 'static>(
+	fn build_with_store_runtime_and_logger<S: PaginatedKVStore + Send + Sync + 'static>(
 		&self, node_entropy: NodeEntropy, kv_store: S, runtime: Arc<Runtime>, logger: Arc<Logger>,
 	) -> Result<Node, BuildError> {
 		let seed_bytes = node_entropy.to_seed_bytes();
@@ -861,11 +972,13 @@ impl NodeBuilder {
 		build_with_store_internal(
 			config,
 			self.chain_data_source_config.as_ref(),
+			self.cbf_chain_service_hooks.clone(),
 			self.gossip_source_config.as_ref(),
 			self.liquidity_source_config.as_ref(),
 			self.pathfinding_scores_sync_config.as_ref(),
+			self.probing_config.as_ref(),
 			self.async_payments_role,
-			self.recovery_mode,
+			self.custom_gossip_enabled,
 			seed_bytes,
 			runtime,
 			logger,
@@ -889,7 +1002,7 @@ impl NodeBuilder {
 /// - [`build`] uses an SQLite database (recommended default).
 /// - [`build_with_fs_store`] uses a filesystem-based store.
 /// - [`build_with_vss_store`] and variants use a [VSS] remote store (**experimental**).
-/// - [`build_with_store`] allows providing a custom [`KVStore`] implementation.
+/// - [`build_with_store`] allows providing a custom [`PaginatedKVStore`] implementation.
 ///
 /// ### Logging
 ///
@@ -905,7 +1018,7 @@ impl NodeBuilder {
 /// [`build_with_vss_store`]: Self::build_with_vss_store
 /// [`build_with_store`]: Self::build_with_store
 /// [VSS]: https://github.com/lightningdevkit/vss-server/blob/main/README.md
-/// [`KVStore`]: lightning::util::persist::KVStore
+/// [`PaginatedKVStore`]: lightning::util::persist::PaginatedKVStore
 /// [`DEFAULT_LOG_LEVEL`]: crate::config::DEFAULT_LOG_LEVEL
 /// [`set_filesystem_logger`]: Self::set_filesystem_logger
 /// [`set_log_facade_logger`]: Self::set_log_facade_logger
@@ -979,14 +1092,20 @@ impl ArcedNodeBuilder {
 	/// ## Parameters:
 	/// * `rpc_host`, `rpc_port`, `rpc_user`, `rpc_password` - Required parameters for the Bitcoin Core RPC
 	///   connection.
+	/// * `wallet_rescan_from_height` - Optional wallet birthday height to rescan from on first
+	///   startup, before wallet state exists. Existing wallets are not rewound. The height must
+	///   be at or below the current tip. Passing `Some(0)` rescans from genesis; passing `None`
+	///   checkpoints at the current tip.
 	pub fn set_chain_source_bitcoind_rpc(
 		&self, rpc_host: String, rpc_port: u16, rpc_user: String, rpc_password: String,
+		wallet_rescan_from_height: Option<u32>,
 	) {
 		self.inner.write().expect("lock").set_chain_source_bitcoind_rpc(
 			rpc_host,
 			rpc_port,
 			rpc_user,
 			rpc_password,
+			wallet_rescan_from_height,
 		);
 	}
 
@@ -999,9 +1118,13 @@ impl ArcedNodeBuilder {
 	/// * `rest_host`, `rest_port` - Required parameters for the Bitcoin Core REST connection.
 	/// * `rpc_host`, `rpc_port`, `rpc_user`, `rpc_password` - Required parameters for the Bitcoin Core RPC
 	///   connection
+	/// * `wallet_rescan_from_height` - Optional wallet birthday height to rescan from on first
+	///   startup, before wallet state exists. Existing wallets are not rewound. The height must
+	///   be at or below the current tip. Passing `Some(0)` rescans from genesis; passing `None`
+	///   checkpoints at the current tip.
 	pub fn set_chain_source_bitcoind_rest(
 		&self, rest_host: String, rest_port: u16, rpc_host: String, rpc_port: u16,
-		rpc_user: String, rpc_password: String,
+		rpc_user: String, rpc_password: String, wallet_rescan_from_height: Option<u32>,
 	) {
 		self.inner.write().expect("lock").set_chain_source_bitcoind_rest(
 			rest_host,
@@ -1010,6 +1133,7 @@ impl ArcedNodeBuilder {
 			rpc_port,
 			rpc_user,
 			rpc_password,
+			wallet_rescan_from_height,
 		);
 	}
 
@@ -1032,32 +1156,29 @@ impl ArcedNodeBuilder {
 		self.inner.write().expect("lock").set_pathfinding_scores_source(url);
 	}
 
-	/// Configures the [`Node`] instance to source inbound liquidity from the given
-	/// [bLIP-51 / LSPS1] service.
+	/// Configures the [`Node`] instance to source inbound liquidity from the given LSP.
 	///
-	/// Will mark the LSP as trusted for 0-confirmation channels, see [`Config::trusted_peers_0conf`].
-	///
-	/// The given `token` will be used by the LSP to authenticate the user.
-	///
-	/// [bLIP-51 / LSPS1]: https://github.com/lightning/blips/blob/master/blip-0051.md
-	pub fn set_liquidity_source_lsps1(
-		&self, node_id: PublicKey, address: SocketAddress, token: Option<String>,
-	) {
-		self.inner.write().expect("lock").set_liquidity_source_lsps1(node_id, address, token);
-	}
-
-	/// Configures the [`Node`] instance to source just-in-time inbound liquidity from the given
-	/// [bLIP-52 / LSPS2] service.
-	///
-	/// Will mark the LSP as trusted for 0-confirmation channels, see [`Config::trusted_peers_0conf`].
+	/// The node will discover the LSP's supported protocols (LSPS1/LSPS2) on startup via [bLIP-50 / LSPS0]
+	/// and select the appropriate protocol per request automatically.
 	///
 	/// The given `token` will be used by the LSP to authenticate the user.
+	/// `trust_peer_0conf` controls whether the node will additionally accept
+	/// 0-confirmation channels opened by this LSP. If `false`, 0-confirmation
+	/// acceptance for this peer falls back to [`Config::trusted_peers_0conf`].
 	///
-	/// [bLIP-52 / LSPS2]: https://github.com/lightning/blips/blob/master/blip-0052.md
-	pub fn set_liquidity_source_lsps2(
+	/// May be called multiple times to register several LSPs. Duplicate `node_id`s are ignored.
+	///
+	/// [bLIP-50 / LSPS0]: https://github.com/lightning/blips/blob/master/blip-0050.md
+	pub fn add_liquidity_source(
 		&self, node_id: PublicKey, address: SocketAddress, token: Option<String>,
+		trust_peer_0conf: bool,
 	) {
-		self.inner.write().expect("lock").set_liquidity_source_lsps2(node_id, address, token);
+		self.inner.write().expect("lock").add_liquidity_source(
+			node_id,
+			address,
+			token,
+			trust_peer_0conf,
+		);
 	}
 
 	/// Configures the [`Node`] instance to provide an [LSPS2] service, issuing just-in-time
@@ -1066,8 +1187,19 @@ impl ArcedNodeBuilder {
 	/// **Caution**: LSP service support is in **alpha** and is considered an experimental feature.
 	///
 	/// [LSPS2]: https://github.com/BitcoinAndLightningLayerSpecs/lsp/blob/main/LSPS2/README.md
-	pub fn set_liquidity_provider_lsps2(&self, service_config: LSPS2ServiceConfig) {
-		self.inner.write().expect("lock").set_liquidity_provider_lsps2(service_config);
+	pub fn enable_liquidity_provider(&self, lsps2_service_config: LSPS2ServiceConfig) {
+		self.inner.write().expect("lock").enable_liquidity_provider(lsps2_service_config);
+	}
+
+	/// Enables custom gossip message support for the [`Node`] instance.
+	///
+	/// When enabled, the node will be able to send and receive custom gossip messages
+	/// containing metadata extensions to the standard Lightning gossip protocol.
+	///
+	/// Custom gossip messages use message type 32769 and can contain arbitrary metadata
+	/// up to 4096 bytes in length.
+	pub fn enable_custom_gossip(&self) {
+		self.inner.write().unwrap().enable_custom_gossip();
 	}
 
 	/// Sets the used storage directory path.
@@ -1155,13 +1287,13 @@ impl ArcedNodeBuilder {
 		self.inner.write().expect("lock").set_async_payments_role(role).map(|_| ())
 	}
 
-	/// Configures the [`Node`] to resync chain data from genesis on first startup, recovering any
-	/// historical wallet funds.
+	/// Configures background probing.
 	///
-	/// This should only be set on first startup when importing an older wallet from a previously
-	/// used [`NodeEntropy`].
-	pub fn set_wallet_recovery_mode(&self) {
-		self.inner.write().expect("lock").set_wallet_recovery_mode();
+	/// Use [`ProbingConfigBuilder`] to build the configuration.
+	///
+	/// [`ProbingConfigBuilder`]: crate::probing::ProbingConfigBuilder
+	pub fn set_probing_config(&self, config: Arc<ProbingConfig>) {
+		self.inner.write().expect("lock").set_probing_config((*config).clone());
 	}
 
 	/// Builds a [`Node`] instance with a [`SqliteStore`] backend and according to the options
@@ -1346,7 +1478,7 @@ impl ArcedNodeBuilder {
 	/// Builds a [`Node`] instance according to the options previously configured.
 	// Note that the generics here don't actually work for Uniffi, but we don't currently expose
 	// this so its not needed.
-	pub fn build_with_store<S: KVStore + Send + Sync + 'static>(
+	pub fn build_with_store<S: PaginatedKVStore + Send + Sync + 'static>(
 		&self, node_entropy: Arc<NodeEntropy>, kv_store: S,
 	) -> Result<Arc<Node>, BuildError> {
 		self.inner.read().expect("lock").build_with_store(*node_entropy, kv_store).map(Arc::new)
@@ -1356,11 +1488,12 @@ impl ArcedNodeBuilder {
 /// Builds a [`Node`] instance according to the options previously configured.
 fn build_with_store_internal(
 	config: Arc<Config>, chain_data_source_config: Option<&ChainDataSourceConfig>,
-	gossip_source_config: Option<&GossipSourceConfig>,
+	cbf_chain_service_hooks: ChainServiceHooks, gossip_source_config: Option<&GossipSourceConfig>,
 	liquidity_source_config: Option<&LiquiditySourceConfig>,
 	pathfinding_scores_sync_config: Option<&PathfindingScoresSyncConfig>,
-	async_payments_role: Option<AsyncPaymentsRole>, recovery_mode: bool, seed_bytes: [u8; 64],
-	runtime: Arc<Runtime>, logger: Arc<Logger>, kv_store: Arc<DynStore>,
+	probing_config: Option<&ProbingConfig>, async_payments_role: Option<AsyncPaymentsRole>,
+	custom_gossip_enabled: bool, seed_bytes: [u8; 64], runtime: Arc<Runtime>, logger: Arc<Logger>,
+	kv_store: Arc<DynStore>,
 ) -> Result<Node, BuildError> {
 	optionally_install_rustls_cryptoprovider();
 
@@ -1470,12 +1603,31 @@ fn build_with_store_internal(
 				Arc::clone(&node_metrics),
 			)
 		},
+		Some(ChainDataSourceConfig::Cbf {
+			peers,
+			fee_source_config,
+			wallet_rescan_from_height,
+		}) => ChainSource::new_cbf(
+			peers.clone(),
+			fee_source_config.clone(),
+			*wallet_rescan_from_height,
+			Arc::clone(&runtime),
+			Arc::clone(&fee_estimator),
+			Arc::clone(&tx_broadcaster),
+			Arc::clone(&kv_store),
+			Arc::clone(&config),
+			Arc::clone(&logger),
+			Arc::clone(&node_metrics),
+			cbf_chain_service_hooks.clone(),
+		)
+		.map_err(|_| BuildError::ChainSourceSetupFailed)?,
 		Some(ChainDataSourceConfig::Bitcoind {
 			rpc_host,
 			rpc_port,
 			rpc_user,
 			rpc_password,
 			rest_client_config,
+			..
 		}) => match rest_client_config {
 			Some(rest_client_config) => runtime.block_on(async {
 				ChainSource::new_bitcoind_rest(
@@ -1529,6 +1681,12 @@ fn build_with_store_internal(
 		},
 	};
 	let chain_source = Arc::new(chain_source);
+	let wallet_rescan_from_height = match chain_data_source_config {
+		Some(ChainDataSourceConfig::Bitcoind { wallet_rescan_from_height, .. }) => {
+			*wallet_rescan_from_height
+		},
+		_ => None,
+	};
 
 	// Initialize the on-chain wallet and chain access
 	let xprv = bitcoin::bip32::Xpriv::new_master(config.network, &seed_bytes).map_err(|e| {
@@ -1571,8 +1729,76 @@ fn build_with_store_internal(
 			},
 		})?;
 	let bdk_wallet = match wallet_opt {
-		Some(wallet) => wallet,
+		Some(mut wallet) => {
+			// `wallet_rescan_from_height`, when set, applies only while the wallet's
+			// persisted chain state is still rooted at genesis. Rewinding a wallet with a
+			// persisted block is not just replacing BDK's best block: its local-chain and
+			// tx-graph changesets are already persisted, and LDK state may also have synced
+			// to a later tip. A safe rewind needs an explicit recovery flow that invalidates
+			// all dependent state before replaying blocks.
+			//
+			// One exception heals the crash window between wallet creation and the initial
+			// checkpoint persist: a CBF wallet whose chain state never persisted a block
+			// past genesis is re-anchored at the compiled birthday checkpoint. The
+			// anchor is a deterministic constant, so this is exactly the checkpoint the
+			// wallet received at creation; without it, listeners already persisted at the
+			// birthday would latch divergence against the genesis-rooted wallet on every
+			// subsequent start.
+			if wallet.latest_checkpoint().height() == 0
+				&& matches!(chain_data_source_config, Some(ChainDataSourceConfig::Cbf { .. }))
+			{
+				if let Some(best_block) = chain_tip_opt {
+					let block_id = bdk_chain::BlockId {
+						height: best_block.height,
+						hash: best_block.block_hash,
+					};
+					let latest_checkpoint = wallet.latest_checkpoint().insert(block_id);
+					let update =
+						bdk_wallet::Update { chain: Some(latest_checkpoint), ..Default::default() };
+					wallet.apply_update(update).map_err(|e| {
+						log_error!(
+							logger,
+							"Failed to re-apply the wallet birthday checkpoint: {}",
+							e
+						);
+						BuildError::WalletSetupFailed
+					})?;
+					runtime.block_on(wallet.persist_async(&mut wallet_persister)).map_err(|e| {
+						log_error!(
+							logger,
+							"Failed to persist the wallet birthday checkpoint: {}",
+							e
+						);
+						BuildError::WalletSetupFailed
+					})?;
+					log_info!(
+						logger,
+						"Re-anchored an unscanned wallet at the configured CBF birthday (height {}).",
+						best_block.height
+					);
+				}
+			}
+			wallet
+		},
 		None => {
+			// Guard against silently setting the wallet birthday to genesis on a fresh node:
+			// if we are creating a new wallet but failed to learn the current chain tip from
+			// a Bitcoin Core RPC/REST backend, we'd otherwise persist fresh wallet state
+			// pinned at height 0 and force a full-history rescan once the backend comes back.
+			// Abort cleanly instead so the misconfiguration surfaces on the first startup.
+			// Esplora/Electrum backends currently never return a tip at build time, so they
+			// retain their existing behavior.
+			if wallet_rescan_from_height.is_none()
+				&& chain_tip_opt.is_none()
+				&& matches!(chain_data_source_config, Some(ChainDataSourceConfig::Bitcoind { .. }))
+			{
+				log_error!(
+					logger,
+					"Failed to determine chain tip on first startup. Aborting to avoid pinning the wallet birthday to genesis."
+				);
+				return Err(BuildError::ChainTipFetchFailed);
+			}
+
 			let mut wallet = runtime
 				.block_on(async {
 					BdkWallet::create(descriptor, change_descriptor)
@@ -1585,23 +1811,75 @@ fn build_with_store_internal(
 					BuildError::WalletSetupFailed
 				})?;
 
-			if !recovery_mode {
-				if let Some(best_block) = chain_tip_opt {
-					// Insert the first checkpoint if we have it, to avoid resyncing from genesis.
-					// TODO: Use a proper wallet birthday once BDK supports it.
-					let mut latest_checkpoint = wallet.latest_checkpoint();
-					let block_id = bdk_chain::BlockId {
-						height: best_block.height,
-						hash: best_block.block_hash,
-					};
-					latest_checkpoint = latest_checkpoint.insert(block_id);
-					let update =
-						bdk_wallet::Update { chain: Some(latest_checkpoint), ..Default::default() };
-					wallet.apply_update(update).map_err(|e| {
-						log_error!(logger, "Failed to apply checkpoint during wallet setup: {}", e);
+			// Decide which block (if any) to insert as the initial BDK checkpoint. If the
+			// bitcoind config provides a wallet rescan height, resolve that block and use it as
+			// the checkpoint. Otherwise, use the current chain tip to avoid any rescan.
+			let checkpoint_block = match wallet_rescan_from_height {
+				None => chain_tip_opt,
+				Some(height) => {
+					if let Some(chain_tip) = chain_tip_opt {
+						if height > chain_tip.height {
+							log_error!(
+								logger,
+								"Wallet rescan height {} is above current chain tip {}.",
+								height,
+								chain_tip.height
+							);
+							return Err(BuildError::WalletRescanHeightTooHigh);
+						}
+					}
+
+					let utxo_source = chain_source.as_utxo_source().ok_or_else(|| {
+						log_error!(
+							logger,
+							"Wallet rescan height requested but the chain source does not support block-by-height lookups.",
+						);
 						BuildError::WalletSetupFailed
 					})?;
-				}
+					let hash_res = runtime.block_on(async {
+						lightning_block_sync::gossip::UtxoSource::get_block_hash_by_height(
+							&utxo_source,
+							height,
+						)
+						.await
+					});
+					match hash_res {
+						Ok(hash) => Some(BlockLocator::new(hash, height)),
+						Err(e) => {
+							log_error!(
+								logger,
+								"Failed to resolve block hash at height {} for wallet rescan: {:?}",
+								height,
+								e,
+							);
+							return Err(BuildError::WalletSetupFailed);
+						},
+					}
+				},
+			};
+
+			if let Some(best_block) = checkpoint_block {
+				// Insert the checkpoint so BDK starts scanning from there instead of from
+				// genesis.
+				// TODO: Use a proper wallet birthday once BDK supports it.
+				let mut latest_checkpoint = wallet.latest_checkpoint();
+				let block_id =
+					bdk_chain::BlockId { height: best_block.height, hash: best_block.block_hash };
+				latest_checkpoint = latest_checkpoint.insert(block_id);
+				let update =
+					bdk_wallet::Update { chain: Some(latest_checkpoint), ..Default::default() };
+				wallet.apply_update(update).map_err(|e| {
+					log_error!(logger, "Failed to apply checkpoint during wallet setup: {}", e);
+					BuildError::WalletSetupFailed
+				})?;
+				// `apply_update` only stages the checkpoint. Persist it now: a crash before
+				// the first persisted block would otherwise resurrect a genesis-rooted
+				// wallet next to listeners already initialized at the checkpoint, which the
+				// CBF divergence gate then latches on every subsequent start.
+				runtime.block_on(wallet.persist_async(&mut wallet_persister)).map_err(|e| {
+					log_error!(logger, "Failed to persist checkpoint during wallet setup: {}", e);
+					BuildError::WalletSetupFailed
+				})?;
 			}
 			wallet
 		},
@@ -1633,6 +1911,8 @@ fn build_with_store_internal(
 		Arc::clone(&logger),
 		Arc::clone(&pending_payment_store),
 	));
+
+	tx_broadcaster.set_wallet(Arc::downgrade(&wallet));
 
 	// Initialize the KeysManager
 	let cur_time = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_err(|e| {
@@ -1932,6 +2212,7 @@ fn build_with_store_internal(
 				Arc::clone(&channel_manager),
 				Arc::clone(&om_resolver),
 				IgnoringMessageHandler {},
+				false,
 			))
 		} else {
 			Arc::new(OnionMessenger::new(
@@ -1975,33 +2256,19 @@ fn build_with_store_internal(
 		},
 	};
 
-	let (liquidity_source, custom_message_handler) =
+	let (liquidity_source, custom_message_handler) = {
+		let mut liquidity_source_builder = LiquiditySourceBuilder::new(
+			Arc::clone(&wallet),
+			Arc::clone(&channel_manager),
+			Arc::clone(&keys_manager),
+			Arc::clone(&tx_broadcaster),
+			Arc::clone(&kv_store),
+			Arc::clone(&config),
+			Arc::clone(&logger),
+		);
+
 		if let Some(lsc) = liquidity_source_config.as_ref() {
-			let mut liquidity_source_builder = LiquiditySourceBuilder::new(
-				Arc::clone(&wallet),
-				Arc::clone(&channel_manager),
-				Arc::clone(&keys_manager),
-				Arc::clone(&tx_broadcaster),
-				Arc::clone(&kv_store),
-				Arc::clone(&config),
-				Arc::clone(&logger),
-			);
-
-			lsc.lsps1_client.as_ref().map(|config| {
-				liquidity_source_builder.lsps1_client(
-					config.node_id,
-					config.address.clone(),
-					config.token.clone(),
-				)
-			});
-
-			lsc.lsps2_client.as_ref().map(|config| {
-				liquidity_source_builder.lsps2_client(
-					config.node_id,
-					config.address.clone(),
-					config.token.clone(),
-				)
-			});
+			liquidity_source_builder.set_lsp_nodes(lsc.lsp_nodes.clone());
 
 			let promise_secret = {
 				let lsps_xpriv = derive_xprv(
@@ -2015,15 +2282,27 @@ fn build_with_store_internal(
 			lsc.lsps2_service.as_ref().map(|config| {
 				liquidity_source_builder.lsps2_service(promise_secret, config.clone())
 			});
+		}
 
-			let liquidity_source = runtime
-				.block_on(async move { liquidity_source_builder.build().await.map(Arc::new) })?;
-			let custom_message_handler =
-				Arc::new(NodeCustomMessageHandler::new_liquidity(Arc::clone(&liquidity_source)));
-			(Some(liquidity_source), custom_message_handler)
+		let liquidity_source = runtime
+			.block_on(async move { liquidity_source_builder.build().await.map(Arc::new) })?;
+
+		// The liquidity handler is always wired up; custom gossip rides alongside it when enabled.
+		let custom_message_handler = if custom_gossip_enabled {
+			let gossip_handler = Arc::new(CustomGossipMessageHandler::new(Arc::clone(&logger)));
+			Arc::new(NodeCustomMessageHandler::new_combined(
+				Arc::clone(&liquidity_source),
+				gossip_handler,
+			))
 		} else {
-			(None, Arc::new(NodeCustomMessageHandler::new_ignoring()))
+			Arc::new(NodeCustomMessageHandler::new_liquidity(Arc::clone(&liquidity_source)))
 		};
+
+		(liquidity_source, custom_message_handler)
+	};
+
+	// Extract custom gossip handler for later use
+	let custom_gossip_handler = custom_message_handler.custom_gossip_handler();
 
 	let msg_handler = match gossip_source.as_gossip_sync() {
 		GossipSync::P2P(p2p_gossip_sync) => MessageHandler {
@@ -2072,7 +2351,7 @@ fn build_with_store_internal(
 		}));
 	}
 
-	liquidity_source.as_ref().map(|l| l.set_peer_manager(Arc::downgrade(&peer_manager)));
+	liquidity_source.lsps2_service().set_peer_manager(Arc::downgrade(&peer_manager));
 
 	let connection_manager = Arc::new(ConnectionManager::new(
 		Arc::clone(&peer_manager),
@@ -2152,6 +2431,51 @@ fn build_with_store_internal(
 		_leak_checker.0.push(Arc::downgrade(&wallet) as Weak<dyn Any + Send + Sync>);
 	}
 
+	let prober = probing_config.map(|probing_cfg| {
+		let strategy: Arc<dyn ProbingStrategy> = match &probing_cfg.kind {
+			ProbingStrategyKind::HighDegree { top_node_count } => {
+				// Dedicated router for probing so the diversity penalty doesn't interfere
+				// with real payments; shares the scorer so probe results still train it.
+				let mut probing_fee_params = ProbabilisticScoringFeeParameters::default();
+				if let Some(penalty) = probing_cfg.diversity_penalty_msat {
+					probing_fee_params.probing_diversity_penalty_msat = penalty;
+				}
+				let probing_router = Arc::new(DefaultRouter::new(
+					Arc::clone(&network_graph),
+					Arc::clone(&logger),
+					Arc::clone(&keys_manager),
+					Arc::clone(&scorer),
+					probing_fee_params,
+				));
+				Arc::new(HighDegreeStrategy::new(
+					Arc::clone(&network_graph),
+					Arc::clone(&channel_manager),
+					probing_router,
+					*top_node_count,
+					DEFAULT_MIN_PROBE_AMOUNT_MSAT,
+					DEFAULT_MAX_PROBE_AMOUNT_MSAT,
+					probing_cfg.cooldown,
+					config.probing_liquidity_limit_multiplier,
+				))
+			},
+			ProbingStrategyKind::RandomWalk { max_hops } => Arc::new(RandomWalkStrategy::new(
+				Arc::clone(&network_graph),
+				Arc::clone(&channel_manager),
+				*max_hops,
+				DEFAULT_MIN_PROBE_AMOUNT_MSAT,
+				DEFAULT_MAX_PROBE_AMOUNT_MSAT,
+			)),
+			ProbingStrategyKind::Custom(s) => Arc::clone(s),
+		};
+		Arc::new(Prober {
+			channel_manager: Arc::clone(&channel_manager),
+			logger: Arc::clone(&logger),
+			strategy,
+			interval: probing_cfg.interval,
+			max_locked_msat: probing_cfg.max_locked_msat,
+		})
+	});
+
 	Ok(Node {
 		runtime,
 		stop_sender,
@@ -2173,6 +2497,7 @@ fn build_with_store_internal(
 		gossip_source,
 		pathfinding_scores_sync_url,
 		liquidity_source,
+		custom_gossip_handler,
 		kv_store,
 		logger,
 		_router: router,
@@ -2185,8 +2510,11 @@ fn build_with_store_internal(
 		om_mailbox,
 		async_payments_role,
 		hrn_resolver,
+		prober,
 		#[cfg(cycle_tests)]
 		_leak_checker,
+		#[cfg(feature = "swaps")]
+		swap_tx_watch: Arc::new(crate::chain::SwapTxWatch::new()),
 	})
 }
 

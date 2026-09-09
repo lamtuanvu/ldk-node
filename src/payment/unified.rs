@@ -129,9 +129,9 @@ impl UnifiedPayment {
 	pub fn receive(
 		&self, amount_sats: u64, description: &str, expiry_sec: u32,
 	) -> Result<String, Error> {
-		let onchain_address = self.onchain_payment.new_address()?;
+		let amount_msats = amount_sats.checked_mul(1_000).ok_or(Error::InvalidAmount)?;
 
-		let amount_msats = amount_sats * 1_000;
+		let onchain_address = self.onchain_payment.new_address()?;
 
 		let bolt12_offer =
 			match self.bolt12_payment.receive_inner(amount_msats, description, None, None) {
@@ -328,7 +328,10 @@ impl UnifiedPayment {
 						Error::InvalidAmount
 					})?;
 
-					let txid = self.onchain_payment.send_to_address(&address, amt_sats, None)?;
+					let txid = self
+						.onchain_payment
+						.send_to_address_inner(&address, amt_sats, None)
+						.await?;
 					return Ok(UnifiedPaymentResult::Onchain { txid });
 				},
 			}

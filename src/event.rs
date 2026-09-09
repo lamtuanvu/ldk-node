@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 use bitcoin::blockdata::locktime::absolute::LockTime;
 use bitcoin::secp256k1::PublicKey;
 use bitcoin::{Amount, OutPoint};
+use lightning::blinded_path::message::NextMessageHop;
 use lightning::events::bump_transaction::BumpTransactionEvent;
 #[cfg(not(feature = "uniffi"))]
 use lightning::events::PaidBolt12Invoice;
@@ -33,7 +34,7 @@ use lightning::{impl_writeable_tlv_based, impl_writeable_tlv_based_enum};
 use lightning_liquidity::lsps2::utils::compute_opening_fee;
 use lightning_types::payment::{PaymentHash, PaymentPreimage};
 
-use crate::config::{may_announce_channel, Config};
+use crate::config::{may_announce_channel, Config, PEER_RECONNECTION_INTERVAL};
 use crate::connection::ConnectionManager;
 use crate::data_store::DataStoreUpdateResult;
 use crate::fee_estimator::ConfirmationTarget;
@@ -51,6 +52,7 @@ use crate::payment::store::{
 	PaymentDetails, PaymentDetailsUpdate, PaymentDirection, PaymentKind, PaymentStatus,
 };
 use crate::payment::PaymentMetadata;
+use crate::probing::Prober;
 use crate::runtime::Runtime;
 use crate::types::{
 	CustomTlvRecord, DynStore, KeysManager, OnionMessenger, PaymentStore, Sweeper, Wallet,
@@ -265,9 +267,7 @@ pub enum Event {
 		/// The `user_channel_id` of the channel.
 		user_channel_id: UserChannelId,
 		/// The `node_id` of the channel counterparty.
-		///
-		/// This will be `None` for events serialized by LDK Node v0.1.0 and prior.
-		counterparty_node_id: Option<PublicKey>,
+		counterparty_node_id: PublicKey,
 		/// This will be `None` for events serialized by LDK Node v0.2.1 and prior.
 		reason: Option<ClosureReason>,
 	},
@@ -328,7 +328,7 @@ impl_writeable_tlv_based_enum!(Event,
 	},
 	(5, ChannelClosed) => {
 		(0, channel_id, required),
-		(1, counterparty_node_id, option),
+		(1, counterparty_node_id, required),
 		(2, user_channel_id, required),
 		(3, reason, upgradable_option),
 	},
@@ -533,16 +533,17 @@ where
 	connection_manager: Arc<ConnectionManager<L>>,
 	output_sweeper: Arc<Sweeper>,
 	network_graph: Arc<Graph>,
-	liquidity_source: Option<Arc<LiquiditySource<Arc<Logger>>>>,
+	liquidity_source: Arc<LiquiditySource<Arc<Logger>>>,
 	payment_store: Arc<PaymentStore>,
 	peer_store: Arc<PeerStore<L>>,
 	keys_manager: Arc<KeysManager>,
-	runtime: Arc<Runtime>,
-	logger: L,
-	config: Arc<Config>,
 	static_invoice_store: Option<StaticInvoiceStore>,
 	onion_messenger: Arc<OnionMessenger>,
 	om_mailbox: Option<Arc<OnionMessageMailbox>>,
+	prober: Option<Arc<Prober>>,
+	runtime: Arc<Runtime>,
+	logger: L,
+	config: Arc<Config>,
 }
 
 impl<L: Deref + Clone + Sync + Send + 'static> EventHandler<L>
@@ -554,10 +555,10 @@ where
 		bump_tx_event_handler: Arc<BumpTransactionEventHandler>,
 		channel_manager: Arc<ChannelManager>, connection_manager: Arc<ConnectionManager<L>>,
 		output_sweeper: Arc<Sweeper>, network_graph: Arc<Graph>,
-		liquidity_source: Option<Arc<LiquiditySource<Arc<Logger>>>>,
-		payment_store: Arc<PaymentStore>, peer_store: Arc<PeerStore<L>>,
-		keys_manager: Arc<KeysManager>, static_invoice_store: Option<StaticInvoiceStore>,
-		onion_messenger: Arc<OnionMessenger>, om_mailbox: Option<Arc<OnionMessageMailbox>>,
+		liquidity_source: Arc<LiquiditySource<Arc<Logger>>>, payment_store: Arc<PaymentStore>,
+		peer_store: Arc<PeerStore<L>>, keys_manager: Arc<KeysManager>,
+		static_invoice_store: Option<StaticInvoiceStore>, onion_messenger: Arc<OnionMessenger>,
+		om_mailbox: Option<Arc<OnionMessageMailbox>>, prober: Option<Arc<Prober>>,
 		runtime: Arc<Runtime>, logger: L, config: Arc<Config>,
 	) -> Self {
 		Self {
@@ -572,13 +573,76 @@ where
 			payment_store,
 			peer_store,
 			keys_manager,
-			logger,
-			runtime,
-			config,
 			static_invoice_store,
 			onion_messenger,
 			om_mailbox,
+			prober,
+			runtime,
+			logger,
+			config,
 		}
+	}
+
+	fn remove_peer_after_reconnect(&self, peer_info: PeerInfo, closed_channel_id: ChannelId) {
+		let channel_manager = Arc::clone(&self.channel_manager);
+		let connection_manager = Arc::clone(&self.connection_manager);
+		let peer_store = Arc::clone(&self.peer_store);
+		let logger = self.logger.clone();
+		self.runtime.spawn_cancellable_background_task(async move {
+			let has_other_channels = || {
+				channel_manager
+					.list_channels_with_counterparty(&peer_info.node_id)
+					.iter()
+					.any(|c| c.channel_id != closed_channel_id)
+			};
+
+			if peer_store.get_peer(&peer_info.node_id).is_none() || has_other_channels() {
+				return;
+			}
+
+			// Ensure a connected peer cannot be mistaken for a completed recovery reconnect.
+			// With no other channels left, reconnecting once gives `channel_reestablish` a chance
+			// to retransmit the force-close error before we stop persisting the peer.
+			connection_manager.disconnect_peer(peer_info.node_id);
+
+			loop {
+				if peer_store.get_peer(&peer_info.node_id).is_none() || has_other_channels() {
+					return;
+				}
+
+				match connection_manager
+					.connect_peer_if_necessary(peer_info.node_id, peer_info.address.clone())
+					.await
+				{
+					Ok(()) => {
+						if peer_store.get_peer(&peer_info.node_id).is_none() || has_other_channels()
+						{
+							return;
+						}
+						if let Err(e) = peer_store.remove_peer(&peer_info.node_id).await {
+							log_error!(
+								logger,
+								"Failed to remove peer {} from peer store: {}",
+								peer_info.node_id,
+								e
+							);
+						} else {
+							return;
+						}
+					},
+					Err(e) => {
+						log_debug!(
+							logger,
+							"Failed to reconnect peer {} before removing from peer store: {}",
+							peer_info.node_id,
+							e
+						);
+					},
+				}
+
+				tokio::time::sleep(PEER_RECONNECTION_INTERVAL).await;
+			}
+		});
 	}
 
 	async fn fail_claimable_payment(
@@ -630,29 +694,32 @@ where
 
 				// Sign the final funding transaction and broadcast it.
 				let channel_amount = Amount::from_sat(channel_value_satoshis);
-				match self.wallet.create_funding_transaction(
-					output_script,
-					channel_amount,
-					confirmation_target,
-					locktime,
-				) {
+				let funding_transaction = self
+					.wallet
+					.create_funding_transaction(
+						output_script,
+						channel_amount,
+						confirmation_target,
+						locktime,
+					)
+					.await;
+				match funding_transaction {
 					Ok(final_tx) => {
-						let needs_manual_broadcast =
-							self.liquidity_source.as_ref().map_or(false, |ls| {
-								ls.as_ref().lsps2_channel_needs_manual_broadcast(
-									counterparty_node_id,
-									user_channel_id,
-								)
-							});
+						let needs_manual_broadcast = self
+							.liquidity_source
+							.lsps2_service()
+							.lsps2_channel_needs_manual_broadcast(
+								counterparty_node_id,
+								user_channel_id,
+							);
 
 						let result = if needs_manual_broadcast {
-							self.liquidity_source.as_ref().map(|ls| {
-								ls.lsps2_store_funding_transaction(
-									user_channel_id,
-									counterparty_node_id,
-									final_tx.clone(),
-								);
-							});
+							self.liquidity_source.lsps2_service().lsps2_store_funding_transaction(
+								user_channel_id,
+								counterparty_node_id,
+								final_tx.clone(),
+							);
+
 							self.channel_manager.funding_transaction_generated_manual_broadcast(
 								temporary_channel_id,
 								counterparty_node_id,
@@ -710,9 +777,9 @@ where
 				}
 			},
 			LdkEvent::FundingTxBroadcastSafe { user_channel_id, counterparty_node_id, .. } => {
-				self.liquidity_source.as_ref().map(|ls| {
-					ls.lsps2_funding_tx_broadcast_safe(user_channel_id, counterparty_node_id);
-				});
+				self.liquidity_source
+					.lsps2_service()
+					.lsps2_funding_tx_broadcast_safe(user_channel_id, counterparty_node_id);
 			},
 			LdkEvent::PaymentClaimable {
 				payment_hash,
@@ -726,7 +793,11 @@ where
 				let payment_id = PaymentId(payment_hash.0);
 				let payment_info = self.payment_store.get(&payment_id);
 				if let Some(info) = payment_info.as_ref() {
-					if info.direction == PaymentDirection::Outbound {
+					// Guard 1: refuse circular (self-loop) payments, EXCEPT for
+					// self-rebalance loops tagged as PaymentKind::Rebalance. Cross-node
+					// payments are never caught here (the remote recipient has no local
+					// Outbound record under the inbound hash).
+					if info.direction == PaymentDirection::Outbound && !info.is_rebalance() {
 						log_info!(
 							self.logger,
 							"Refused inbound payment with ID {}: circular payments are unsupported.",
@@ -747,8 +818,13 @@ where
 						};
 					}
 
+					// Guard 2: refuse duplicate Succeeded payments and plain Spontaneous
+					// inbound payments. Self-rebalance loops (PaymentKind::Rebalance) must
+					// fall through here so we can claim the HTLC using our locally-held
+					// preimage and settle the loop.
 					if info.status == PaymentStatus::Succeeded
-						|| matches!(&info.kind, PaymentKind::Spontaneous { .. })
+						|| (matches!(&info.kind, PaymentKind::Spontaneous { .. })
+							&& !info.is_rebalance())
 					{
 						let stored_preimage = match &info.kind {
 							PaymentKind::Bolt11 { preimage, .. }
@@ -846,6 +922,47 @@ where
 				}
 
 				if let Some(info) = payment_info {
+					// For self-rebalance loops the preimage is held locally in the
+					// Rebalance record. Claim immediately without inserting a new
+					// payment record (the outbound record already exists).
+					if let PaymentKind::Rebalance { preimage, .. } = info.kind {
+						// Belt-and-braces amount pin: the stateless inbound registration
+						// already enforces `min_value_msat = amount` before this event can
+						// fire, but never reveal the preimage for less than the recorded
+						// loop amount.
+						if amount_msat < info.amount_msat.unwrap_or(0) {
+							log_error!(
+								self.logger,
+								"Refusing underpaying self-rebalance HTLC for payment hash {}: got {}msat, expected {}msat",
+								hex_utils::to_string(&payment_hash.0),
+								amount_msat,
+								info.amount_msat.unwrap_or(0),
+							);
+							self.channel_manager.fail_htlc_backwards(&payment_hash);
+							return Ok(());
+						}
+						log_info!(
+							self.logger,
+							"Claiming self-rebalance loop for payment hash {} of {}msat",
+							hex_utils::to_string(&payment_hash.0),
+							amount_msat,
+						);
+						self.channel_manager.claim_funds(preimage);
+
+						let update = PaymentDetailsUpdate {
+							status: Some(PaymentStatus::Succeeded),
+							amount_msat: Some(Some(amount_msat)),
+							..PaymentDetailsUpdate::new(payment_id)
+						};
+						match self.payment_store.update(update).await {
+							Ok(_) => return Ok(()),
+							Err(e) => {
+								log_error!(self.logger, "Failed to access payment store: {}", e);
+								return Err(ReplayEvent());
+							},
+						};
+					}
+
 					// If this is known by the store but ChannelManager doesn't know the preimage,
 					// the payment has been registered via `_for_hash` variants and needs to be manually claimed via
 					// user interaction.
@@ -1210,12 +1327,21 @@ where
 
 			LdkEvent::PaymentPathSuccessful { .. } => {},
 			LdkEvent::PaymentPathFailed { .. } => {},
-			LdkEvent::ProbeSuccessful { .. } => {},
-			LdkEvent::ProbeFailed { .. } => {},
-			LdkEvent::HTLCHandlingFailed { failure_type, .. } => {
-				if let Some(liquidity_source) = self.liquidity_source.as_ref() {
-					liquidity_source.handle_htlc_handling_failed(failure_type).await;
+			LdkEvent::ProbeSuccessful { path, payment_id, .. } => {
+				if let Some(prober) = &self.prober {
+					prober.handle_background_probe_successful(&path, payment_id);
 				}
+			},
+			LdkEvent::ProbeFailed { path, payment_id, .. } => {
+				if let Some(prober) = &self.prober {
+					prober.handle_background_probe_failed(&path, payment_id);
+				}
+			},
+			LdkEvent::HTLCHandlingFailed { failure_type, .. } => {
+				self.liquidity_source
+					.lsps2_service()
+					.handle_htlc_handling_failed(failure_type)
+					.await;
 			},
 			LdkEvent::SpendableOutputs { outputs, channel_id, counterparty_node_id } => {
 				match self
@@ -1256,25 +1382,7 @@ where
 					}
 				}
 
-				let anchor_channel = channel_type.requires_anchors_zero_fee_htlc_tx();
-				if anchor_channel && self.config.anchor_channels_config.is_none() {
-					log_error!(
-						self.logger,
-						"Rejecting inbound channel from peer {} due to Anchor channels being disabled.",
-						counterparty_node_id,
-					);
-					self.channel_manager
-						.force_close_broadcasting_latest_txn(
-							&temporary_channel_id,
-							&counterparty_node_id,
-							"Channel request rejected".to_string(),
-						)
-						.unwrap_or_else(|e| {
-							log_error!(self.logger, "Failed to reject channel: {:?}", e)
-						});
-					return Ok(());
-				}
-
+				let anchor_channel = crate::requires_anchor_channel_type(&channel_type);
 				let required_reserve_sats = crate::new_channel_anchor_reserve_sats(
 					&self.config,
 					&counterparty_node_id,
@@ -1315,35 +1423,36 @@ where
 						.try_into()
 						.expect("slice is exactly 16 bytes"),
 				);
-				let allow_0conf = self.config.trusted_peers_0conf.contains(&counterparty_node_id);
+				let mut allow_0conf =
+					self.config.trusted_peers_0conf.contains(&counterparty_node_id);
 				let mut channel_override_config = None;
-				if let Some((lsp_node_id, _)) = self
-					.liquidity_source
-					.as_ref()
-					.and_then(|ls| ls.as_ref().get_lsps2_lsp_details())
-				{
-					if lsp_node_id == counterparty_node_id {
-						// When we're an LSPS2 client, allow claiming underpaying HTLCs as the LSP will skim off some fee. We'll
-						// check that they don't take too much before claiming.
-						channel_override_config = Some(ChannelConfigOverrides {
-							update_overrides: Some(ChannelConfigUpdate {
-								accept_underpaying_htlcs: Some(true),
-								..Default::default()
-							}),
-							..Default::default()
-						});
 
-						// LSPS2 channels are unannounced; rely on LDK's default of 100%
-						// inbound HTLC value-in-flight so the LSP can forward the initial
-						// payment in full.
-						debug_assert_eq!(
-							self.channel_manager
-								.get_current_config()
-								.channel_handshake_config
-								.unannounced_channel_max_inbound_htlc_value_in_flight_percentage,
-							100
-						);
-					}
+				// If the peer is a configured LSP node, additionally honor its trust_peer_0conf flag.
+				if let Some(lsp) =
+					self.liquidity_source.get_lsp_config(&counterparty_node_id, 2).await
+				{
+					allow_0conf = allow_0conf || lsp.trust_peer_0conf;
+
+					// When we're an LSPS2 client, allow claiming underpaying HTLCs as the LSP will skim off some fee. We'll
+					// check that they don't take too much before claiming.
+					channel_override_config = Some(ChannelConfigOverrides {
+						update_overrides: Some(ChannelConfigUpdate {
+							accept_underpaying_htlcs: Some(true),
+							..Default::default()
+						}),
+						..Default::default()
+					});
+
+					// LSPS2 channels are unannounced; rely on LDK's default of 100%
+					// inbound HTLC value-in-flight so the LSP can forward the initial
+					// payment in full.
+					debug_assert_eq!(
+						self.channel_manager
+							.get_current_config()
+							.channel_handshake_config
+							.unannounced_channel_max_inbound_htlc_value_in_flight_percentage,
+						100
+					);
 				}
 				let res = if allow_0conf {
 					self.channel_manager.accept_inbound_channel_from_trusted_peer(
@@ -1468,13 +1577,15 @@ where
 						"unexpected skimmed fee for trampoline forward, fee may be double counted"
 					);
 				}
-				if let Some(liquidity_source) = self.liquidity_source.as_ref() {
-					let skimmed_fee_msat = skimmed_fee_msat.unwrap_or(0);
-					for next_htlc in next_htlcs.iter() {
-						liquidity_source
-							.handle_payment_forwarded(Some(next_htlc.channel_id), skimmed_fee_msat)
-							.await;
-					}
+
+				for next_htlc in next_htlcs.iter() {
+					self.liquidity_source
+						.lsps2_service()
+						.handle_payment_forwarded(
+							Some(next_htlc.channel_id),
+							skimmed_fee_msat.unwrap_or(0),
+						)
+						.await;
 				}
 
 				let event = Event::PaymentForwarded {
@@ -1582,11 +1693,10 @@ where
 					);
 				}
 
-				if let Some(liquidity_source) = self.liquidity_source.as_ref() {
-					liquidity_source
-						.handle_channel_ready(user_channel_id, &channel_id, &counterparty_node_id)
-						.await;
-				}
+				self.liquidity_source
+					.lsps2_service()
+					.handle_channel_ready(user_channel_id, &channel_id, &counterparty_node_id)
+					.await;
 
 				let event = Event::ChannelReady {
 					channel_id,
@@ -1611,6 +1721,43 @@ where
 			} => {
 				log_info!(self.logger, "Channel {} closed due to: {}", channel_id, reason);
 
+				// `counterparty_node_id` has been set on every `ChannelClosed` since LDK 0.0.117.
+				let counterparty_node_id = counterparty_node_id
+					.expect("counterparty_node_id is always set since LDK 0.0.117");
+
+				// Drop the peer once its last channel with us has reached a terminal state.
+				// For `HolderForceClosed`, retain it through one recovery reconnect so that
+				// `channel_reestablish` can retransmit the force-close error before cleanup.
+				// This also cleans up peers persisted for a channel that closed before funding
+				// (e.g. `CounterpartyCoopClosedUnfundedChannel`), which would otherwise be
+				// retried forever.
+				// We exclude `channel_id` from the count because LDK emits `ChannelClosed`
+				// before removing it from its internal list.
+				let has_other_channels = self
+					.channel_manager
+					.list_channels_with_counterparty(&counterparty_node_id)
+					.iter()
+					.any(|c| c.channel_id != channel_id);
+
+				let peer_to_reconnect = if !has_other_channels {
+					if matches!(reason, ClosureReason::HolderForceClosed { .. }) {
+						self.peer_store.get_peer(&counterparty_node_id)
+					} else {
+						if let Err(e) = self.peer_store.remove_peer(&counterparty_node_id).await {
+							log_error!(
+								self.logger,
+								"Failed to remove peer {} from peer store: {}",
+								counterparty_node_id,
+								e
+							);
+							return Err(ReplayEvent());
+						}
+						None
+					}
+				} else {
+					None
+				};
+
 				let event = Event::ChannelClosed {
 					channel_id,
 					user_channel_id: UserChannelId(user_channel_id),
@@ -1625,6 +1772,10 @@ where
 						return Err(ReplayEvent());
 					},
 				};
+
+				if let Some(peer_info) = peer_to_reconnect {
+					self.remove_peer_after_reconnect(peer_info, channel_id);
+				}
 			},
 			LdkEvent::DiscardFunding { channel_id, funding_info } => {
 				if let FundingInfo::Contribution { inputs: _, outputs } = funding_info {
@@ -1646,7 +1797,7 @@ where
 							})
 							.collect(),
 					};
-					if let Err(e) = self.wallet.cancel_tx(&tx) {
+					if let Err(e) = self.wallet.cancel_tx(tx).await {
 						log_error!(self.logger, "Failed reclaiming unused addresses: {}", e);
 						return Err(ReplayEvent());
 					}
@@ -1659,16 +1810,15 @@ where
 				payment_hash,
 				..
 			} => {
-				if let Some(liquidity_source) = self.liquidity_source.as_ref() {
-					liquidity_source
-						.handle_htlc_intercepted(
-							requested_next_hop_scid,
-							intercept_id,
-							expected_outbound_amount_msat,
-							payment_hash,
-						)
-						.await;
-				}
+				self.liquidity_source
+					.lsps2_service()
+					.handle_htlc_intercepted(
+						requested_next_hop_scid,
+						intercept_id,
+						expected_outbound_amount_msat,
+						payment_hash,
+					)
+					.await;
 			},
 			LdkEvent::InvoiceReceived { .. } => {
 				debug_assert!(false, "We currently don't handle BOLT12 invoices manually, so this event should never be emitted.");
@@ -1704,19 +1854,17 @@ where
 						..
 					} => {
 						// Skip bumping channel closes if our counterparty is trusted.
-						if let Some(anchor_channels_config) =
-							self.config.anchor_channels_config.as_ref()
+						if self
+							.config
+							.anchor_channels_config
+							.trusted_peers_no_reserve
+							.contains(counterparty_node_id)
 						{
-							if anchor_channels_config
-								.trusted_peers_no_reserve
-								.contains(counterparty_node_id)
-							{
-								log_debug!(self.logger,
-									"Ignoring BumpTransactionEvent::ChannelClose for channel {} due to trusted counterparty {}",
-									channel_id, counterparty_node_id
-								);
-								return Ok(());
-							}
+							log_debug!(self.logger,
+								"Ignoring BumpTransactionEvent::ChannelClose for channel {} due to trusted counterparty {}",
+								channel_id, counterparty_node_id
+							);
+							return Ok(());
 						}
 					},
 					BumpTransactionEvent::HTLCResolution { .. } => {},
@@ -1724,14 +1872,18 @@ where
 
 				self.bump_tx_event_handler.handle_event(&bte).await;
 			},
-			LdkEvent::OnionMessageIntercepted { peer_node_id, message } => {
-				if let Some(om_mailbox) = self.om_mailbox.as_ref() {
-					om_mailbox.onion_message_intercepted(peer_node_id, message);
+			LdkEvent::OnionMessageIntercepted { next_hop, message, .. } => {
+				if let NextMessageHop::NodeId(peer_node_id) = next_hop {
+					if let Some(om_mailbox) = self.om_mailbox.as_ref() {
+						om_mailbox.onion_message_intercepted(peer_node_id, message);
+					} else {
+						log_trace!(
+							self.logger,
+							"Onion message intercepted, but no onion message mailbox available"
+						);
+					}
 				} else {
-					log_trace!(
-						self.logger,
-						"Onion message intercepted, but no onion message mailbox available"
-					);
+					log_error!(self.logger, "Onion message intercepted for unknown SCID");
 				}
 			},
 			LdkEvent::OnionMessagePeerConnected { peer_node_id } => {
@@ -1910,6 +2062,8 @@ where
 
 #[cfg(test)]
 mod tests {
+	use std::collections::VecDeque;
+	use std::str::FromStr;
 	use std::sync::atomic::{AtomicU16, Ordering};
 	use std::time::Duration;
 
@@ -2005,6 +2159,84 @@ mod tests {
 
 		event_queue.event_handled().await.unwrap();
 		assert_eq!(event_queue.next_event(), None);
+	}
+
+	#[derive(Clone, Debug, PartialEq, Eq)]
+	enum LegacyEvent {
+		ChannelClosed {
+			channel_id: ChannelId,
+			user_channel_id: UserChannelId,
+			counterparty_node_id: Option<PublicKey>,
+			reason: Option<ClosureReason>,
+		},
+	}
+
+	impl_writeable_tlv_based_enum!(LegacyEvent,
+		(5, ChannelClosed) => {
+			(0, channel_id, required),
+			(1, counterparty_node_id, option),
+			(2, user_channel_id, required),
+			(3, reason, upgradable_option),
+		},
+	);
+
+	fn encode_legacy_event_queue(event: LegacyEvent) -> Vec<u8> {
+		let mut queue = VecDeque::new();
+		queue.push_back(event);
+
+		let mut bytes = Vec::new();
+		(queue.len() as u16).write(&mut bytes).unwrap();
+		for event in queue.iter() {
+			event.write(&mut bytes).unwrap();
+		}
+		bytes
+	}
+
+	#[test]
+	fn event_queue_reads_legacy_channel_closed_with_counterparty() {
+		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
+		let logger = Arc::new(TestLogger::new());
+		let counterparty_node_id = PublicKey::from_str(
+			"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+		)
+		.unwrap();
+		let channel_id = ChannelId([42u8; 32]);
+		let user_channel_id = UserChannelId(4242);
+		let legacy_event = LegacyEvent::ChannelClosed {
+			channel_id,
+			user_channel_id,
+			counterparty_node_id: Some(counterparty_node_id),
+			reason: None,
+		};
+		let persisted_bytes = encode_legacy_event_queue(legacy_event);
+
+		let event_queue =
+			EventQueue::read(&mut &persisted_bytes[..], (Arc::clone(&store), logger)).unwrap();
+		assert_eq!(
+			event_queue.next_event(),
+			Some(Event::ChannelClosed {
+				channel_id,
+				user_channel_id,
+				counterparty_node_id,
+				reason: None,
+			})
+		);
+	}
+
+	#[test]
+	fn event_queue_rejects_legacy_channel_closed_without_counterparty() {
+		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
+		let logger = Arc::new(TestLogger::new());
+		let legacy_event = LegacyEvent::ChannelClosed {
+			channel_id: ChannelId([42u8; 32]),
+			user_channel_id: UserChannelId(4242),
+			counterparty_node_id: None,
+			reason: None,
+		};
+		let persisted_bytes = encode_legacy_event_queue(legacy_event);
+
+		let res = EventQueue::read(&mut &persisted_bytes[..], (Arc::clone(&store), logger));
+		assert!(res.is_err());
 	}
 
 	#[tokio::test]

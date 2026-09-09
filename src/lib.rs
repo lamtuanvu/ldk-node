@@ -85,6 +85,7 @@ mod builder;
 mod chain;
 pub mod config;
 mod connection;
+pub mod custom_gossip;
 mod data_store;
 pub mod entropy;
 mod error;
@@ -101,10 +102,12 @@ pub mod logger;
 mod message_handler;
 pub mod payment;
 mod peer_store;
+pub mod probing;
 mod runtime;
 mod scoring;
 mod tx_broadcaster;
 mod types;
+mod util;
 mod wallet;
 
 use std::default::Default;
@@ -117,10 +120,58 @@ pub use balance::{BalanceDetails, LightningBalance, PendingSweepBalance};
 pub use bip39;
 pub use bitcoin;
 use bitcoin::secp256k1::PublicKey;
+
+/// Public swap fee-priority selector (Peerswap native primitives, B-series).
+///
+/// Re-exported from the otherwise-private `fee_estimator` module so swap code
+/// can request on-chain fee rates without the crate-internal
+/// `ConfirmationTarget` leaking into the public API.
+#[cfg(feature = "swaps")]
+pub use fee_estimator::SwapFeeTarget;
+
+/// Public source-bearing swap feerate quote types (Peerswap native primitive
+/// B6 / plan FIX-B). Re-exported from the otherwise-private `fee_estimator`
+/// module so swap callers can detect estimate provenance (live vs fallback).
+#[cfg(feature = "swaps")]
+pub use fee_estimator::{FeerateQuote, SwapFeerateSource};
+
+/// Public reorg-aware chain-status types for the swap-txid watch primitive
+/// (Peerswap native primitives, B5). Re-exported from the otherwise-private
+/// `chain` module.
+#[cfg(feature = "swaps")]
+pub use chain::{ChainStatus, TxStatus};
+
+/// Public external chain-service hook types for the CBF chain source (fee estimates +
+/// broadcast short-circuit). Re-exported from the otherwise-private `chain` module so a
+/// consumer can name [`ChainServiceHooks`] to call
+/// [`crate::builder::NodeBuilder::set_cbf_chain_service_hooks`]. Unlike the swap-primitive
+/// re-exports above, these are CBF-only and not gated behind the `swaps` feature — matching
+/// [`chain::ChainServiceHooks`]'s own (ungated) definition.
+pub use chain::{BroadcastFuture, BroadcastHookError, ChainServiceHooks, FeeEstimatesFuture};
+
+/// Optional external fee-estimation backend for [`set_chain_source_cbf`], re-exported from the
+/// otherwise-private `chain` module so a consumer can name it. Not gated behind `swaps`, matching
+/// [`chain::CbfFeeSourceConfig`]'s own (ungated) definition.
+///
+/// [`set_chain_source_cbf`]: crate::builder::NodeBuilder::set_chain_source_cbf
+pub use chain::CbfFeeSourceConfig;
+
+/// Simplified CBF sync-status snapshot, re-exported from the otherwise-private
+/// `chain` module so a consumer can name the return type of
+/// [`Node::cbf_sync_status`].
+pub use chain::CbfSyncStatus;
+
+/// Public types appearing in the swap-primitive signatures on [`Node`]
+/// (Peerswap native primitives, B-series). Re-exported so the consumer crate
+/// can name them without reaching into the (otherwise-private) LDK/bitcoin
+/// module paths.
+#[cfg(feature = "swaps")]
+pub use bitcoin::psbt::Psbt;
+/// Swap keypair type returned by [`Node::derive_swap_keypair`] (B7).
+#[cfg(feature = "swaps")]
+pub use bitcoin::secp256k1::Keypair as SwapKeypair;
 #[cfg(feature = "uniffi")]
 pub use bitcoin::FeeRate;
-#[cfg(not(feature = "uniffi"))]
-use bitcoin::FeeRate;
 use bitcoin::{Address, Amount, BlockHash, Network};
 #[cfg(feature = "uniffi")]
 pub use builder::ArcedNodeBuilder as Builder;
@@ -134,11 +185,14 @@ use config::{
 	RGS_SYNC_INTERVAL,
 };
 use connection::ConnectionManager;
+use custom_gossip::CustomGossipMessageHandler;
 pub use error::Error as NodeError;
 use error::Error;
 pub use event::Event;
 use event::{EventHandler, EventQueue};
-use fee_estimator::{ConfirmationTarget, FeeEstimator, OnchainFeeEstimator};
+use fee_estimator::{
+	max_funding_feerate, rbf_splice_feerates, ConfirmationTarget, FeeEstimator, OnchainFeeEstimator,
+};
 #[cfg(feature = "uniffi")]
 use ffi::*;
 use gossip::GossipSource;
@@ -156,13 +210,19 @@ use lightning::ln::peer_handler::CustomMessageHandler;
 use lightning::routing::gossip::NodeAlias;
 use lightning::sign::EntropySource;
 use lightning::util::persist::KVStore;
+/// Confirmed wallet UTXO type returned by [`Node::swap_list_confirmed_utxos`]
+/// (B2).
+#[cfg(feature = "swaps")]
+pub use lightning::util::wallet_utils::Utxo;
 use lightning::util::wallet_utils::{Input, Wallet as LdkWallet};
 use lightning_background_processor::process_events_async;
 pub use lightning_invoice;
 pub use lightning_liquidity;
 pub use lightning_types;
-use lightning_types::features::NodeFeatures as LdkNodeFeatures;
-use liquidity::{LSPS1Liquidity, LiquiditySource};
+use lightning_types::features::{
+	ChannelTypeFeatures, InitFeatures, NodeFeatures as LdkNodeFeatures,
+};
+use liquidity::LiquiditySource;
 use lnurl_auth::LnurlAuth;
 use logger::{log_debug, log_error, log_info, log_trace, LdkLogger, Logger};
 use payment::asynchronous::om_mailbox::OnionMessageMailbox;
@@ -172,6 +232,9 @@ use payment::{
 	UnifiedPayment,
 };
 use peer_store::{PeerInfo, PeerStore};
+#[cfg(feature = "uniffi")]
+pub use probing::ArcedProbingConfigBuilder as ProbingConfigBuilder;
+use probing::{run_prober, Prober};
 use runtime::Runtime;
 pub use tokio;
 use types::{
@@ -179,10 +242,13 @@ use types::{
 	HRNResolver, KeysManager, OnionMessenger, PaymentStore, PeerManager, Router, Scorer, Sweeper,
 	Wallet,
 };
-pub use types::{ChannelDetails, CustomTlvRecord, PeerDetails, UserChannelId};
+pub use types::{
+	ChannelCounterparty, ChannelDetails, CustomTlvRecord, PeerDetails, ReserveType, UserChannelId,
+};
 pub use vss_client;
 
 use crate::ffi::maybe_wrap;
+use crate::liquidity::Liquidity;
 use crate::scoring::setup_background_pathfinding_scores_sync;
 use crate::wallet::FundingAmount;
 
@@ -211,6 +277,19 @@ impl LeakChecker {
 	}
 }
 
+fn peer_may_negotiate_anchor_channel_type(
+	config: &Config, their_init_features: &InitFeatures,
+) -> bool {
+	their_init_features.supports_anchors_zero_fee_htlc_tx()
+		|| (config.anchor_channels_config.enable_zero_fee_commitments
+			&& their_init_features.supports_anchor_zero_fee_commitments())
+}
+
+fn requires_anchor_channel_type(channel_type: &ChannelTypeFeatures) -> bool {
+	channel_type.requires_anchors_zero_fee_htlc_tx()
+		|| channel_type.requires_anchor_zero_fee_commitments()
+}
+
 /// The main interface object of LDK Node, wrapping the necessary LDK and BDK functionalities.
 ///
 /// Needs to be initialized and instantiated through [`Builder::build`].
@@ -234,7 +313,8 @@ pub struct Node {
 	network_graph: Arc<Graph>,
 	gossip_source: Arc<GossipSource>,
 	pathfinding_scores_sync_url: Option<String>,
-	liquidity_source: Option<Arc<LiquiditySource<Arc<Logger>>>>,
+	liquidity_source: Arc<LiquiditySource<Arc<Logger>>>,
+	custom_gossip_handler: Option<Arc<CustomGossipMessageHandler<Arc<Logger>>>>,
 	kv_store: Arc<DynStore>,
 	logger: Arc<Logger>,
 	_router: Arc<Router>,
@@ -247,8 +327,12 @@ pub struct Node {
 	om_mailbox: Option<Arc<OnionMessageMailbox>>,
 	async_payments_role: Option<AsyncPaymentsRole>,
 	hrn_resolver: HRNResolver,
+	prober: Option<Arc<Prober>>,
 	#[cfg(cycle_tests)]
 	_leak_checker: LeakChecker,
+	/// Reorg-aware swap-txid watch registry (Peerswap native primitive B5).
+	#[cfg(feature = "swaps")]
+	swap_tx_watch: Arc<chain::SwapTxWatch>,
 }
 
 impl Node {
@@ -274,15 +358,59 @@ impl Node {
 			self.config.network
 		);
 
-		// Start up any runtime-dependant chain sources (e.g. Electrum)
-		self.chain_source.start(Arc::clone(&self.runtime)).map_err(|e| {
-			log_error!(self.logger, "Failed to start chain syncing: {}", e);
-			e
-		})?;
+		self.runtime.allow_cancellable_background_task_spawns();
 
-		// Block to ensure we update our fee rate cache once on startup
+		// Start up any runtime-dependant chain sources (e.g. Electrum, CBF)
+		self.chain_source
+			.start(
+				Arc::clone(&self.runtime),
+				Arc::clone(&self.wallet),
+				Arc::clone(&self.channel_manager),
+				Arc::clone(&self.chain_monitor),
+				Arc::clone(&self.output_sweeper),
+			)
+			.map_err(|e| {
+				log_error!(self.logger, "Failed to start chain syncing: {}", e);
+				e
+			})?;
+
+		let manager_owns_any_0fc_channels =
+			self.channel_manager.list_channels().into_iter().any(|channel| {
+				channel
+					.channel_shutdown_state
+					.map_or(true, |s| s != ChannelShutdownState::ShutdownComplete)
+					&& channel
+						.channel_type
+						.as_ref()
+						.map_or(false, |c| c.requires_anchor_zero_fee_commitments())
+			});
+		let monitor_owns_any_0fc_channels =
+			self.chain_monitor.list_monitors().into_iter().any(|channel_id| {
+				self.chain_monitor
+					.get_monitor(channel_id)
+					.map(|monitor| {
+						monitor.channel_type_features().requires_anchor_zero_fee_commitments()
+					})
+					.unwrap_or(false)
+			});
+		let zero_fee_commitments_support_required = manager_owns_any_0fc_channels
+			|| monitor_owns_any_0fc_channels
+			|| self.config.anchor_channels_config.enable_zero_fee_commitments;
+
+		// Block to ensure we update our fee rate cache once on startup.
+		// Also take this opportunity to make sure our chain source supports 0FC channels
+		// if they are enabled.
+		//
+		// TODO: drop 0FC chain source validation when support is ubiquitous
 		let chain_source = Arc::clone(&self.chain_source);
-		self.runtime.block_on(async move { chain_source.update_fee_rate_estimates().await })?;
+		self.runtime.block_on(async move {
+			tokio::try_join!(
+				chain_source.update_fee_rate_estimates(),
+				chain_source.validate_zero_fee_commitments_support_if_required(
+					zero_fee_commitments_support_required
+				)
+			)
+		})?;
 
 		// Spawn background task continuously syncing onchain, lightning, and fee rate cache.
 		let stop_sync_receiver = self.stop_sender.subscribe();
@@ -572,8 +700,9 @@ impl Node {
 
 		let stop_tx_bcast = self.stop_sender.subscribe();
 		let chain_source = Arc::clone(&self.chain_source);
+		let bcast_wallet = Arc::clone(&self.wallet);
 		self.runtime.spawn_cancellable_background_task(async move {
-			chain_source.continuously_process_broadcast_queue(stop_tx_bcast).await
+			chain_source.continuously_process_broadcast_queue(stop_tx_bcast, bcast_wallet).await
 		});
 
 		let bump_tx_event_handler = Arc::new(BumpTransactionEventHandler::new(
@@ -598,17 +727,25 @@ impl Node {
 			Arc::clone(&self.connection_manager),
 			Arc::clone(&self.output_sweeper),
 			Arc::clone(&self.network_graph),
-			self.liquidity_source.clone(),
+			Arc::clone(&self.liquidity_source),
 			Arc::clone(&self.payment_store),
 			Arc::clone(&self.peer_store),
 			Arc::clone(&self.keys_manager),
 			static_invoice_store,
 			Arc::clone(&self.onion_messenger),
 			self.om_mailbox.clone(),
+			self.prober.clone(),
 			Arc::clone(&self.runtime),
 			Arc::clone(&self.logger),
 			Arc::clone(&self.config),
 		));
+
+		if let Some(prober) = self.prober.clone() {
+			let stop_rx = self.stop_sender.subscribe();
+			self.runtime.spawn_cancellable_background_task(async move {
+				run_prober(prober, stop_rx).await;
+			});
+		}
 
 		// Setup background processing
 		let background_persister = Arc::clone(&self.kv_store);
@@ -617,8 +754,7 @@ impl Node {
 		let background_chan_man = Arc::clone(&self.channel_manager);
 		let background_gossip_sync = self.gossip_source.as_gossip_sync();
 		let background_peer_man = Arc::clone(&self.peer_manager);
-		let background_liquidity_man_opt =
-			self.liquidity_source.as_ref().map(|ls| ls.liquidity_manager());
+		let background_liquidity_man = self.liquidity_source.liquidity_manager();
 		let background_sweeper = Arc::clone(&self.output_sweeper);
 		let background_onion_messenger = Arc::clone(&self.onion_messenger);
 		let background_logger = Arc::clone(&self.logger);
@@ -654,7 +790,7 @@ impl Node {
 				Some(background_onion_messenger),
 				background_gossip_sync,
 				background_peer_man,
-				background_liquidity_man_opt,
+				Some(background_liquidity_man),
 				Some(background_sweeper),
 				background_logger,
 				Some(background_scorer),
@@ -675,25 +811,74 @@ impl Node {
 			});
 		});
 
-		if let Some(liquidity_source) = self.liquidity_source.as_ref() {
-			let mut stop_liquidity_handler = self.stop_sender.subscribe();
-			let liquidity_handler = Arc::clone(&liquidity_source);
-			let liquidity_logger = Arc::clone(&self.logger);
-			self.runtime.spawn_background_task(async move {
-				loop {
-					tokio::select! {
-						_ = stop_liquidity_handler.changed() => {
-							log_debug!(
-								liquidity_logger,
-								"Stopping processing liquidity events.",
+		let mut stop_liquidity_handler = self.stop_sender.subscribe();
+		let liquidity_handler = Arc::clone(&self.liquidity_source);
+		let liquidity_logger = Arc::clone(&self.logger);
+		let discovery_cm = Arc::clone(&self.connection_manager);
+		self.runtime.spawn_background_task(async move {
+			// Spawn discovery for configured LSPs in parallel.
+			let discovery_logger = Arc::clone(&liquidity_logger);
+			let mut discovery_set = tokio::task::JoinSet::new();
+			for (node_id, address) in liquidity_handler.get_all_lsp_details() {
+				let cm = Arc::clone(&discovery_cm);
+				let logger = Arc::clone(&discovery_logger);
+				let ls = Arc::clone(&liquidity_handler);
+				discovery_set.spawn(async move {
+					if let Err(e) = cm.connect_peer_if_necessary(node_id, address.clone()).await {
+						log_error!(
+							logger,
+							"Failed to connect to LSP {} for protocol discovery: {}",
+							node_id,
+							e
+						);
+						return;
+					}
+					match ls.discover_lsp_protocols(&node_id).await {
+						Ok(protocols) => {
+							log_info!(
+								logger,
+								"Discovered protocols for LSP {}: {:?}",
+								node_id,
+								protocols
 							);
-							return;
+						},
+						Err(e) => {
+							log_error!(
+								logger,
+								"Failed to discover protocols for LSP {}: {:?}",
+								node_id,
+								e
+							);
+						},
+					}
+				});
+			}
+
+			let mut discovery_done = false;
+			loop {
+				tokio::select! {
+					  _ = stop_liquidity_handler.changed() => {
+						  log_debug!(
+							  liquidity_logger,
+							  "Stopping processing liquidity events.",
+						  );
+						   discovery_set.shutdown().await;
+						  return;
+					  }
+					  _ = liquidity_handler.handle_next_event() => {}
+					  res = discovery_set.join_next(), if !discovery_done => {
+						if res.is_none() {
+							liquidity_handler.mark_discovery_done();
+							discovery_done = true;
+							log_info!(
+								liquidity_logger,
+								"LSP protocols discovery complete.",
+							);
 						}
-						_ = liquidity_handler.handle_next_event() => {}
 					}
 				}
-			});
-		}
+			}
+		});
 
 		log_info!(self.logger, "Startup complete.");
 		*is_running_lock = true;
@@ -733,12 +918,14 @@ impl Node {
 		self.peer_manager.disconnect_all_peers();
 		log_debug!(self.logger, "Disconnected all network peers.");
 
-		// Wait until non-cancellable background tasks (mod LDK's background processor) are done.
-		self.runtime.wait_on_background_tasks();
-
-		// Stop any runtime-dependant chain sources.
+		// Stop any runtime-dependant chain sources before waiting on non-cancellable
+		// background tasks. Some chain sources own background tasks that only exit
+		// after their client/requester is shut down.
 		self.chain_source.stop();
 		log_debug!(self.logger, "Stopped chain sources.");
+
+		// Wait until non-cancellable background tasks (mod LDK's background processor) are done.
+		self.runtime.wait_on_background_tasks();
 
 		// Stop the background processor.
 		self.background_processor_stop_sender
@@ -803,6 +990,17 @@ impl Node {
 	/// Returns the config with which the [`Node`] was initialized.
 	pub fn config(&self) -> Config {
 		self.config.as_ref().clone()
+	}
+
+	/// Returns a snapshot of the CBF chain source's sync status
+	/// ([`CbfSyncStatus`]), or `None` if this [`Node`] is not configured with
+	/// the CBF chain source (i.e. [`set_chain_source_cbf`] was not called).
+	///
+	/// Never blocks — reads the current value without waiting for a change.
+	///
+	/// [`set_chain_source_cbf`]: crate::builder::NodeBuilder::set_chain_source_cbf
+	pub fn cbf_sync_status(&self) -> Option<CbfSyncStatus> {
+		self.chain_source.cbf_sync_status()
 	}
 
 	/// Returns the next event in the event queue, if currently available.
@@ -884,6 +1082,12 @@ impl Node {
 		self.config.node_alias
 	}
 
+	/// Processes pending peer manager events and returns a handle to the peer manager.
+	pub fn process_events(&self) -> Arc<PeerManager> {
+		self.peer_manager.process_events();
+		Arc::clone(&self.peer_manager)
+	}
+
 	/// Returns a payment handler allowing to create and pay [BOLT 11] invoices.
 	///
 	/// [BOLT 11]: https://github.com/lightning/bolts/blob/master/11-payment-encoding.md
@@ -893,7 +1097,8 @@ impl Node {
 			Arc::clone(&self.runtime),
 			Arc::clone(&self.channel_manager),
 			Arc::clone(&self.connection_manager),
-			self.liquidity_source.clone(),
+			Arc::clone(&self.keys_manager),
+			Arc::clone(&self.liquidity_source),
 			Arc::clone(&self.payment_store),
 			Arc::clone(&self.peer_store),
 			Arc::clone(&self.config),
@@ -911,7 +1116,8 @@ impl Node {
 			Arc::clone(&self.runtime),
 			Arc::clone(&self.channel_manager),
 			Arc::clone(&self.connection_manager),
-			self.liquidity_source.clone(),
+			Arc::clone(&self.keys_manager),
+			Arc::clone(&self.liquidity_source),
 			Arc::clone(&self.payment_store),
 			Arc::clone(&self.peer_store),
 			Arc::clone(&self.config),
@@ -982,6 +1188,117 @@ impl Node {
 		))
 	}
 
+	/// Sends a circular self-payment along a caller-supplied route (cooperative
+	/// cycle-balance primitive).
+	///
+	/// The caller builds the exact [`Route`] (first hop = drain channel A, last hop =
+	/// fill channel B → self), generates a `preimage`/`payment_hash` pair (held
+	/// locally), and passes them here. The payment record is stored with
+	/// [`PaymentKind::Rebalance`] so the `event.rs` `PaymentClaimable` handler allows
+	/// the self-loop to settle instead of refusing it as a circular payment.
+	///
+	/// Settlement is observed by polling [`Node::payment`] for the returned
+	/// [`PaymentId`]; no user-facing event is emitted for the loop.
+	///
+	/// The raw [`ChannelManager`] is NOT exposed; this method is the sole entry
+	/// point for route-controlled self-pays.
+	///
+	/// [`Route`]: lightning::routing::router::Route
+	/// [`PaymentKind::Rebalance`]: crate::payment::PaymentKind::Rebalance
+	/// [`ChannelManager`]: crate::types::ChannelManager
+	#[cfg(feature = "cycles")]
+	pub fn send_along_route(
+		&self, route: lightning::routing::router::Route, amount_msat: u64,
+		payment_hash: lightning_types::payment::PaymentHash,
+		preimage: lightning_types::payment::PaymentPreimage,
+	) -> Result<PaymentId, Error> {
+		use lightning::ln::outbound_payment::{RecipientOnionFields, RetryableSendFailure};
+
+		if !*self.is_running.read().unwrap() {
+			return Err(Error::NotRunning);
+		}
+
+		let payment_id = PaymentId(payment_hash.0);
+
+		if let Some(existing) = self.payment_store.get(&payment_id) {
+			if existing.status == payment::PaymentStatus::Pending
+				|| existing.status == payment::PaymentStatus::Succeeded
+			{
+				log_error!(self.logger, "Rebalance payment error: duplicate payment_id.");
+				return Err(Error::DuplicatePayment);
+			}
+		}
+
+		// Register `payment_hash` with the ChannelManager's STATELESS inbound-payment
+		// verifier so the looped HTLC is receivable at the final hop. Without this the
+		// final onion payload carries neither a payment secret nor a keysend preimage
+		// and LDK fails it with "We require payment_secrets" BEFORE any
+		// `PaymentClaimable` fires — the loop could never settle. This creates NO
+		// payment-store record (unlike `Bolt11Payment::receive_for_hash`), so the
+		// scoped circular guard still sees only our single Outbound Rebalance record.
+		// `min_value_msat = amount_msat` means an underpaying HTLC never even surfaces
+		// a claimable event (no proof-of-payment leak); the secret only ever travels
+		// inside the onion we build, so no third party can construct a claimable HTLC
+		// for this hash.
+		let (payment_secret, _payment_metadata) = self
+			.channel_manager
+			.create_inbound_payment_for_hash(payment_hash, Some(amount_msat), 3600, None, None)
+			.map_err(|()| {
+				log_error!(
+					self.logger,
+					"Failed to register rebalance inbound payment for payment_id {}.",
+					payment_id,
+				);
+				Error::PaymentSendingFailed
+			})?;
+
+		let kind = payment::PaymentKind::Rebalance { hash: payment_hash, preimage };
+		let payment_record = PaymentDetails::new(
+			payment_id,
+			kind,
+			Some(amount_msat),
+			None,
+			payment::PaymentDirection::Outbound,
+			payment::PaymentStatus::Pending,
+		);
+		self.runtime.block_on(self.payment_store.insert(payment_record)).map_err(|e| {
+			log_error!(self.logger, "Failed to insert rebalance payment record: {}", e);
+			e
+		})?;
+
+		match self.channel_manager.send_payment_with_route(
+			route,
+			payment_hash,
+			RecipientOnionFields::secret_only(payment_secret, amount_msat),
+			payment_id,
+		) {
+			Ok(()) => {
+				log_info!(
+					self.logger,
+					"Initiated self-rebalance of {}msat (payment_id: {}).",
+					amount_msat,
+					payment_id,
+				);
+				Ok(payment_id)
+			},
+			Err(RetryableSendFailure::DuplicatePayment) => Err(Error::DuplicatePayment),
+			Err(e) => {
+				let update = payment::store::PaymentDetailsUpdate {
+					status: Some(payment::PaymentStatus::Failed),
+					..payment::store::PaymentDetailsUpdate::new(payment_id)
+				};
+				let _ = self.runtime.block_on(self.payment_store.update(update));
+				log_error!(
+					self.logger,
+					"Self-rebalance send failed ({:?}) for payment_id {}.",
+					e,
+					payment_id,
+				);
+				Err(Error::PaymentSendingFailed)
+			},
+		}
+	}
+
 	/// Returns a payment handler allowing to send and receive on-chain payments.
 	#[cfg(not(feature = "uniffi"))]
 	pub fn onchain_payment(&self) -> OnchainPayment {
@@ -990,8 +1307,170 @@ impl Node {
 			Arc::clone(&self.channel_manager),
 			Arc::clone(&self.config),
 			Arc::clone(&self.is_running),
+			Arc::clone(&self.runtime),
 			Arc::clone(&self.logger),
 		)
+	}
+
+	/// Registers an arbitrary transaction (e.g. a counterparty's swap opening tx
+	/// that the local wallet does not own) for reorg-aware confirmation tracking
+	/// via [`Node::get_tx_confirmations`] (Peerswap native primitive B5).
+	///
+	/// `scriptpubkey` is the output script being watched; it is required by the
+	/// Electrum chain source (which locates a tx through its scriptHash history)
+	/// and ignored by the Esplora/Bitcoind backends. Registration is idempotent.
+	#[cfg(feature = "swaps")]
+	pub fn watch_txid(&self, txid: bitcoin::Txid, scriptpubkey: bitcoin::ScriptBuf) {
+		self.swap_tx_watch.register(txid, scriptpubkey);
+	}
+
+	/// Drops the reorg-aware watch for `txid` registered via [`Node::watch_txid`]
+	/// (Peerswap native primitive B5, LOW-1). The consumer calls this once a swap
+	/// reaches a terminal, settled state so the in-memory watch map does not grow
+	/// unbounded for the process lifetime. A no-op for a txid never watched.
+	#[cfg(feature = "swaps")]
+	pub fn unwatch_txid(&self, txid: bitcoin::Txid) {
+		self.swap_tx_watch.unregister(&txid);
+	}
+
+	/// Queries the reorg-aware confirmation status of an arbitrary `txid`
+	/// against the configured chain source (Peerswap native primitive B5).
+	///
+	/// Unlike wallet-owned confirmation lookups, this works on a counterparty's
+	/// opening tx. Confirmations are re-derived from the tx's *current*
+	/// best-chain block on every call, so a previously-confirmed tx that has
+	/// re-orged out is reported as [`ChainStatus::Reorged`] (and a never-confirmed
+	/// tx gone from the mempool as [`ChainStatus::Dropped`]) with zero
+	/// confirmations, allowing the caller to re-anchor deadlines (F4).
+	///
+	/// FAIL-CLOSED (E6): if the chain source is unconfigured/unreachable, or an
+	/// Electrum lookup is attempted for a `txid` never registered via
+	/// [`Node::watch_txid`], the returned status is [`ChainStatus::NoChainSource`]
+	/// — never a confirmed result. Callers MUST NOT advance any state that
+	/// depends on a confirmation they could not verify.
+	#[cfg(feature = "swaps")]
+	pub async fn get_tx_confirmations(&self, txid: bitcoin::Txid) -> Result<TxStatus, Error> {
+		let script_pubkey = self.swap_tx_watch.script_pubkey(&txid);
+		let previously_confirmed = self.swap_tx_watch.previously_confirmed(&txid);
+		let observation = self.chain_source.swap_query_tx(txid, script_pubkey.as_ref()).await;
+		let status = chain::derive_tx_status(observation, previously_confirmed);
+		self.swap_tx_watch.record(&txid, &status);
+		Ok(status)
+	}
+
+	/// Builds a fully-signed swap funding (HTLC opening) transaction paying
+	/// `amount` to `output_script` (e.g. a P2WSH submarine-swap HTLC output) at
+	/// the feerate implied by `fee_target`, with the supplied `locktime`
+	/// (Peerswap native primitive B1).
+	///
+	/// The returned [`bitcoin::Transaction`] is signed and persisted but **not**
+	/// broadcast — call [`Node::broadcast_swap_tx`] to publish it. The public
+	/// [`SwapFeeTarget`] is used in place of the crate-internal confirmation
+	/// target so no internal type leaks across the crate boundary.
+	#[cfg(feature = "swaps")]
+	pub fn create_swap_funding_tx(
+		&self, output_script: bitcoin::ScriptBuf, amount: bitcoin::Amount,
+		fee_target: SwapFeeTarget, locktime: bitcoin::blockdata::locktime::absolute::LockTime,
+	) -> Result<bitcoin::Transaction, Error> {
+		self.wallet.create_swap_funding_tx(output_script, amount, fee_target.into(), locktime)
+	}
+
+	/// Lists the wallet's confirmed, unspent outputs as [`Utxo`]s for use as
+	/// swap funding inputs (Peerswap native primitive B2).
+	#[cfg(feature = "swaps")]
+	pub fn swap_list_confirmed_utxos(&self) -> Result<Vec<Utxo>, Error> {
+		self.wallet.swap_list_confirmed_utxos()
+	}
+
+	/// Signs a swap [`Psbt`] with the on-chain wallet, returning the extracted
+	/// [`bitcoin::Transaction`] (Peerswap native primitive B3).
+	///
+	/// LDK-provided inputs are not finalized by BDK; the caller is responsible
+	/// for finalizing any swap-script (HTLC) inputs it owns.
+	#[cfg(feature = "swaps")]
+	pub fn swap_sign_psbt(&self, psbt: Psbt) -> Result<bitcoin::Transaction, Error> {
+		self.wallet.swap_sign_psbt(psbt)
+	}
+
+	/// Enqueues a fully-signed swap transaction for broadcast on the configured
+	/// chain backend (Peerswap native primitive B4).
+	///
+	/// Fire-and-forget: the transaction is placed on the bounded broadcast queue
+	/// drained by the chain source and this returns immediately; it does not
+	/// confirm acceptance by the backend.
+	#[cfg(feature = "swaps")]
+	pub fn broadcast_swap_tx(&self, tx: &bitcoin::Transaction) {
+		self.tx_broadcaster.broadcast_tx(tx);
+	}
+
+	/// Forgets the given unconfirmed transactions in the on-chain wallet, handing the coins they
+	/// spent back to the spendable balance.
+	///
+	/// Meant for a transaction this node broadcast that the network has since dropped (the app's
+	/// transaction watcher learns this from its chain-service provider): under the CBF chain
+	/// source nothing else ever evicts an unconfirmed transaction, so without this the inputs of
+	/// a dropped send would stay locked until it confirmed — which it never will. Transactions
+	/// the wallet does not know, or already sees confirmed, are ignored. The eviction is
+	/// reversible: seeing the transaction again (a later [`Self::rebroadcast_unconfirmed_tx`],
+	/// or its confirmation) makes it canonical again.
+	pub fn evict_unconfirmed_txs(&self, txids: Vec<bitcoin::Txid>) -> Result<(), Error> {
+		if !*self.is_running.read().expect("lock") {
+			return Err(Error::NotRunning);
+		}
+		if txids.is_empty() {
+			return Ok(());
+		}
+		let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+		let evicted = txids.into_iter().map(|txid| (txid, now)).collect();
+		let wallet = Arc::clone(&self.wallet);
+		self.runtime.block_on(async move { wallet.apply_mempool_txs(Vec::new(), evicted).await })
+	}
+
+	/// Re-queues an unconfirmed transaction the on-chain wallet already holds for broadcast,
+	/// over the same path (chain-service hook first, P2P second) a fresh send takes.
+	///
+	/// Returns [`Error::WalletOperationFailed`] when the wallet does not hold the transaction or
+	/// already sees it confirmed. Fire-and-forget like every other broadcast: the transaction is
+	/// placed on the bounded broadcast queue and this returns immediately.
+	pub fn rebroadcast_unconfirmed_tx(&self, txid: bitcoin::Txid) -> Result<(), Error> {
+		if !*self.is_running.read().expect("lock") {
+			return Err(Error::NotRunning);
+		}
+		let Some(tx) = self.wallet.get_unconfirmed_transaction(&txid) else {
+			log_debug!(
+				self.logger,
+				"Not rebroadcasting {}: the on-chain wallet holds no unconfirmed transaction by \
+				 that id.",
+				txid
+			);
+			return Err(Error::WalletOperationFailed);
+		};
+		self.tx_broadcaster.broadcast_unclassified_transaction(tx);
+		Ok(())
+	}
+
+	/// Estimates the on-chain feerate for a swap transaction at the requested
+	/// [`SwapFeeTarget`] priority, returning a source-bearing [`FeerateQuote`]
+	/// (Peerswap native primitive B6 / plan FIX-B).
+	///
+	/// The quote's [`SwapFeerateSource`] lets a fail-closed caller distinguish a
+	/// live backend estimate from a static fallback/relay-floor value and refuse
+	/// to fund on an untrusted estimate.
+	#[cfg(feature = "swaps")]
+	pub fn estimate_onchain_feerate(&self, target: SwapFeeTarget) -> FeerateQuote {
+		self.chain_source.fee_estimator().estimate_swap_feerate_quote(target)
+	}
+
+	/// Derives a deterministic swap [`SwapKeypair`] at `index` from a dedicated,
+	/// swaps-only BIP-32 derivation path (Peerswap native primitive B7).
+	///
+	/// The keypair is NEVER derived from the node identity secret key: it comes
+	/// from a hardened path reserved exclusively for swaps, isolated from the
+	/// identity/channel keys. The returned keypair carries both the secret and
+	/// public key for building and signing swap HTLC scripts.
+	#[cfg(feature = "swaps")]
+	pub fn derive_swap_keypair(&self, index: u32) -> Result<SwapKeypair, Error> {
+		self.keys_manager.derive_swap_keypair(index)
 	}
 
 	/// Returns a payment handler allowing to send and receive on-chain payments.
@@ -1002,6 +1481,7 @@ impl Node {
 			Arc::clone(&self.channel_manager),
 			Arc::clone(&self.config),
 			Arc::clone(&self.is_running),
+			Arc::clone(&self.runtime),
 			Arc::clone(&self.logger),
 		))
 	}
@@ -1048,6 +1528,30 @@ impl Node {
 		))
 	}
 
+	/// Returns a custom gossip handler allowing to send and receive custom gossip messages.
+	///
+	/// This returns `None` if custom gossip was not enabled during node construction.
+	/// To enable custom gossip, call [`Builder::enable_custom_gossip`] before building the node.
+	///
+	/// Custom gossip messages can contain arbitrary metadata up to 4096 bytes in length
+	/// and use message type 32769 to extend the Lightning gossip protocol.
+	#[cfg(not(feature = "uniffi"))]
+	pub fn custom_gossip(&self) -> Option<&CustomGossipMessageHandler<Arc<Logger>>> {
+		self.custom_gossip_handler.as_ref().map(|h| h.as_ref())
+	}
+
+	/// Returns a custom gossip handler allowing to send and receive custom gossip messages.
+	///
+	/// This returns `None` if custom gossip was not enabled during node construction.
+	/// To enable custom gossip, call [`Builder::enable_custom_gossip`] before building the node.
+	///
+	/// Custom gossip messages can contain arbitrary metadata up to 4096 bytes in length
+	/// and use message type 32769 to extend the Lightning gossip protocol.
+	#[cfg(feature = "uniffi")]
+	pub fn custom_gossip(&self) -> Option<Arc<CustomGossipMessageHandler<Arc<Logger>>>> {
+		self.custom_gossip_handler.clone()
+	}
+
 	/// Authenticates the user via [LNURL-auth] for the given LNURL string.
 	///
 	/// [LNURL-auth]: https://github.com/lnurl/luds/blob/luds/04.md
@@ -1068,37 +1572,42 @@ impl Node {
 		})
 	}
 
-	/// Returns a liquidity handler allowing to request channels via the [bLIP-51 / LSPS1] protocol.
-	///
-	/// [bLIP-51 / LSPS1]: https://github.com/lightning/blips/blob/master/blip-0051.md
+	/// Returns a liquidity handler allowing to manage LSP connections and request channels.
 	#[cfg(not(feature = "uniffi"))]
-	pub fn lsps1_liquidity(&self) -> LSPS1Liquidity {
-		LSPS1Liquidity::new(
+	pub fn liquidity(&self) -> Liquidity {
+		Liquidity::new(
 			Arc::clone(&self.runtime),
 			Arc::clone(&self.wallet),
 			Arc::clone(&self.connection_manager),
-			self.liquidity_source.clone(),
+			Arc::clone(&self.liquidity_source),
 			Arc::clone(&self.logger),
 		)
 	}
 
-	/// Returns a liquidity handler allowing to request channels via the [bLIP-51 / LSPS1] protocol.
-	///
-	/// [bLIP-51 / LSPS1]: https://github.com/lightning/blips/blob/master/blip-0051.md
+	/// Returns a liquidity handler allowing to manage LSP connections and request channels.
 	#[cfg(feature = "uniffi")]
-	pub fn lsps1_liquidity(&self) -> Arc<LSPS1Liquidity> {
-		Arc::new(LSPS1Liquidity::new(
+	pub fn liquidity(&self) -> Arc<Liquidity> {
+		Arc::new(Liquidity::new(
 			Arc::clone(&self.runtime),
 			Arc::clone(&self.wallet),
 			Arc::clone(&self.connection_manager),
-			self.liquidity_source.clone(),
+			Arc::clone(&self.liquidity_source),
 			Arc::clone(&self.logger),
 		))
 	}
 
+	/// Returns a reference to the [`Prober`], or `None` if no probing strategy is configured.
+	pub fn prober(&self) -> Option<&Prober> {
+		self.prober.as_deref()
+	}
+
 	/// Retrieve a list of known channels.
 	pub fn list_channels(&self) -> Vec<ChannelDetails> {
-		self.channel_manager.list_channels().into_iter().map(|c| c.into()).collect()
+		self.channel_manager
+			.list_channels()
+			.into_iter()
+			.map(|c| ChannelDetails::from_ldk(c, &self.config.anchor_channels_config))
+			.collect()
 	}
 
 	/// Connect to a node on the peer-to-peer network.
@@ -1179,7 +1688,7 @@ impl Node {
 			FundingAmount::Exact { amount_sats } => {
 				// Check funds availability after connection (includes anchor reserve
 				// calculation).
-				self.check_sufficient_funds_for_channel(amount_sats, &peer_info.node_id)?;
+				self.check_sufficient_onchain_funds(amount_sats, &peer_info.node_id, true)?;
 				amount_sats
 			},
 			FundingAmount::Max => {
@@ -1281,37 +1790,41 @@ impl Node {
 			.peer_by_node_id(peer_node_id)
 			.ok_or(Error::ConnectionFailed)?
 			.init_features;
-		let anchor_channel = init_features.requires_anchors_zero_fee_htlc_tx();
+		let anchor_channel = peer_may_negotiate_anchor_channel_type(&self.config, &init_features);
 		Ok(new_channel_anchor_reserve_sats(&self.config, peer_node_id, anchor_channel))
 	}
 
-	fn check_sufficient_funds_for_channel(
-		&self, amount_sats: u64, peer_node_id: &PublicKey,
+	fn check_sufficient_onchain_funds(
+		&self, amount_sats: u64, peer_node_id: &PublicKey, for_new_channel: bool,
 	) -> Result<(), Error> {
+		let action_str = if for_new_channel { "create channel" } else { "splice-in" };
 		let cur_anchor_reserve_sats =
 			total_anchor_channels_reserve_sats(&self.channel_manager, &self.config);
 		let spendable_amount_sats =
 			self.wallet.get_spendable_amount_sats(cur_anchor_reserve_sats).unwrap_or(0);
 
-		// Fail early if we have less than the channel value available.
 		if spendable_amount_sats < amount_sats {
-			log_error!(self.logger,
-				"Unable to create channel due to insufficient funds. Available: {}sats, Required: {}sats",
-				spendable_amount_sats, amount_sats
+			log_error!(
+				self.logger,
+				"Unable to {} due to insufficient funds. Available: {}sats, Required: {}sats",
+				action_str,
+				spendable_amount_sats,
+				amount_sats
 			);
 			return Err(Error::InsufficientFunds);
 		}
 
-		// Fail if we have less than the channel value + anchor reserve available (if applicable).
-		let required_funds_sats =
-			amount_sats + self.new_channel_anchor_reserve_sats(peer_node_id)?;
+		if for_new_channel {
+			let required_funds_sats =
+				amount_sats + self.new_channel_anchor_reserve_sats(peer_node_id)?;
 
-		if spendable_amount_sats < required_funds_sats {
-			log_error!(self.logger,
-				"Unable to create channel due to insufficient funds. Available: {}sats, Required: {}sats",
-				spendable_amount_sats, required_funds_sats
-			);
-			return Err(Error::InsufficientFunds);
+			if spendable_amount_sats < required_funds_sats {
+				log_error!(self.logger,
+					"Unable to create channel due to insufficient funds. Available: {}sats, Required: {}sats",
+					spendable_amount_sats, required_funds_sats
+				);
+				return Err(Error::InsufficientFunds);
+			}
 		}
 
 		Ok(())
@@ -1531,7 +2044,7 @@ impl Node {
 		{
 			let min_feerate =
 				self.fee_estimator.estimate_fee_rate(ConfirmationTarget::ChannelFunding);
-			let max_feerate = FeeRate::from_sat_per_kwu(min_feerate.to_sat_per_kwu() * 3 / 2);
+			let max_feerate = max_funding_feerate(min_feerate);
 
 			let splice_amount_sats = match splice_amount_sats {
 				FundingAmount::Exact { amount_sats } => amount_sats,
@@ -1587,7 +2100,7 @@ impl Node {
 				},
 			};
 
-			self.check_sufficient_funds_for_channel(splice_amount_sats, &counterparty_node_id)?;
+			self.check_sufficient_onchain_funds(splice_amount_sats, &counterparty_node_id, false)?;
 
 			let funding_template = self
 				.channel_manager
@@ -1600,16 +2113,26 @@ impl Node {
 			if funding_template.prior_contribution().is_some() {
 				log_error!(
 					self.logger,
-					"Failed to splice channel: a prior splice contribution is pending"
+					"Failed to splice channel: a prior splice contribution is pending; use bump_channel_funding_fee to bump its fee"
 				);
 				return Err(Error::ChannelSplicingFailed);
 			}
+
+			// When contributing to a pending splice, the funding template requires at least the RBF
+			// minimum feerate to replace the in-flight transaction. Use it in place of our funding
+			// feerate estimate when it's higher, as long as it stays within our max.
+			let feerate = match funding_template.min_rbf_feerate() {
+				Some(min_rbf_feerate) if min_rbf_feerate <= max_feerate => {
+					min_feerate.max(min_rbf_feerate)
+				},
+				_ => min_feerate,
+			};
 
 			let contribution = self
 				.runtime
 				.block_on(funding_template.splice_in(
 					Amount::from_sat(splice_amount_sats),
-					min_feerate,
+					feerate,
 					max_feerate,
 					Arc::clone(&self.wallet),
 				))
@@ -1700,7 +2223,9 @@ impl Node {
 		if let Some(channel_details) =
 			open_channels.iter().find(|c| c.user_channel_id == user_channel_id.0)
 		{
-			if splice_amount_sats > channel_details.outbound_capacity_msat {
+			let splice_amount_msat =
+				splice_amount_sats.checked_mul(1_000).ok_or(Error::ChannelSplicingFailed)?;
+			if splice_amount_msat > channel_details.outbound_capacity_msat {
 				return Err(Error::ChannelSplicingFailed);
 			}
 
@@ -1708,7 +2233,7 @@ impl Node {
 
 			let min_feerate =
 				self.fee_estimator.estimate_fee_rate(ConfirmationTarget::ChannelFunding);
-			let max_feerate = FeeRate::from_sat_per_kwu(min_feerate.to_sat_per_kwu() * 3 / 2);
+			let max_feerate = max_funding_feerate(min_feerate);
 
 			let funding_template = self
 				.channel_manager
@@ -1721,17 +2246,27 @@ impl Node {
 			if funding_template.prior_contribution().is_some() {
 				log_error!(
 					self.logger,
-					"Failed to splice channel: a prior splice contribution is pending"
+					"Failed to splice channel: a prior splice contribution is pending; use bump_channel_funding_fee to bump its fee"
 				);
 				return Err(Error::ChannelSplicingFailed);
 			}
+
+			// When contributing to a pending splice, the funding template requires at least the RBF
+			// minimum feerate to replace the in-flight transaction. Use it in place of our funding
+			// feerate estimate when it's higher, as long as it stays within our max.
+			let feerate = match funding_template.min_rbf_feerate() {
+				Some(min_rbf_feerate) if min_rbf_feerate <= max_feerate => {
+					min_feerate.max(min_rbf_feerate)
+				},
+				_ => min_feerate,
+			};
 
 			let outputs = vec![bitcoin::TxOut {
 				value: Amount::from_sat(splice_amount_sats),
 				script_pubkey: address.script_pubkey(),
 			}];
 			let contribution =
-				funding_template.splice_out(outputs, min_feerate, max_feerate).map_err(|e| {
+				funding_template.splice_out(outputs, feerate, max_feerate).map_err(|e| {
 					log_error!(self.logger, "Failed to splice channel: {}", e);
 					Error::ChannelSplicingFailed
 				})?;
@@ -1758,6 +2293,77 @@ impl Node {
 		}
 	}
 
+	/// Fee-bumps the pending splice on a channel by replacing its in-flight funding transaction
+	/// (RBF). The splice's amount and destination are preserved; only the fee rate is raised.
+	/// Errors if the channel has no pending splice to bump.
+	pub fn bump_channel_funding_fee(
+		&self, user_channel_id: &UserChannelId, counterparty_node_id: PublicKey,
+	) -> Result<(), Error> {
+		let open_channels =
+			self.channel_manager.list_channels_with_counterparty(&counterparty_node_id);
+		if let Some(channel_details) =
+			open_channels.iter().find(|c| c.user_channel_id == user_channel_id.0)
+		{
+			let min_feerate =
+				self.fee_estimator.estimate_fee_rate(ConfirmationTarget::ChannelFunding);
+
+			let funding_template = self
+				.channel_manager
+				.splice_channel(&channel_details.channel_id, &counterparty_node_id)
+				.map_err(|e| {
+					log_error!(self.logger, "Failed to RBF channel: {:?}", e);
+					Error::ChannelSplicingFailed
+				})?;
+
+			let Some(min_rbf_feerate) = funding_template.min_rbf_feerate() else {
+				log_error!(self.logger, "Failed to RBF channel: no pending splice to replace");
+				return Err(Error::ChannelSplicingFailed);
+			};
+
+			let Some((target_feerate, max_feerate)) =
+				rbf_splice_feerates(min_feerate, min_rbf_feerate)
+			else {
+				log_error!(
+					self.logger,
+					"Failed to RBF channel: the RBF minimum feerate exceeds our maximum"
+				);
+				return Err(Error::ChannelSplicingFailed);
+			};
+
+			let contribution = self
+				.runtime
+				.block_on(funding_template.rbf_prior_contribution(
+					Some(target_feerate),
+					max_feerate,
+					Arc::clone(&self.wallet),
+				))
+				.map_err(|e| {
+					log_error!(self.logger, "Failed to RBF channel: {}", e);
+					Error::ChannelSplicingFailed
+				})?;
+
+			self.channel_manager
+				.funding_contributed(
+					&channel_details.channel_id,
+					&counterparty_node_id,
+					contribution,
+					None,
+				)
+				.map_err(|e| {
+					log_error!(self.logger, "Failed to RBF channel: {:?}", e);
+					Error::ChannelSplicingFailed
+				})
+		} else {
+			log_error!(
+				self.logger,
+				"Channel not found for user_channel_id {} and counterparty {}",
+				user_channel_id,
+				counterparty_node_id
+			);
+			Err(Error::ChannelSplicingFailed)
+		}
+	}
+
 	/// Manually sync the LDK and BDK wallets with the current chain state and update the fee rate
 	/// cache.
 	///
@@ -1766,6 +2372,9 @@ impl Node {
 	/// is almost always redundant when background syncing is enabled and should be avoided where possible.
 	/// However, if background syncing is disabled (i.e., `background_sync_config` is set to `None`),
 	/// this method must be called manually to keep wallets in sync with the chain state.
+	///
+	/// When using the CBF chain source, syncing always runs in the background. In that mode this
+	/// method waits until the background sync has applied chain updates through the current tip.
 	///
 	/// [`EsploraSyncConfig::background_sync_config`]: crate::config::EsploraSyncConfig::background_sync_config
 	pub fn sync_wallets(&self) -> Result<(), Error> {
@@ -1864,10 +2473,11 @@ impl Node {
 					})?;
 			}
 
-			// Check if this was the last open channel, if so, forget the peer.
-			if open_channels.len() == 1 {
-				self.runtime.block_on(self.peer_store.remove_peer(&counterparty_node_id))?;
-			}
+			// Peer store cleanup is handled centrally in the `ChannelClosed` event handler,
+			// which retains a force-closed peer through one recovery reconnect before
+			// dropping it. This lets `channel_reestablish` drive the recovery flow, which is
+			// especially important against LND peers that don't always handle force-closure
+			// error messages correctly.
 		}
 
 		Ok(())
@@ -2094,11 +2704,7 @@ impl Node {
 			| self.chain_monitor.provided_node_features()
 			| self.onion_messenger.provided_node_features()
 			| gossip_features
-			| self
-				.liquidity_source
-				.as_ref()
-				.map(|ls| ls.liquidity_manager().provided_node_features())
-				.unwrap_or_else(LdkNodeFeatures::empty)
+			| self.liquidity_source.liquidity_manager().provided_node_features()
 	}
 }
 
@@ -2238,21 +2844,20 @@ impl_writeable_tlv_based!(NodeMetrics, {
 pub(crate) fn total_anchor_channels_reserve_sats(
 	channel_manager: &ChannelManager, config: &Config,
 ) -> u64 {
-	config.anchor_channels_config.as_ref().map_or(0, |anchor_channels_config| {
-		channel_manager
-			.list_channels()
-			.into_iter()
-			.filter(|c| {
-				!anchor_channels_config.trusted_peers_no_reserve.contains(&c.counterparty.node_id)
-					&& c.channel_shutdown_state
-						.map_or(true, |s| s != ChannelShutdownState::ShutdownComplete)
-					&& c.channel_type
-						.as_ref()
-						.map_or(false, |t| t.requires_anchors_zero_fee_htlc_tx())
-			})
-			.count() as u64
-			* anchor_channels_config.per_channel_reserve_sats
-	})
+	channel_manager
+		.list_channels()
+		.into_iter()
+		.filter(|c| {
+			!config
+				.anchor_channels_config
+				.trusted_peers_no_reserve
+				.contains(&c.counterparty.node_id)
+				&& c.channel_shutdown_state
+					.map_or(true, |s| s != ChannelShutdownState::ShutdownComplete)
+				&& c.channel_type.as_ref().map_or(false, requires_anchor_channel_type)
+		})
+		.count() as u64
+		* config.anchor_channels_config.per_channel_reserve_sats
 }
 
 pub(crate) fn new_channel_anchor_reserve_sats(
@@ -2262,13 +2867,11 @@ pub(crate) fn new_channel_anchor_reserve_sats(
 		return 0;
 	}
 
-	config.anchor_channels_config.as_ref().map_or(0, |c| {
-		if c.trusted_peers_no_reserve.contains(peer_node_id) {
-			0
-		} else {
-			c.per_channel_reserve_sats
-		}
-	})
+	if config.anchor_channels_config.trusted_peers_no_reserve.contains(peer_node_id) {
+		0
+	} else {
+		config.anchor_channels_config.per_channel_reserve_sats
+	}
 }
 
 #[cfg(test)]

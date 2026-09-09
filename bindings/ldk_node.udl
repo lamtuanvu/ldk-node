@@ -13,6 +13,8 @@ typedef dictionary TorConfig;
 
 typedef interface NodeEntropy;
 
+typedef interface ProbingConfig;
+
 typedef enum WordCount;
 
 [Remote]
@@ -32,19 +34,30 @@ interface LogWriter {
 	void log(LogRecord record);
 };
 
+interface ProbingConfigBuilder {
+	[Name=high_degree]
+	constructor(u64 top_node_count);
+	[Name=random_walk]
+	constructor(u64 max_hops);
+	void set_interval(u64 secs);
+	void set_max_locked_msat(u64 max_msat);
+	void set_diversity_penalty_msat(u64 penalty_msat);
+	void set_cooldown(u64 secs);
+	ProbingConfig build();
+};
+
 interface Builder {
 	constructor();
 	[Name=from_config]
 	constructor(Config config);
 	void set_chain_source_esplora(string server_url, EsploraSyncConfig? config);
 	void set_chain_source_electrum(string server_url, ElectrumSyncConfig? config);
-	void set_chain_source_bitcoind_rpc(string rpc_host, u16 rpc_port, string rpc_user, string rpc_password);
-	void set_chain_source_bitcoind_rest(string rest_host, u16 rest_port, string rpc_host, u16 rpc_port, string rpc_user, string rpc_password);
+	void set_chain_source_bitcoind_rpc(string rpc_host, u16 rpc_port, string rpc_user, string rpc_password, u32? wallet_rescan_from_height);
+	void set_chain_source_bitcoind_rest(string rest_host, u16 rest_port, string rpc_host, u16 rpc_port, string rpc_user, string rpc_password, u32? wallet_rescan_from_height);
 	void set_gossip_source_p2p();
 	void set_gossip_source_rgs(string rgs_server_url);
 	void set_pathfinding_scores_source(string url);
-	void set_liquidity_source_lsps1(PublicKey node_id, SocketAddress address, string? token);
-	void set_liquidity_source_lsps2(PublicKey node_id, SocketAddress address, string? token);
+	void add_liquidity_source(PublicKey node_id, SocketAddress address, string? token, boolean trust_peer_0conf);
 	void set_storage_dir_path(string storage_dir_path);
 	void set_filesystem_logger(string? log_file_path, LogLevel? max_log_level);
 	void set_log_facade_logger();
@@ -60,7 +73,7 @@ interface Builder {
 	void set_node_alias(string node_alias);
 	[Throws=BuildError]
 	void set_async_payments_role(AsyncPaymentsRole? role);
-	void set_wallet_recovery_mode();
+	void set_probing_config(ProbingConfig config);
 	[Throws=BuildError]
 	Node build(NodeEntropy node_entropy);
 	[Throws=BuildError]
@@ -99,7 +112,7 @@ interface Node {
 	SpontaneousPayment spontaneous_payment();
 	OnchainPayment onchain_payment();
 	UnifiedPayment unified_payment();
-	LSPS1Liquidity lsps1_liquidity();
+	Liquidity liquidity();
 	[Throws=NodeError]
 	void lnurl_auth(string lnurl);
 	[Throws=NodeError]
@@ -124,6 +137,8 @@ interface Node {
 	void splice_in_with_all([ByRef]UserChannelId user_channel_id, PublicKey counterparty_node_id);
 	[Throws=NodeError]
 	void splice_out([ByRef]UserChannelId user_channel_id, PublicKey counterparty_node_id, [ByRef]Address address, u64 splice_amount_sats);
+	[Throws=NodeError]
+	void bump_channel_funding_fee([ByRef]UserChannelId user_channel_id, PublicKey counterparty_node_id);
 	[Throws=NodeError]
 	void close_channel([ByRef]UserChannelId user_channel_id, PublicKey counterparty_node_id);
 	[Throws=NodeError]
@@ -167,7 +182,7 @@ interface FeeRate {
 
 typedef interface UnifiedPayment;
 
-typedef interface LSPS1Liquidity;
+typedef interface Liquidity;
 
 [Error]
 enum NodeError {
@@ -231,6 +246,7 @@ enum NodeError {
 	"LnurlAuthFailed",
 	"LnurlAuthTimeout",
 	"InvalidLnurl",
+	"ChainSourceNotSupported",
 };
 
 typedef dictionary NodeStatus;
@@ -275,6 +291,7 @@ dictionary LSPS1OrderStatus {
 	LSPS1OrderParams order_params;
 	LSPS1PaymentInfo payment_options;
 	LSPS1ChannelInfo? channel_state;
+	PublicKey counterparty_node_id;
 };
 
 [Remote]
