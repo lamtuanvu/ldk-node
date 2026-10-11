@@ -31,6 +31,9 @@ use bdk_electrum::BdkElectrumClient;
 use electrum_client::Client as ElectrumClient;
 use electrum_client::ConfigBuilder as ElectrumConfigBuilder;
 use electrum_client::{Batch, ElectrumApi, GetHistoryRes};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Mutex, RwLock};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use bitcoin::{BlockHash, FeeRate, Network, OutPoint, Script, ScriptBuf, Transaction, Txid};
 
@@ -165,10 +168,81 @@ pub(crate) fn plan_mempool_view<'a>(
 pub(crate) const ELECTRUM_CLIENT_NUM_RETRIES: u8 = 3;
 pub(crate) const ELECTRUM_CLIENT_TIMEOUT_SECS: u8 = 20;
 
-pub(crate) struct ElectrumRuntimeClient {
+/// How many ticks in a row a sync slot may still be busy — its previous blocking
+/// call never came back — before the Electrum connections are torn down and
+/// rebuilt. Three Lightning ticks is 90 s: long enough for a slow server to finish
+/// a big sync, short enough that a wedged socket costs minutes, not days.
+pub(crate) const ELECTRUM_WEDGE_TICKS: u32 = 3;
+/// Time allowed for the replacement connections to come up.
+pub(crate) const ELECTRUM_RECONNECT_TIMEOUT_SECS: u64 = 30;
+
+/// The three Electrum connections one node runs on, replaced together.
+struct ElectrumConnections {
 	electrum_client: Arc<ElectrumClient>,
 	bdk_electrum_client: Arc<BdkElectrumClient<ElectrumClient>>,
 	tx_sync: Arc<ElectrumSyncClient<Arc<Logger>>>,
+}
+
+/// One kind of periodic sync may run on one blocking thread at a time.
+///
+/// `tokio::time::timeout` abandons the *future* of a `spawn_blocking` call; the
+/// thread underneath keeps running until the Electrum call returns, and
+/// `ElectrumSyncClient::sync` holds its state mutex for that whole time. Spawning
+/// the next tick regardless therefore queued one more blocked thread every 30 s
+/// until the process hit systemd's TasksMax (seen live: 454 idle `tokio-rt-worker`
+/// threads, Lightning frozen, `channel_ready` never sent). The permit travels INTO
+/// the blocking closure, so the slot stays taken exactly as long as the thread
+/// lives, and a tick that finds it taken skips instead of piling on.
+struct SyncSlot {
+	sem: Arc<Semaphore>,
+	/// Ticks in a row that found the slot taken.
+	busy_ticks: AtomicU32,
+}
+
+impl SyncSlot {
+	fn new() -> Self {
+		Self { sem: Arc::new(Semaphore::new(1)), busy_ticks: AtomicU32::new(0) }
+	}
+
+	/// The permit for this tick, or how many ticks in a row the slot has been busy.
+	fn take(&self) -> Result<OwnedSemaphorePermit, u32> {
+		match Arc::clone(&self.sem).try_acquire_owned() {
+			Ok(permit) => {
+				self.busy_ticks.store(0, Ordering::Relaxed);
+				Ok(permit)
+			},
+			Err(_) => Err(self.busy_ticks.fetch_add(1, Ordering::Relaxed) + 1),
+		}
+	}
+}
+
+struct SyncSlots {
+	lightning: SyncSlot,
+	onchain: SyncSlot,
+	fee: SyncSlot,
+}
+
+impl SyncSlots {
+	fn new() -> Self {
+		Self { lightning: SyncSlot::new(), onchain: SyncSlot::new(), fee: SyncSlot::new() }
+	}
+}
+
+/// What LDK asked us to watch, kept so a rebuilt `ElectrumSyncClient` watches the
+/// same things. LDK registers each tx/output once, at startup or when a channel is
+/// opened; it never re-registers after the chain source reconnects.
+#[derive(Default)]
+struct RegisteredFilters {
+	txs: Vec<(Txid, ScriptBuf)>,
+	outputs: Vec<WatchedOutput>,
+}
+
+pub(crate) struct ElectrumRuntimeClient {
+	server_url: String,
+	electrum_config: electrum_client::Config,
+	conns: RwLock<ElectrumConnections>,
+	slots: RwLock<SyncSlots>,
+	registered: Mutex<RegisteredFilters>,
 	runtime: Arc<tokio::runtime::Runtime>,
 	config: Arc<Config>,
 	logger: Arc<Logger>,
@@ -204,25 +278,112 @@ impl ElectrumRuntimeClient {
 			.timeout(Some(ELECTRUM_CLIENT_TIMEOUT_SECS))
 			.build();
 
-		let electrum_client = Arc::new(
-			ElectrumClient::from_config(&server_url, electrum_config.clone()).map_err(|e| {
-				log_error!(logger, "Failed to connect to electrum server: {}", e);
-				Error::ConnectionFailed
-			})?,
+		let conns = connect(&server_url, &electrum_config, &logger)?;
+		Ok(Self {
+			server_url,
+			electrum_config,
+			conns: RwLock::new(conns),
+			slots: RwLock::new(SyncSlots::new()),
+			registered: Mutex::new(RegisteredFilters::default()),
+			runtime,
+			config,
+			logger,
+		})
+	}
+
+	fn electrum_client(&self) -> Arc<ElectrumClient> {
+		Arc::clone(&self.conns.read().unwrap().electrum_client)
+	}
+
+	fn bdk_electrum_client(&self) -> Arc<BdkElectrumClient<ElectrumClient>> {
+		Arc::clone(&self.conns.read().unwrap().bdk_electrum_client)
+	}
+
+	fn tx_sync(&self) -> Arc<ElectrumSyncClient<Arc<Logger>>> {
+		Arc::clone(&self.conns.read().unwrap().tx_sync)
+	}
+
+	/// The permit for a periodic sync, or `None` when the previous one is still on
+	/// its blocking thread. Past [`ELECTRUM_WEDGE_TICKS`] of that, the connections are
+	/// rebuilt (the wedged thread keeps the OLD client and dies with its call) and
+	/// the next tick starts clean.
+	async fn take_slot(
+		&self, pick: fn(&SyncSlots) -> &SyncSlot, what: &str,
+	) -> Option<OwnedSemaphorePermit> {
+		let busy = match pick(&self.slots.read().unwrap()).take() {
+			Ok(permit) => return Some(permit),
+			Err(busy) => busy,
+		};
+		if busy < ELECTRUM_WEDGE_TICKS {
+			log_error!(
+				self.logger,
+				"Previous {} sync is still running ({} tick(s) in a row); skipping this tick",
+				what,
+				busy
+			);
+			return None;
+		}
+		log_error!(
+			self.logger,
+			"{} sync has been stuck for {} ticks; rebuilding the Electrum connections",
+			what,
+			busy
 		);
-		let electrum_client_2 =
-			ElectrumClient::from_config(&server_url, electrum_config).map_err(|e| {
-				log_error!(logger, "Failed to connect to electrum server: {}", e);
-				Error::ConnectionFailed
-			})?;
-		let bdk_electrum_client = Arc::new(BdkElectrumClient::new(electrum_client_2));
-		let tx_sync = Arc::new(
-			ElectrumSyncClient::new(server_url.clone(), Arc::clone(&logger)).map_err(|e| {
-				log_error!(logger, "Failed to connect to electrum server: {}", e);
-				Error::ConnectionFailed
-			})?,
-		);
-		Ok(Self { electrum_client, bdk_electrum_client, tx_sync, runtime, config, logger })
+		if self.reconnect().await {
+			pick(&self.slots.read().unwrap()).take().ok()
+		} else {
+			None
+		}
+	}
+
+	/// Replace every Electrum connection, watch again what LDK registered, and
+	/// hand out fresh sync slots. `false` when the server could not be reached —
+	/// the next tick tries again.
+	async fn reconnect(&self) -> bool {
+		let server_url = self.server_url.clone();
+		let electrum_config = self.electrum_config.clone();
+		let logger = Arc::clone(&self.logger);
+		let spawn_fut =
+			self.runtime.spawn_blocking(move || connect(&server_url, &electrum_config, &logger));
+		let conns = match tokio::time::timeout(
+			Duration::from_secs(ELECTRUM_RECONNECT_TIMEOUT_SECS),
+			spawn_fut,
+		)
+		.await
+		{
+			Ok(Ok(Ok(conns))) => conns,
+			Ok(Ok(Err(_))) => return false,
+			Ok(Err(e)) => {
+				log_error!(self.logger, "Rebuilding the Electrum connections could not run: {}", e);
+				return false;
+			},
+			Err(_) => {
+				log_error!(
+					self.logger,
+					"Rebuilding the Electrum connections timed out after {}s",
+					ELECTRUM_RECONNECT_TIMEOUT_SECS
+				);
+				return false;
+			},
+		};
+		{
+			let registered = self.registered.lock().unwrap();
+			for (txid, script_pubkey) in registered.txs.iter() {
+				conns.tx_sync.register_tx(txid, script_pubkey);
+			}
+			for output in registered.outputs.iter() {
+				conns.tx_sync.register_output(output.clone());
+			}
+			log_info!(
+				self.logger,
+				"Rebuilt the Electrum connections; watching {} transaction(s) and {} output(s) again",
+				registered.txs.len(),
+				registered.outputs.len()
+			);
+		}
+		*self.conns.write().unwrap() = conns;
+		*self.slots.write().unwrap() = SyncSlots::new();
+		true
 	}
 
 	pub(crate) async fn sync_confirmables(
@@ -230,8 +391,15 @@ impl ElectrumRuntimeClient {
 	) -> Result<(), Error> {
 		let now = Instant::now();
 
-		let tx_sync = Arc::clone(&self.tx_sync);
-		let spawn_fut = self.runtime.spawn_blocking(move || tx_sync.sync(confirmables));
+		let permit = match self.take_slot(|s| &s.lightning, "Lightning wallet").await {
+			Some(permit) => permit,
+			None => return Err(Error::TxSyncTimeout),
+		};
+		let tx_sync = self.tx_sync();
+		let spawn_fut = self.runtime.spawn_blocking(move || {
+			let _slot = permit;
+			tx_sync.sync(confirmables)
+		});
 		let timeout_fut =
 			tokio::time::timeout(Duration::from_secs(LDK_WALLET_SYNC_TIMEOUT_SECS), spawn_fut);
 
@@ -263,10 +431,15 @@ impl ElectrumRuntimeClient {
 		&self, request: BdkFullScanRequest<BdkKeyChainKind>,
 		cached_txs: impl IntoIterator<Item = impl Into<Arc<Transaction>>>,
 	) -> Result<BdkFullScanResponse<BdkKeyChainKind>, Error> {
-		let bdk_electrum_client = Arc::clone(&self.bdk_electrum_client);
+		let permit = match self.take_slot(|s| &s.onchain, "on-chain wallet").await {
+			Some(permit) => permit,
+			None => return Err(Error::WalletOperationTimeout),
+		};
+		let bdk_electrum_client = self.bdk_electrum_client();
 		bdk_electrum_client.populate_tx_cache(cached_txs);
 
 		let spawn_fut = self.runtime.spawn_blocking(move || {
+			let _slot = permit;
 			bdk_electrum_client.full_scan(
 				request,
 				BDK_CLIENT_STOP_GAP,
@@ -297,10 +470,15 @@ impl ElectrumRuntimeClient {
 		&self, request: BdkSyncRequest<(BdkKeyChainKind, u32)>,
 		cached_txs: impl IntoIterator<Item = impl Into<Arc<Transaction>>>,
 	) -> Result<BdkSyncResponse, Error> {
-		let bdk_electrum_client = Arc::clone(&self.bdk_electrum_client);
+		let permit = match self.take_slot(|s| &s.onchain, "on-chain wallet").await {
+			Some(permit) => permit,
+			None => return Err(Error::WalletOperationTimeout),
+		};
+		let bdk_electrum_client = self.bdk_electrum_client();
 		bdk_electrum_client.populate_tx_cache(cached_txs);
 
 		let spawn_fut = self.runtime.spawn_blocking(move || {
+			let _slot = permit;
 			bdk_electrum_client.sync(request, BDK_ELECTRUM_CLIENT_BATCH_SIZE, true)
 		});
 		let wallet_sync_timeout_fut =
@@ -330,7 +508,7 @@ impl ElectrumRuntimeClient {
 	/// verdict table classifies it and the verdict is logged at trace; any
 	/// other protocol error, a failed call or a timed-out one is `Unavailable`.
 	pub(crate) async fn broadcast(&self, tx: Transaction) -> TxBroadcastOutcome {
-		let electrum_client = Arc::clone(&self.electrum_client);
+		let electrum_client = self.electrum_client();
 
 		let txid = tx.compute_txid();
 		let tx_bytes = tx.encode();
@@ -433,7 +611,7 @@ impl ElectrumRuntimeClient {
 
 		let unreachable = Anchored { value: RawTxObservation::Unreachable, tip: None };
 
-		let electrum_client = Arc::clone(&self.electrum_client);
+		let electrum_client = self.electrum_client();
 
 		let spawn_fut = self.runtime.spawn_blocking(move || {
 			let history = electrum_client.script_get_history(script_pubkey.as_script())?;
@@ -480,7 +658,11 @@ impl ElectrumRuntimeClient {
 	pub(crate) async fn get_fee_rate_cache_update(
 		&self,
 	) -> Result<HashMap<ConfirmationTarget, FeeRate>, Error> {
-		let electrum_client = Arc::clone(&self.electrum_client);
+		let permit = match self.take_slot(|s| &s.fee, "fee rate").await {
+			Some(permit) => permit,
+			None => return Err(Error::FeerateEstimationUpdateTimeout),
+		};
+		let electrum_client = self.electrum_client();
 
 		let mut batch = Batch::default();
 		let confirmation_targets = get_all_conf_targets();
@@ -489,7 +671,10 @@ impl ElectrumRuntimeClient {
 			batch.estimate_fee(num_blocks);
 		}
 
-		let spawn_fut = self.runtime.spawn_blocking(move || electrum_client.batch_call(&batch));
+		let spawn_fut = self.runtime.spawn_blocking(move || {
+			let _slot = permit;
+			electrum_client.batch_call(&batch)
+		});
 
 		let timeout_fut = tokio::time::timeout(
 			Duration::from_secs(FEE_RATE_CACHE_UPDATE_TIMEOUT_SECS),
@@ -570,7 +755,7 @@ impl ElectrumRuntimeClient {
 	pub(crate) async fn mempool_view(
 		&self, scripts: Vec<ScriptBuf>, known_unconfirmed: Vec<Txid>,
 	) -> Result<ElectrumMempoolView, Error> {
-		let electrum_client = Arc::clone(&self.electrum_client);
+		let electrum_client = self.electrum_client();
 		let logger = Arc::clone(&self.logger);
 		let spawn_fut = self.runtime.spawn_blocking(move || {
 			mempool_view_blocking(&electrum_client, &logger, scripts, known_unconfirmed)
@@ -609,7 +794,7 @@ impl ElectrumRuntimeClient {
 			Error::ChainServeFailed
 		})?;
 
-		let bdk_electrum_client = Arc::clone(&self.bdk_electrum_client);
+		let bdk_electrum_client = self.bdk_electrum_client();
 		let spawn_fut = self.runtime.spawn_blocking(move || {
 			bdk_electrum_client.sync(sync_request, BDK_ELECTRUM_CLIENT_BATCH_SIZE, true)
 		});
@@ -668,7 +853,7 @@ impl ElectrumRuntimeClient {
 			watched_outputs.push((outpoint, script));
 		}
 
-		let electrum_client = Arc::clone(&self.electrum_client);
+		let electrum_client = self.electrum_client();
 		let logger = Arc::clone(&self.logger);
 		let spawn_fut = self.runtime.spawn_blocking(move || {
 			serve_lightning_sync_blocking(&electrum_client, &logger, watched_txs, watched_outputs)
@@ -910,12 +1095,63 @@ fn mempool_view_blocking(
 	Ok(ElectrumMempoolView { unconfirmed, evicted, tip })
 }
 
+/// Open the three connections one node syncs on. Blocking: it dials the server.
+fn connect(
+	server_url: &str, electrum_config: &electrum_client::Config, logger: &Arc<Logger>,
+) -> Result<ElectrumConnections, Error> {
+	let electrum_client = Arc::new(
+		ElectrumClient::from_config(server_url, electrum_config.clone()).map_err(|e| {
+			log_error!(logger, "Failed to connect to electrum server: {}", e);
+			Error::ConnectionFailed
+		})?,
+	);
+	let electrum_client_2 =
+		ElectrumClient::from_config(server_url, electrum_config.clone()).map_err(|e| {
+			log_error!(logger, "Failed to connect to electrum server: {}", e);
+			Error::ConnectionFailed
+		})?;
+	let bdk_electrum_client = Arc::new(BdkElectrumClient::new(electrum_client_2));
+	let tx_sync = Arc::new(
+		ElectrumSyncClient::new(server_url.to_string(), Arc::clone(logger)).map_err(|e| {
+			log_error!(logger, "Failed to connect to electrum server: {}", e);
+			Error::ConnectionFailed
+		})?,
+	);
+	Ok(ElectrumConnections { electrum_client, bdk_electrum_client, tx_sync })
+}
+
+#[cfg(test)]
+mod sync_slot_tests {
+	use super::*;
+
+	#[test]
+	fn a_slot_is_taken_until_the_permit_drops_and_counts_the_ticks_it_refused() {
+		let slot = SyncSlot::new();
+		let permit = slot.take().expect("free slot");
+		assert_eq!(slot.take().unwrap_err(), 1);
+		assert_eq!(slot.take().unwrap_err(), 2);
+		assert_eq!(slot.take().unwrap_err(), 3);
+		drop(permit);
+		let again = slot.take().expect("free again once the blocking closure returned");
+		assert_eq!(slot.busy_ticks.load(Ordering::Relaxed), 0, "a successful take resets the streak");
+		drop(again);
+	}
+
+	#[test]
+	fn the_wedge_threshold_spans_three_lightning_ticks() {
+		// 3 × the 30 s Lightning sync interval = 90 s before the connections are rebuilt.
+		assert_eq!(ELECTRUM_WEDGE_TICKS, 3);
+	}
+}
+
 impl Filter for ElectrumRuntimeClient {
 	fn register_tx(&self, txid: &Txid, script_pubkey: &Script) {
-		self.tx_sync.register_tx(txid, script_pubkey)
+		self.registered.lock().unwrap().txs.push((*txid, script_pubkey.to_owned()));
+		self.tx_sync().register_tx(txid, script_pubkey)
 	}
 	fn register_output(&self, output: WatchedOutput) {
-		self.tx_sync.register_output(output)
+		self.registered.lock().unwrap().outputs.push(output.clone());
+		self.tx_sync().register_output(output)
 	}
 }
 
