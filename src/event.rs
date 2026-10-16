@@ -28,6 +28,7 @@ use crate::io::{
 	EVENT_QUEUE_PERSISTENCE_SECONDARY_NAMESPACE,
 };
 use crate::logger::{log_debug, log_error, log_info, LdkLogger};
+use crate::path_failure::{attribute_path_failure, PathFailureInfo, PathFailureStore};
 
 use lightning::events::bump_transaction::BumpTransactionEvent;
 use lightning::events::{ClosureReason, FundingInfo, PaymentPurpose, ReplayEvent};
@@ -54,7 +55,7 @@ use core::task::{Poll, Waker};
 use std::collections::VecDeque;
 use std::ops::Deref;
 use std::sync::{Arc, Condvar, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// An event emitted by [`Node`], which should be handled by the user.
 ///
@@ -451,6 +452,7 @@ where
 	liquidity_source: Option<Arc<LiquiditySource<Arc<Logger>>>>,
 	payment_store: Arc<PaymentStore>,
 	peer_store: Arc<PeerStore<L>>,
+	path_failures: Arc<PathFailureStore>,
 	runtime: Arc<RwLock<Option<Arc<tokio::runtime::Runtime>>>>,
 	logger: L,
 	config: Arc<Config>,
@@ -467,6 +469,7 @@ where
 		output_sweeper: Arc<Sweeper>, network_graph: Arc<Graph>,
 		liquidity_source: Option<Arc<LiquiditySource<Arc<Logger>>>>,
 		payment_store: Arc<PaymentStore>, peer_store: Arc<PeerStore<L>>,
+		path_failures: Arc<PathFailureStore>,
 		runtime: Arc<RwLock<Option<Arc<tokio::runtime::Runtime>>>>, logger: L, config: Arc<Config>,
 	) -> Self {
 		Self {
@@ -480,6 +483,7 @@ where
 			liquidity_source,
 			payment_store,
 			peer_store,
+			path_failures,
 			logger,
 			runtime,
 			config,
@@ -1101,7 +1105,61 @@ where
 			},
 
 			LdkEvent::PaymentPathSuccessful { .. } => {},
-			LdkEvent::PaymentPathFailed { .. } => {},
+			LdkEvent::PaymentPathFailed {
+				payment_id: Some(payment_id),
+				payment_failed_permanently,
+				failure,
+				path,
+				short_channel_id,
+				..
+			} => {
+				// No user-facing event is emitted for a single failed path (the terminal
+				// `PaymentFailed` still follows); we only remember the per-hop detail so
+				// route-driving callers can ask `Node::path_failure` which leg broke.
+				let our_node_id = self.channel_manager.get_our_node_id();
+				let attribution =
+					attribute_path_failure(&path, short_channel_id, &failure, &our_node_id);
+
+				// Observation only: LDK's background processor applies the event's
+				// `network_update` to the graph itself and may do so before or after this
+				// handler runs, so an absent channel here is not proof the prune happened
+				// because of this event (see `PathFailureInfo::graph_pruned`).
+				let graph_pruned =
+					match (attribution.graph_lookup_meaningful, attribution.short_channel_id) {
+						(true, Some(scid)) => {
+							self.network_graph.read_only().channel(scid).is_none()
+						},
+						_ => false,
+					};
+
+				let at_unix_secs =
+					SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+
+				let info = PathFailureInfo {
+					short_channel_id: attribution.short_channel_id,
+					failing_node_id: attribution.failing_node_id,
+					hop_index: attribution.hop_index,
+					failure_class: attribution.failure_class,
+					payment_failed_permanently,
+					graph_pruned,
+					at_unix_secs,
+				};
+
+				log_debug!(
+					self.logger,
+					"Payment path failed for payment {}: class={} scid={:?} hop_index={:?} failing_node={:?} graph_pruned={} permanent={}",
+					payment_id,
+					info.failure_class.as_str(),
+					info.short_channel_id,
+					info.hop_index,
+					info.failing_node_id,
+					info.graph_pruned,
+					info.payment_failed_permanently,
+				);
+
+				self.path_failures.insert(payment_id, info);
+			},
+			LdkEvent::PaymentPathFailed { payment_id: None, .. } => {},
 			LdkEvent::ProbeSuccessful { .. } => {},
 			LdkEvent::ProbeFailed { .. } => {},
 			LdkEvent::HTLCHandlingFailed { failed_next_destination, .. } => {
