@@ -93,6 +93,7 @@ pub mod io;
 pub mod liquidity;
 pub mod logger;
 mod message_handler;
+mod path_failure;
 pub mod payment;
 mod peer_store;
 mod sweep;
@@ -140,6 +141,13 @@ use error::Error;
 pub use event::Event;
 
 pub use io::utils::generate_entropy_mnemonic;
+
+/// Per-payment path-failure detail captured from LDK's `PaymentPathFailed` event
+/// (cooperative cycle-balance observability). The types are always public; the
+/// accessor `Node::path_failure` is gated behind the `cycles` feature like
+/// `Node::send_along_route`.
+pub use path_failure::{PathFailureClass, PathFailureInfo, PATH_FAILURE_STORE_CAPACITY};
+use path_failure::PathFailureStore;
 
 /// Public swap fee-priority selector (Peerswap native primitives, B-series).
 ///
@@ -265,6 +273,9 @@ pub struct Node {
 	payment_store: Arc<PaymentStore>,
 	is_listening: Arc<AtomicBool>,
 	node_metrics: Arc<RwLock<NodeMetrics>>,
+	/// Last `PaymentPathFailed` detail per payment (bounded, in-memory). Written by
+	/// the event handler, read via `Node::path_failure`.
+	path_failures: Arc<PathFailureStore>,
 	/// Reorg-aware swap-txid watch registry (Peerswap native primitive B5).
 	#[cfg(feature = "swaps")]
 	swap_tx_watch: Arc<chain::SwapTxWatch>,
@@ -661,6 +672,7 @@ impl Node {
 			self.liquidity_source.clone(),
 			Arc::clone(&self.payment_store),
 			Arc::clone(&self.peer_store),
+			Arc::clone(&self.path_failures),
 			Arc::clone(&self.runtime),
 			Arc::clone(&self.logger),
 			Arc::clone(&self.config),
@@ -2038,6 +2050,25 @@ impl Node {
 	/// Returns `Some` if the payment was known and `None` otherwise.
 	pub fn payment(&self, payment_id: &PaymentId) -> Option<PaymentDetails> {
 		self.payment_store.get(payment_id)
+	}
+
+	/// Retrieve what LDK reported about the last failed path of the payment with
+	/// the given id: which hop broke, which node forwarded into it, and a coarse
+	/// [`PathFailureClass`].
+	///
+	/// Returns `None` when no `PaymentPathFailed` event has been observed for the
+	/// payment, or when its record has been evicted (only the most recent
+	/// [`PATH_FAILURE_STORE_CAPACITY`] payments are retained, in memory only; the
+	/// record does not survive a restart).
+	///
+	/// Intended for callers of [`Node::send_along_route`] that observe the payment
+	/// reaching [`PaymentStatus::Failed`] via [`Node::payment`] and need to know
+	/// which leg of their hand-built route to avoid next time.
+	///
+	/// [`PaymentStatus::Failed`]: crate::payment::PaymentStatus::Failed
+	#[cfg(feature = "cycles")]
+	pub fn path_failure(&self, payment_id: &PaymentId) -> Option<PathFailureInfo> {
+		self.path_failures.get(payment_id)
 	}
 
 	/// Remove the payment with the given id from the store.

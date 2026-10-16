@@ -2249,6 +2249,7 @@ fn build_with_store_internal(
 		payment_store,
 		is_listening,
 		node_metrics,
+		path_failures: Arc::new(crate::path_failure::PathFailureStore::new()),
 		#[cfg(feature = "swaps")]
 		swap_tx_watch: Arc::new(crate::chain::SwapTxWatch::new()),
 	})
