@@ -1117,13 +1117,18 @@ where
 				// `PaymentFailed` still follows); we only remember the per-hop detail so
 				// route-driving callers can ask `Node::path_failure` which leg broke.
 				let our_node_id = self.channel_manager.get_our_node_id();
-				let attribution =
-					attribute_path_failure(&path, short_channel_id, &failure, &our_node_id);
+				let attribution = attribute_path_failure(
+					&path,
+					short_channel_id,
+					&failure,
+					payment_failed_permanently,
+					&our_node_id,
+				);
 
-				// Observation only: LDK's background processor applies the event's
-				// `network_update` to the graph itself and may do so before or after this
-				// handler runs, so an absent channel here is not proof the prune happened
-				// because of this event (see `PathFailureInfo::graph_pruned`).
+				// The background processor applies the event's `network_update` to the
+				// graph before awaiting this handler, so this reads the graph after that
+				// update: a permanently failed channel is already gone here
+				// (see `PathFailureInfo::graph_pruned`).
 				let graph_pruned =
 					match (attribution.graph_lookup_meaningful, attribution.short_channel_id) {
 						(true, Some(scid)) => {

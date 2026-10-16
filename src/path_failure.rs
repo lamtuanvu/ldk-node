@@ -51,9 +51,18 @@ pub enum PathFailureClass {
 	/// (`NetworkUpdate::ChannelFailure { is_permanent: false }`) or an on-path error
 	/// carrying no graph update at all (fee/CLTV mismatch, liquidity, etc.).
 	Transient,
-	/// Our own node refused to send before any HTLC was committed
-	/// ([`PathFailure::InitialSend`]), e.g. the first hop channel is not usable.
+	/// The failure originated on our own side: either we refused to send before
+	/// any HTLC was committed ([`PathFailure::InitialSend`], e.g. the first hop
+	/// channel is not usable), or our direct peer returned a malformed-onion
+	/// failure for the first hop (an on-path error with no graph update blamed on
+	/// `hops[0]`), which means the onion we built was unusable.
 	Local,
+	/// The final node rejected the payment itself: an on-path error carrying no
+	/// graph update and no blamed channel, with LDK's `payment_failed_permanently`
+	/// set (PERM final-node failure codes such as `incorrect_or_unknown_payment_details`
+	/// and `final_incorrect_htlc_amount`, or garbage from the final node). In a
+	/// circular self-payment the payee is our own node.
+	PayeeRejected,
 	/// No path failure is recorded for the payment. Never produced by the
 	/// capture itself; reserved for consumers that need a "nothing known" value.
 	Unknown,
@@ -67,6 +76,7 @@ impl PathFailureClass {
 			PathFailureClass::NodeDown => "node_down",
 			PathFailureClass::Transient => "transient",
 			PathFailureClass::Local => "local",
+			PathFailureClass::PayeeRejected => "payee_rejected",
 			PathFailureClass::Unknown => "unknown",
 		}
 	}
@@ -86,8 +96,12 @@ pub struct PathFailureInfo {
 	/// named. `None` when the blamed channel is not part of the reported path.
 	pub failing_node_id: Option<PublicKey>,
 	/// Zero-based index into the path's hops of the hop whose
-	/// `short_channel_id` matches the blamed channel. `None` when the blamed
-	/// channel is not part of the reported path (an alias, or no channel blamed).
+	/// `short_channel_id` matches the blamed channel, i.e. the hop the HTLC could
+	/// not be forwarded *into*. For a channel failure the forwarder that failed it
+	/// is the previous hop (see `failing_node_id`); for a
+	/// [`PathFailureClass::NodeDown`] it is the failed node's own inbound hop, so
+	/// `hops[hop_index].pubkey` is the failed node. `None` when the blamed channel
+	/// is not part of the reported path (an alias, or no channel blamed).
 	pub hop_index: Option<u32>,
 	/// Coarse failure classification.
 	pub failure_class: PathFailureClass,
@@ -98,11 +112,12 @@ pub struct PathFailureInfo {
 	/// failure was recorded.
 	///
 	/// LDK's background processor applies the event's `network_update` to the graph
-	/// itself and the ordering of that application relative to our event handler is
-	/// not guaranteed, so this is an *observation* taken at capture time, not proof
-	/// that the capture caused or awaited the prune. Only computed when the blamed
-	/// hop is part of the path and flagged as possibly announced; an unannounced or
-	/// aliased channel is never in the graph and would read as a false positive.
+	/// (`handle_network_graph_update`) before it awaits our event handler for the
+	/// same event, so this is observed *after* the update was applied: a permanent
+	/// channel failure reads `true` here once the graph has dropped the channel.
+	/// Only computed when the blamed hop is part of the path and flagged as
+	/// possibly announced; an unannounced or aliased channel is never in the graph
+	/// and would read as a false positive.
 	pub graph_pruned: bool,
 	/// Unix timestamp (seconds) at which the failure was recorded.
 	pub at_unix_secs: u64,
@@ -155,22 +170,29 @@ pub(crate) struct PathFailureAttribution {
 /// Pure function over the event payload so it can be unit-tested without a node.
 /// `short_channel_id` is the event's blamed channel; when it is `None` but the
 /// failure carries a `ChannelFailure` update, that update's channel is used.
+///
+/// An on-path failure with no graph update is ambiguous on its own, so it is
+/// split by context: `payment_failed_permanently` means the final node rejected
+/// the payment ([`PathFailureClass::PayeeRejected`]); a blamed first hop means our
+/// direct peer could not even parse the onion ([`PathFailureClass::Local`]);
+/// anything else is [`PathFailureClass::Transient`].
 pub(crate) fn attribute_path_failure(
-	path: &Path, short_channel_id: Option<u64>, failure: &PathFailure, our_node_id: &PublicKey,
+	path: &Path, short_channel_id: Option<u64>, failure: &PathFailure,
+	payment_failed_permanently: bool, our_node_id: &PublicKey,
 ) -> PathFailureAttribution {
-	let (failure_class, update_scid, update_node) = match failure {
-		PathFailure::InitialSend { .. } => (PathFailureClass::Local, None, None),
+	let (update_class, update_scid, update_node) = match failure {
+		PathFailure::InitialSend { .. } => (Some(PathFailureClass::Local), None, None),
 		PathFailure::OnPath { network_update } => match network_update {
 			Some(NetworkUpdate::ChannelFailure { short_channel_id, is_permanent: true }) => {
-				(PathFailureClass::ChannelClosed, Some(*short_channel_id), None)
+				(Some(PathFailureClass::ChannelClosed), Some(*short_channel_id), None)
 			},
 			Some(NetworkUpdate::ChannelFailure { short_channel_id, is_permanent: false }) => {
-				(PathFailureClass::Transient, Some(*short_channel_id), None)
+				(Some(PathFailureClass::Transient), Some(*short_channel_id), None)
 			},
 			Some(NetworkUpdate::NodeFailure { node_id, .. }) => {
-				(PathFailureClass::NodeDown, None, Some(*node_id))
+				(Some(PathFailureClass::NodeDown), None, Some(*node_id))
 			},
-			None => (PathFailureClass::Transient, None, None),
+			None => (None, None, None),
 		},
 	};
 
@@ -187,6 +209,13 @@ pub(crate) fn attribute_path_failure(
 	let failing_node_id = update_node.or(forwarder);
 
 	let graph_lookup_meaningful = hop.map(|(_, h)| h.maybe_announced_channel).unwrap_or(false);
+
+	let failure_class = match update_class {
+		Some(class) => class,
+		None if payment_failed_permanently => PathFailureClass::PayeeRejected,
+		None if hop_index == Some(0) => PathFailureClass::Local,
+		None => PathFailureClass::Transient,
+	};
 
 	PathFailureAttribution {
 		short_channel_id,
@@ -240,7 +269,7 @@ mod tests {
 			}),
 		};
 
-		let got = attribute_path_failure(&path, Some(200), &failure, &us);
+		let got = attribute_path_failure(&path, Some(200), &failure, false, &us);
 
 		assert_eq!(got.failure_class, PathFailureClass::ChannelClosed);
 		assert_eq!(got.short_channel_id, Some(200));
@@ -257,7 +286,7 @@ mod tests {
 			network_update: Some(NetworkUpdate::NodeFailure { node_id: b, is_permanent: false }),
 		};
 
-		let got = attribute_path_failure(&path, Some(300), &failure, &us);
+		let got = attribute_path_failure(&path, Some(300), &failure, false, &us);
 
 		assert_eq!(got.failure_class, PathFailureClass::NodeDown);
 		assert_eq!(got.short_channel_id, Some(300));
@@ -276,16 +305,60 @@ mod tests {
 				is_permanent: false,
 			}),
 		};
-		let got = attribute_path_failure(&path, Some(300), &temporary, &us);
+		let got = attribute_path_failure(&path, Some(300), &temporary, false, &us);
 		assert_eq!(got.failure_class, PathFailureClass::Transient);
 		assert_eq!(got.hop_index, Some(2));
 		assert_eq!(got.failing_node_id, Some(b));
 
 		let bare = PathFailure::OnPath { network_update: None };
-		let got = attribute_path_failure(&path, Some(100), &bare, &us);
+		let got = attribute_path_failure(&path, Some(200), &bare, false, &us);
 		assert_eq!(got.failure_class, PathFailureClass::Transient);
+		assert_eq!(got.hop_index, Some(1));
+		assert_eq!(got.failing_node_id, Some(a), "blamed on the forwarder into hop 1");
+	}
+
+	#[test]
+	fn first_hop_failure_without_update_is_local_and_blamed_on_us() {
+		// `update_fail_malformed_htlc` from our direct peer: OnPath with no network
+		// update, blamed on hops[0], payment not permanently failed.
+		let (us, a, b) = (pubkey(1), pubkey(2), pubkey(3));
+		let path = cycle_path(us, a, b);
+		let failure = PathFailure::OnPath { network_update: None };
+
+		let got = attribute_path_failure(&path, Some(100), &failure, false, &us);
+
+		assert_eq!(got.failure_class, PathFailureClass::Local);
+		assert_eq!(got.short_channel_id, Some(100));
 		assert_eq!(got.hop_index, Some(0));
 		assert_eq!(got.failing_node_id, Some(us), "first hop is our own outgoing channel");
+	}
+
+	#[test]
+	fn permanent_failure_without_update_or_channel_is_payee_rejected() {
+		// PERM final-node codes (incorrect_or_unknown_payment_details, final_incorrect_*)
+		// surface as OnPath { None }, no blamed channel, payment_failed_permanently.
+		let (us, a, b) = (pubkey(1), pubkey(2), pubkey(3));
+		let path = cycle_path(us, a, b);
+		let failure = PathFailure::OnPath { network_update: None };
+
+		let got = attribute_path_failure(&path, None, &failure, true, &us);
+
+		assert_eq!(got.failure_class, PathFailureClass::PayeeRejected);
+		assert_eq!(got.short_channel_id, None);
+		assert_eq!(got.hop_index, None);
+		assert_eq!(got.failing_node_id, None);
+		assert!(!got.graph_lookup_meaningful);
+
+		// A permanent payment failure that still names a closed channel keeps the
+		// more specific class.
+		let closed = PathFailure::OnPath {
+			network_update: Some(NetworkUpdate::ChannelFailure {
+				short_channel_id: 200,
+				is_permanent: true,
+			}),
+		};
+		let got = attribute_path_failure(&path, Some(200), &closed, true, &us);
+		assert_eq!(got.failure_class, PathFailureClass::ChannelClosed);
 	}
 
 	#[test]
@@ -296,7 +369,7 @@ mod tests {
 			err: APIError::ChannelUnavailable { err: "peer disconnected".to_string() },
 		};
 
-		let got = attribute_path_failure(&path, Some(100), &failure, &us);
+		let got = attribute_path_failure(&path, Some(100), &failure, false, &us);
 
 		assert_eq!(got.failure_class, PathFailureClass::Local);
 		assert_eq!(got.short_channel_id, Some(100));
@@ -315,7 +388,7 @@ mod tests {
 			}),
 		};
 
-		let got = attribute_path_failure(&path, Some(999), &failure, &us);
+		let got = attribute_path_failure(&path, Some(999), &failure, false, &us);
 
 		assert_eq!(got.failure_class, PathFailureClass::ChannelClosed);
 		assert_eq!(got.short_channel_id, Some(999));
@@ -324,8 +397,8 @@ mod tests {
 		assert!(!got.graph_lookup_meaningful);
 
 		// No blamed channel at all: nothing to attribute, class still follows the update.
-		let got =
-			attribute_path_failure(&path, None, &PathFailure::OnPath { network_update: None }, &us);
+		let bare = PathFailure::OnPath { network_update: None };
+		let got = attribute_path_failure(&path, None, &bare, false, &us);
 		assert_eq!(got.failure_class, PathFailureClass::Transient);
 		assert_eq!(got.short_channel_id, None);
 		assert_eq!(got.hop_index, None);
@@ -343,7 +416,7 @@ mod tests {
 			}),
 		};
 
-		let got = attribute_path_failure(&path, None, &failure, &us);
+		let got = attribute_path_failure(&path, None, &failure, false, &us);
 
 		assert_eq!(got.short_channel_id, Some(200));
 		assert_eq!(got.hop_index, Some(1));
@@ -357,7 +430,7 @@ mod tests {
 		path.hops[0].maybe_announced_channel = false;
 		let failure = PathFailure::OnPath { network_update: None };
 
-		let got = attribute_path_failure(&path, Some(100), &failure, &us);
+		let got = attribute_path_failure(&path, Some(100), &failure, false, &us);
 
 		assert_eq!(got.hop_index, Some(0));
 		assert!(!got.graph_lookup_meaningful);
@@ -369,6 +442,7 @@ mod tests {
 		assert_eq!(PathFailureClass::NodeDown.as_str(), "node_down");
 		assert_eq!(PathFailureClass::Transient.as_str(), "transient");
 		assert_eq!(PathFailureClass::Local.as_str(), "local");
+		assert_eq!(PathFailureClass::PayeeRejected.as_str(), "payee_rejected");
 		assert_eq!(PathFailureClass::Unknown.as_str(), "unknown");
 	}
 
@@ -396,9 +470,10 @@ mod tests {
 		let oldest = PaymentId([0u8; 32]);
 		assert_eq!(store.get(&oldest), None, "oldest entry must have been evicted");
 
+		let newest_at = PATH_FAILURE_STORE_CAPACITY as u64 + 7;
 		let mut newest = [0u8; 32];
-		newest[..8].copy_from_slice(&(PATH_FAILURE_STORE_CAPACITY as u64 + 7).to_be_bytes());
-		assert_eq!(store.get(&PaymentId(newest)).map(|i| i.at_unix_secs), Some(263));
+		newest[..8].copy_from_slice(&newest_at.to_be_bytes());
+		assert_eq!(store.get(&PaymentId(newest)).map(|i| i.at_unix_secs), Some(newest_at));
 
 		let entries = store.entries.lock().unwrap();
 		assert_eq!(entries.len(), PATH_FAILURE_STORE_CAPACITY);
