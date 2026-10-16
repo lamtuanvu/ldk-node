@@ -1,3 +1,8 @@
+# Standalone crate: never a member of a surrounding workspace. Without this,
+# a local clone placed inside the consuming monorepo is captured by that
+# repo's workspace and fails to resolve.
+[workspace]
+
 [package]
 name = "ldk-node"
 version = "0.7.0+git"
@@ -33,6 +38,10 @@ swaps = []
 # Gates the `Node::send_along_route` entry point; the `PaymentKind::Rebalance`
 # variant and its `event.rs` claim path stay ungated for TLV compatibility.
 cycles = []
+# BIP157/158 compact-block-filter chain source (T6 groundwork; the engine lands in T7).
+# Pulls in `bip157` (kyoto) and the tokio `net` feature its peer sockets need, so the
+# default build stays free of both.
+cbf = ["dep:bip157", "tokio/net"]
 
 [dependencies]
 lightning = { version = "0.1.0", features = ["std"] }
@@ -72,8 +81,12 @@ bdk_chain = { version = "0.23.0", default-features = false, features = ["std"] }
 bdk_esplora = { version = "0.22.0", default-features = false, features = ["async-https-rustls", "tokio"]}
 bdk_electrum = { version = "0.23.0", default-features = false, features = ["use-rustls"]}
 bdk_wallet = { version = "2.0.0", default-features = false, features = ["std", "keys-bip39"]}
+bip157 = { version = "0.6.3", default-features = false, optional = true }
 
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Only to pick a crypto provider explicitly: rustls panics rather than guess
+# when several are linked. See `install_default_crypto_provider`.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 rusqlite = { version = "0.31.0", features = ["bundled"] }
 bitcoin = "0.32.4"
 bip39 = "2.0.0"
@@ -81,6 +94,9 @@ bip21 = { version = "0.5", features = ["std"], default-features = false }
 
 base64 = { version = "0.22.1", default-features = false, features = ["std"] }
 rand = "0.8.5"
+# Needed for object-safe async methods on the chain ability adapters
+# (`Arc<dyn FeeAdapter>` and friends in `chain::seam`).
+async-trait = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 tokio = { version = "1.37", default-features = false, features = [ "rt-multi-thread", "time", "sync", "macros" ] }
 esplora-client = { version = "0.12", default-features = false, features = ["tokio", "async-https-rustls"] }

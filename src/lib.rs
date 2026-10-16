@@ -93,12 +93,33 @@ pub mod io;
 pub mod liquidity;
 pub mod logger;
 mod message_handler;
+mod path_failure;
 pub mod payment;
 mod peer_store;
 mod sweep;
 mod tx_broadcaster;
 mod types;
 mod wallet;
+
+/// The remote chain provider port, for nodes with no chain source of their own.
+///
+/// A Dependent node fills every chain slot from one implementation of
+/// [`chain_provider::ChainDataProvider`], supplied through
+/// [`Builder::set_chain_source_dependent`]. The transport is the implementor's
+/// business; this crate never learns what it is.
+pub use crate::chain::provider as chain_provider;
+
+/// The raw BIP157/158 filter source port.
+///
+/// [`chain_filter_source::FilterSource`] is what a compact-block-filter node
+/// reads headers, filter headers, filters and blocks through, verifying all
+/// of it. A Pro node with a raw source (see
+/// [`Builder::set_raw_chain_source_bitcoind_rpc`]) serves that data through
+/// [`Node::chain_serve_headers`] and its siblings; an app implements the trait
+/// over its own transport to consume it.
+pub use crate::chain::cbf::source as chain_filter_source;
+
+pub use crate::chain::adapters::bitcoind_raw::RawSourceStatus;
 
 pub use bip39;
 pub use bitcoin;
@@ -109,12 +130,24 @@ pub use lightning_types;
 pub use vss_client;
 
 pub use balance::{BalanceDetails, LightningBalance, PendingSweepBalance};
+pub use chain::{
+	CbfSyncStatus, ChainSlotAdapterStatus, ChainSlotStatus, ChainUtxoStatus, ChainUtxoVerification,
+};
+#[cfg(feature = "cbf")]
+pub use config::{CbfConfig, CbfExternalFee, CbfSource};
 pub use error::Error as NodeError;
 use error::Error;
 
 pub use event::Event;
 
 pub use io::utils::generate_entropy_mnemonic;
+
+/// Per-payment path-failure detail captured from LDK's `PaymentPathFailed` event
+/// (cooperative cycle-balance observability). The types are always public; the
+/// accessor `Node::path_failure` is gated behind the `cycles` feature like
+/// `Node::send_along_route`.
+pub use path_failure::{PathFailureClass, PathFailureInfo, PATH_FAILURE_STORE_CAPACITY};
+use path_failure::PathFailureStore;
 
 /// Public swap fee-priority selector (Peerswap native primitives, B-series).
 ///
@@ -159,7 +192,7 @@ pub use builder::BuildError;
 #[cfg(not(feature = "uniffi"))]
 pub use builder::NodeBuilder as Builder;
 
-use chain::ChainSource;
+use chain::ChainLayer;
 use config::{
 	default_user_config, may_announce_channel, ChannelConfig, Config, NODE_ANN_BCAST_INTERVAL,
 	PEER_RECONNECTION_INTERVAL, RGS_SYNC_INTERVAL,
@@ -218,7 +251,7 @@ pub struct Node {
 	event_handling_stopped_sender: tokio::sync::watch::Sender<()>,
 	config: Arc<Config>,
 	wallet: Arc<Wallet>,
-	chain_source: Arc<ChainSource>,
+	chain_source: Arc<ChainLayer>,
 	tx_broadcaster: Arc<Broadcaster>,
 	event_queue: Arc<EventQueue<Arc<Logger>>>,
 	channel_manager: Arc<ChannelManager>,
@@ -240,6 +273,9 @@ pub struct Node {
 	payment_store: Arc<PaymentStore>,
 	is_listening: Arc<AtomicBool>,
 	node_metrics: Arc<RwLock<NodeMetrics>>,
+	/// Last `PaymentPathFailed` detail per payment (bounded, in-memory). Written by
+	/// the event handler, read via `Node::path_failure`.
+	path_failures: Arc<PathFailureStore>,
 	/// Reorg-aware swap-txid watch registry (Peerswap native primitive B5).
 	#[cfg(feature = "swaps")]
 	swap_tx_watch: Arc<chain::SwapTxWatch>,
@@ -286,12 +322,68 @@ impl Node {
 			e
 		})?;
 
-		// Block to ensure we update our fee rate cache once on startup
+		// Record which adapters occupy each chain ability slot, in chain order,
+		// so a support question about a fee or broadcast answer can be traced
+		// to the thing that produced it without guessing from config.
+		let slots = self.chain_source.slot_adapters();
+		log_info!(self.logger, "Chain ability slots: {}", slots);
+		if slots.utxo.is_none() {
+			// Say this out loud. Without a UTXO source the routing graph accepts
+			// every peer's channel_announcement without checking that the funding
+			// output exists, and nothing else reports it.
+			log_info!(
+				self.logger,
+				"No chain adapter can verify BOLT-7 channel announcements; the routing graph will carry unverified channel capacities."
+			);
+		}
+
+		// Refresh the fee rate cache once on startup — but do NOT let a failure
+		// stop the node coming up.
+		//
+		// DEVIATION from upstream ldk-node, which propagates this error with
+		// `?` and refuses to start. Upstream's rule is a reachability probe on
+		// the chain source, using the cheapest call available: fail fast rather
+		// than come up blind. That is sound for a node whose chain source is an
+		// external server it can retry until the network appears.
+		//
+		// It is wrong for a node whose chain source is reached through this
+		// node's own transport. There the probe is gated on the node it is
+		// gating — identity and message signing are served by the application
+		// wrapping this crate, and that application cannot answer until start()
+		// returns. The node then retries forever against a dependency that can
+		// never be satisfied.
+		//
+		// Two facts make continuing safe rather than reckless:
+		//
+		//   * `FeeEstimator::estimate_fee_rate` cannot fail. Every target has a
+		//     hardcoded fallback, so an empty cache yields constants, not an
+		//     error. A node with no estimates runs.
+		//   * this crate ALREADY tolerates indefinite fee failures — the
+		//     background loop discards them (`let _ = …update_fee_rate_estimates`).
+		//     A node whose provider dies after startup keeps running on a stale
+		//     cache. Only the very first fetch was fatal, which is an asymmetry
+		//     rather than a safety property.
+		//
+		// What replaces the guarantee: the failure is recorded rather than
+		// swallowed. `latest_fee_rate_cache_update_timestamp` stays `None`,
+		// which [`Node::chain_freshness`] reports so the embedding application
+		// can refuse the operations where a wrong fee rate costs money —
+		// building or broadcasting a transaction — while still serving reads.
+		// Degraded and honest beats absent.
 		let chain_source = Arc::clone(&self.chain_source);
 		let runtime_ref = &runtime;
-		tokio::task::block_in_place(move || {
+		let fee_update = tokio::task::block_in_place(move || {
 			runtime_ref.block_on(async move { chain_source.update_fee_rate_estimates().await })
-		})?;
+		});
+		if let Err(e) = fee_update {
+			log_error!(
+				self.logger,
+				"Initial fee rate cache update failed: {}. Continuing startup with fallback fee \
+				 estimates; transaction-building operations should be refused until a refresh \
+				 succeeds (see Node::chain_freshness).",
+				e
+			);
+		}
 
 		// Spawn background task continuously syncing onchain, lightning, and fee rate cache.
 		let stop_sync_receiver = self.stop_sender.subscribe();
@@ -580,6 +672,7 @@ impl Node {
 			self.liquidity_source.clone(),
 			Arc::clone(&self.payment_store),
 			Arc::clone(&self.peer_store),
+			Arc::clone(&self.path_failures),
 			Arc::clone(&self.runtime),
 			Arc::clone(&self.logger),
 			Arc::clone(&self.config),
@@ -758,6 +851,61 @@ impl Node {
 
 		log_info!(self.logger, "Shutdown complete.");
 		Ok(())
+	}
+
+	/// Returns the status of the [`Node`].
+	/// How current this node's chain-derived state is.
+	///
+	/// Two INDEPENDENT axes, because they fail differently and gate different
+	/// operations. A node can hold either one alone: fresh fees with a wallet
+	/// that has never synced, or a synced wallet behind a dead fee source.
+	///
+	/// ```text
+	///   fee rates stale   estimates are hardcoded fallbacks, not observations
+	///                     -> refuse to BUILD or BROADCAST transactions; a
+	///                        wrong fee rate on a timing-critical path (an
+	///                        HTLC sweep, a force close) loses money
+	///
+	///   wallet stale      balances and transaction states may not be true
+	///                     -> still serve reads, but say so; a last-known
+	///                        balance is useful, a silent zero is not
+	/// ```
+	///
+	/// Exists because [`Node::start`] no longer refuses to come up when the
+	/// chain source is unreachable. The guarantee that used to provide has to
+	/// live somewhere, and this is where: the embedding application reads it
+	/// and decides, per operation, what is still safe to do.
+	///
+	/// `None` means never — no successful update since this node was created,
+	/// not merely since the process started, as these timestamps are persisted.
+	pub fn chain_freshness(&self) -> ChainFreshness {
+		let locked_node_metrics = self.node_metrics.read().unwrap();
+		ChainFreshness {
+			fee_rates_updated_at: locked_node_metrics.latest_fee_rate_cache_update_timestamp,
+			onchain_wallet_synced_at: locked_node_metrics.latest_onchain_wallet_sync_timestamp,
+			lightning_wallet_synced_at: locked_node_metrics.latest_lightning_wallet_sync_timestamp,
+		}
+	}
+
+	/// The compact-block-filter sync status, when this node follows the chain
+	/// by filters.
+	///
+	/// `None` for every other chain source, and for a build without the `cbf`
+	/// feature, which has no such engine. Never blocks; [`Node::sync_wallets`]
+	/// is what waits for the filters to catch up.
+	pub fn cbf_sync_status(&self) -> Option<CbfSyncStatus> {
+		self.chain_source.cbf_sync_status()
+	}
+
+	/// Which adapters fill each chain ability slot, in chain order, and which
+	/// one answered each slot's most recent question.
+	///
+	/// The same layout [`Node::start`] logs as `Chain ability slots: ...`,
+	/// as data: a status surface can show that a hybrid node's fees came from
+	/// its provider this pass and its own coinbase-derived rates the last.
+	/// Diagnostic only — nothing decides anything on it.
+	pub fn chain_slot_adapters(&self) -> ChainSlotStatus {
+		self.chain_source.slot_status()
 	}
 
 	/// Returns the status of the [`Node`].
@@ -1097,7 +1245,10 @@ impl Node {
 	/// and ignored by the Esplora/Bitcoind backends. Registration is idempotent.
 	#[cfg(feature = "swaps")]
 	pub fn watch_txid(&self, txid: bitcoin::Txid, scriptpubkey: bitcoin::ScriptBuf) {
-		self.swap_tx_watch.register(txid, scriptpubkey);
+		self.swap_tx_watch.register(txid, scriptpubkey.clone());
+		// A filter-driven chain source can only report a confirmation it was told to look
+		// for ahead of time; every other engine ignores this.
+		self.chain_source.watch_swap_tx(txid, scriptpubkey);
 	}
 
 	/// Drops the reorg-aware watch for `txid` registered via [`Node::watch_txid`]
@@ -1107,6 +1258,7 @@ impl Node {
 	#[cfg(feature = "swaps")]
 	pub fn unwatch_txid(&self, txid: bitcoin::Txid) {
 		self.swap_tx_watch.unregister(&txid);
+		self.chain_source.unwatch_swap_tx(&txid);
 	}
 
 	/// Queries the reorg-aware confirmation status of an arbitrary `txid`
@@ -1572,30 +1724,212 @@ impl Node {
 		let sync_cmon = Arc::clone(&self.chain_monitor);
 		let sync_sweeper = Arc::clone(&self.output_sweeper);
 		runtime.block_on(async move {
-			match chain_source.as_ref() {
-				ChainSource::Esplora { .. } => {
-					chain_source.update_fee_rate_estimates().await?;
-					chain_source
-						.sync_lightning_wallet(sync_cman, sync_cmon, sync_sweeper)
-						.await?;
-					chain_source.sync_onchain_wallet().await?;
-				},
-				ChainSource::Electrum { .. } => {
-					chain_source.update_fee_rate_estimates().await?;
-					chain_source
-						.sync_lightning_wallet(sync_cman, sync_cmon, sync_sweeper)
-						.await?;
-					chain_source.sync_onchain_wallet().await?;
-				},
-				ChainSource::Bitcoind { .. } => {
-					chain_source.update_fee_rate_estimates().await?;
-					chain_source
-						.poll_and_update_listeners(sync_cman, sync_cmon, sync_sweeper)
-						.await?;
-				},
-			}
-			Ok(())
+			chain_source.sync_wallets_once(sync_cman, sync_cmon, sync_sweeper).await
 		})
+	}
+
+	/// Serve this node's fee-rate cache to another node.
+	///
+	/// The Pro half of the Dependent tier: a node that has a chain source
+	/// answering for one that does not. Nothing here decides *who* may ask or
+	/// what it costs — that is the embedding application's business, and
+	/// keeping it out of this crate is what lets the same binary be either
+	/// tier by configuration alone.
+	///
+	/// Errors with [`Error::ChainServeUnsupported`] when this node's own fee
+	/// estimates are borrowed or derived rather than observed at a chain
+	/// source of its own — a Dependent or filter-following node — which must
+	/// never pass them on as though they were.
+	pub fn chain_serve_fee_estimates(&self) -> Result<chain_provider::WireFeeEstimates, Error> {
+		self.chain_source.serve_fee_estimates()
+	}
+
+	/// Broadcast another node's transaction through this node's chain source.
+	///
+	/// Returns once the transaction has been handed to the network — not
+	/// once it has reached a miner, which no node can promise. Errors when
+	/// this node's own chain source could not put it on the network, or when
+	/// the network rejected it; the wire does not distinguish the two.
+	pub fn chain_serve_broadcast(
+		&self, req: &chain_provider::WireBroadcastRequest,
+	) -> Result<(), Error> {
+		let rt_lock = self.runtime.read().unwrap();
+		let runtime = rt_lock.as_ref().ok_or(Error::NotRunning)?;
+
+		let tx = crate::chain::wire_convert::tx_from_wire(&req.tx_hex).map_err(|e| {
+			log_error!(self.logger, "Refusing a malformed broadcast request: {}", e);
+			Error::ChainServeFailed
+		})?;
+
+		let chain_source = Arc::clone(&self.chain_source);
+		runtime.block_on(async move { chain_source.serve_broadcast(&tx).await })
+	}
+
+	/// Answer another node's question about an arbitrary transaction.
+	///
+	/// Errors when this node's own lookup could not answer. That distinction
+	/// is the whole point: the asking node arms timeouts off this, and must
+	/// see a failure rather than an answer that happens to look like "not
+	/// found".
+	#[cfg(feature = "swaps")]
+	pub fn chain_serve_tx_status(
+		&self, req: &chain_provider::WireTxStatusRequest,
+	) -> Result<chain_provider::WireTxStatusResponse, Error> {
+		let rt_lock = self.runtime.read().unwrap();
+		let runtime = rt_lock.as_ref().ok_or(Error::NotRunning)?;
+
+		let malformed = |e: chain_provider::ChainProviderError| {
+			log_error!(self.logger, "Refusing a malformed chain lookup request: {}", e);
+			Error::ChainServeFailed
+		};
+		let txid = crate::chain::wire_convert::txid_from_wire(&req.txid).map_err(malformed)?;
+		let script_pubkey = req
+			.script_hex
+			.as_deref()
+			.map(crate::chain::wire_convert::script_from_wire)
+			.transpose()
+			.map_err(malformed)?;
+
+		let chain_source = Arc::clone(&self.chain_source);
+		runtime.block_on(
+			async move { chain_source.serve_tx_status(txid, script_pubkey.as_ref()).await },
+		)
+	}
+
+	/// Run another node's on-chain wallet scan against this node's chain
+	/// source.
+	pub fn chain_serve_wallet_sync(
+		&self, req: &chain_provider::WireSyncRequest,
+	) -> Result<chain_provider::WireUpdate, Error> {
+		let rt_lock = self.runtime.read().unwrap();
+		let runtime = rt_lock.as_ref().ok_or(Error::NotRunning)?;
+
+		let chain_source = Arc::clone(&self.chain_source);
+		let req = req.clone();
+		runtime.block_on(async move { chain_source.serve_wallet_sync(&req).await })
+	}
+
+	/// Answer another node's Lightning sync.
+	pub fn chain_serve_lightning_sync(
+		&self, req: &chain_provider::WireLightningSyncRequest,
+	) -> Result<chain_provider::WireLightningSyncResponse, Error> {
+		let rt_lock = self.runtime.read().unwrap();
+		let runtime = rt_lock.as_ref().ok_or(Error::NotRunning)?;
+
+		let chain_source = Arc::clone(&self.chain_source);
+		let req = req.clone();
+		runtime.block_on(async move { chain_source.serve_lightning_sync(&req).await })
+	}
+
+	/// Answer another node's mempool question from this node's own mempool.
+	///
+	/// Errors with [`Error::ChainServeUnsupported`] when this node has no
+	/// mempool of its own to answer from — an Esplora- or Electrum-backed
+	/// node, or a Dependent node, which must never forward the question —
+	/// and with [`Error::ChainServeFailed`] when it has one but could not
+	/// read it, or has not yet synced to a tip to anchor the answer at.
+	pub fn chain_serve_mempool(
+		&self, req: &chain_provider::WireMempoolRequest,
+	) -> Result<chain_provider::WireMempoolResponse, Error> {
+		let rt_lock = self.runtime.read().unwrap();
+		let runtime = rt_lock.as_ref().ok_or(Error::NotRunning)?;
+
+		let chain_source = Arc::clone(&self.chain_source);
+		let req = req.clone();
+		runtime.block_on(async move { chain_source.serve_mempool(&req).await })
+	}
+
+	/// How this node's raw chain source — the bitcoind set through
+	/// [`Builder::set_raw_chain_source_bitcoind_rpc`] — is doing: when it last
+	/// answered, its last error, whether it has the block filter index and how
+	/// far the index has got, and — while it cannot serve yet — why not.
+	/// `configured` is `false` when the configuration was refused at build time
+	/// (raw serving is then off, and `last_error` says why). `None` when no raw
+	/// source was set. Never carries a credential.
+	///
+	/// A raw serve that fails with [`Error::ChainServeFailed`] while
+	/// [`RawSourceStatus::not_ready`] is set failed because the source is not
+	/// ready (initial block download, or a filter index still syncing), not
+	/// because of the request or the transport: an embedding app should answer
+	/// it as "not ready", so the asking node moves on at once instead of
+	/// retrying here.
+	pub fn raw_chain_source_status(&self) -> Option<RawSourceStatus> {
+		self.chain_source.raw_source_status()
+	}
+
+	/// Serve this node's raw source's best block to another node.
+	///
+	/// The raw serves — this and [`Node::chain_serve_headers`],
+	/// [`Node::chain_serve_filter_headers`], [`Node::chain_serve_filters`],
+	/// [`Node::chain_serve_block`] — hand out BIP157/158 consensus data that
+	/// the asking node verifies itself, read from the raw source set through
+	/// [`Builder::set_raw_chain_source_bitcoind_rpc`]. They do not depend on
+	/// how this node follows the chain itself.
+	///
+	/// Errors with [`Error::ChainServeUnsupported`] when no raw source is
+	/// configured, and with [`Error::ChainServeFailed`] when the request is
+	/// malformed or over its limit, or the raw source could not answer.
+	pub fn chain_serve_tip(&self) -> Result<chain_provider::WireChainTip, Error> {
+		let rt_lock = self.runtime.read().unwrap();
+		let runtime = rt_lock.as_ref().ok_or(Error::NotRunning)?;
+
+		let chain_source = Arc::clone(&self.chain_source);
+		runtime.block_on(async move { chain_source.serve_tip().await })
+	}
+
+	/// Serve up to [`chain_provider::MAX_HEADERS_PER_REQUEST`] consecutive
+	/// best-chain headers; see [`Node::chain_serve_tip`].
+	pub fn chain_serve_headers(
+		&self, req: &chain_provider::WireHeadersRequest,
+	) -> Result<chain_provider::WireHeaders, Error> {
+		let rt_lock = self.runtime.read().unwrap();
+		let runtime = rt_lock.as_ref().ok_or(Error::NotRunning)?;
+
+		let chain_source = Arc::clone(&self.chain_source);
+		let req = req.clone();
+		runtime.block_on(async move { chain_source.serve_headers(&req).await })
+	}
+
+	/// Serve the filter headers of a span of at most
+	/// [`chain_provider::MAX_FILTER_HEADERS_PER_REQUEST`] blocks; see
+	/// [`Node::chain_serve_tip`].
+	pub fn chain_serve_filter_headers(
+		&self, req: &chain_provider::WireFilterHeadersRequest,
+	) -> Result<chain_provider::WireFilterHeaders, Error> {
+		let rt_lock = self.runtime.read().unwrap();
+		let runtime = rt_lock.as_ref().ok_or(Error::NotRunning)?;
+
+		let chain_source = Arc::clone(&self.chain_source);
+		let req = req.clone();
+		runtime.block_on(async move { chain_source.serve_filter_headers(&req).await })
+	}
+
+	/// Serve the basic filters of a span of at most
+	/// [`chain_provider::MAX_FILTERS_PER_REQUEST`] blocks; see
+	/// [`Node::chain_serve_tip`].
+	pub fn chain_serve_filters(
+		&self, req: &chain_provider::WireFiltersRequest,
+	) -> Result<chain_provider::WireFilters, Error> {
+		let rt_lock = self.runtime.read().unwrap();
+		let runtime = rt_lock.as_ref().ok_or(Error::NotRunning)?;
+
+		let chain_source = Arc::clone(&self.chain_source);
+		let req = req.clone();
+		runtime.block_on(async move { chain_source.serve_filters(&req).await })
+	}
+
+	/// Serve one [`chain_provider::BLOCK_CHUNK_BYTES`] chunk of a block; see
+	/// [`Node::chain_serve_tip`]. The block is fetched once and cached, so
+	/// asking for its chunks in turn costs one fetch.
+	pub fn chain_serve_block(
+		&self, req: &chain_provider::WireBlockRequest,
+	) -> Result<chain_provider::WireBlockChunk, Error> {
+		let rt_lock = self.runtime.read().unwrap();
+		let runtime = rt_lock.as_ref().ok_or(Error::NotRunning)?;
+
+		let chain_source = Arc::clone(&self.chain_source);
+		let req = req.clone();
+		runtime.block_on(async move { chain_source.serve_block_chunk(&req).await })
 	}
 
 	/// Close a previously opened channel.
@@ -1716,6 +2050,25 @@ impl Node {
 	/// Returns `Some` if the payment was known and `None` otherwise.
 	pub fn payment(&self, payment_id: &PaymentId) -> Option<PaymentDetails> {
 		self.payment_store.get(payment_id)
+	}
+
+	/// Retrieve what LDK reported about the last failed path of the payment with
+	/// the given id: which hop broke, which node forwarded into it, and a coarse
+	/// [`PathFailureClass`].
+	///
+	/// Returns `None` when no `PaymentPathFailed` event has been observed for the
+	/// payment, or when its record has been evicted (only the most recent
+	/// [`PATH_FAILURE_STORE_CAPACITY`] payments are retained, in memory only; the
+	/// record does not survive a restart).
+	///
+	/// Intended for callers of [`Node::send_along_route`] that observe the payment
+	/// reaching [`PaymentStatus::Failed`] via [`Node::payment`] and need to know
+	/// which leg of their hand-built route to avoid next time.
+	///
+	/// [`PaymentStatus::Failed`]: crate::payment::PaymentStatus::Failed
+	#[cfg(feature = "cycles")]
+	pub fn path_failure(&self, payment_id: &PaymentId) -> Option<PathFailureInfo> {
+		self.path_failures.get(payment_id)
 	}
 
 	/// Remove the payment with the given id from the store.
@@ -1934,6 +2287,93 @@ pub struct NodeStatus {
 	///
 	/// Will be `None` if we haven't archived any monitors of closed channels yet.
 	pub latest_channel_monitor_archival_height: Option<u32>,
+}
+
+/// How current this node's chain-derived state is — see
+/// [`Node::chain_freshness`].
+///
+/// Every field is a Unix timestamp of the last SUCCESSFUL update, or `None`
+/// for never. They are read, not judged: what counts as "too old" is a policy
+/// question for the caller, which knows what it is about to do. A read-only
+/// dashboard and an HTLC sweep should not agree on that threshold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChainFreshness {
+	/// Last successful fee-rate cache update. `None` means every estimate in
+	/// use is a hardcoded fallback.
+	pub fee_rates_updated_at: Option<u64>,
+	/// Last successful on-chain (BDK) wallet sync. `None` means balances have
+	/// never been confirmed against the chain.
+	pub onchain_wallet_synced_at: Option<u64>,
+	/// Last successful Lightning (LDK `Confirm`) sync.
+	pub lightning_wallet_synced_at: Option<u64>,
+}
+
+impl ChainFreshness {
+	/// Whether fee estimates have ever been observed rather than assumed.
+	///
+	/// `false` means the cache is empty and `estimate_fee_rate` is returning
+	/// constants. Callers that build or broadcast transactions should refuse.
+	pub fn has_fee_rates(&self) -> bool {
+		self.fee_rates_updated_at.is_some()
+	}
+
+	/// Whether the on-chain wallet has ever synced.
+	///
+	/// `false` means a reported balance is a starting assumption, not an
+	/// observation. Reads may still be served — flagged, never as fact.
+	pub fn has_synced_onchain(&self) -> bool {
+		self.onchain_wallet_synced_at.is_some()
+	}
+}
+
+#[cfg(test)]
+mod chain_freshness_tests {
+	use super::ChainFreshness;
+
+	fn freshness(fee: Option<u64>, onchain: Option<u64>) -> ChainFreshness {
+		ChainFreshness {
+			fee_rates_updated_at: fee,
+			onchain_wallet_synced_at: onchain,
+			lightning_wallet_synced_at: None,
+		}
+	}
+
+	/// The state a node boots into when its chain source is unreachable. It is
+	/// running — `start()` no longer refuses — so the ONLY thing standing
+	/// between it and a transaction built at an unobserved fee rate is this
+	/// returning false.
+	#[test]
+	fn a_node_that_never_reached_its_chain_source_has_neither() {
+		let f = freshness(None, None);
+		assert!(!f.has_fee_rates());
+		assert!(!f.has_synced_onchain());
+	}
+
+	/// The two axes are independent and must not be collapsed into one
+	/// "healthy" bit: fee staleness gates writes, sync staleness only flags
+	/// reads, and a node can genuinely be in either corner.
+	#[test]
+	fn the_two_axes_are_independent() {
+		let fees_only = freshness(Some(1_700_000_000), None);
+		assert!(fees_only.has_fee_rates());
+		assert!(!fees_only.has_synced_onchain(), "balances are not yet a fact");
+
+		let sync_only = freshness(None, Some(1_700_000_000));
+		assert!(!sync_only.has_fee_rates(), "estimates are still constants");
+		assert!(sync_only.has_synced_onchain());
+	}
+
+	/// Age is deliberately NOT judged here. What counts as too old depends on
+	/// what the caller is about to do — a dashboard and an HTLC sweep should
+	/// not share a threshold — so this reports the timestamp and leaves the
+	/// policy to the caller.
+	#[test]
+	fn an_ancient_timestamp_still_counts_as_observed() {
+		let f = freshness(Some(1), Some(1));
+		assert!(f.has_fee_rates());
+		assert!(f.has_synced_onchain());
+		assert_eq!(f.fee_rates_updated_at, Some(1));
+	}
 }
 
 /// Status fields that are persisted across restarts.

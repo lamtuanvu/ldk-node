@@ -1,0 +1,296 @@
+// This file is Copyright its original authors, visible in version control history.
+//
+// This file is licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
+// http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
+// accordance with one or both of these licenses.
+
+//! Wallet synchronisation engines.
+//!
+//! The engine is **not** one of the three pluggable abilities. It is a separate,
+//! explicit axis, because the backends do not implement one strategy — they
+//! implement two structurally incompatible ones:
+//!
+//! ```text
+//!   transaction-based   esplora, electrum
+//!                       drives Confirm via lightning-transaction-sync,
+//!                       needs Filter::register_tx / register_output
+//!
+//!   block-polling       bitcoind
+//!                       drives Listen via lightning-block-sync, keeps a
+//!                       header cache and a cached tip, handles reorgs,
+//!                       registers nothing
+//! ```
+//!
+//! Pre-seam both lived in one enum, so each strategy's methods had to exist on
+//! the other and panic: four `unreachable!()` arms. Splitting the types removes
+//! them by construction — a block-polling engine simply has no
+//! `sync_onchain_wallet` to call.
+//!
+//! Esplora and electrum are both transaction-based but share no code, so this
+//! is three implementations, not two.
+
+pub(crate) mod bitcoind;
+#[cfg(feature = "cbf")]
+pub(crate) mod cbf;
+pub(crate) mod dependent;
+pub(crate) mod electrum;
+pub(crate) mod esplora;
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use bitcoin::{Script, Txid};
+
+use bdk_chain::BlockId;
+
+use lightning::chain::WatchedOutput;
+
+use crate::chain::provider::{
+	WireLightningSyncRequest, WireLightningSyncResponse, WireSyncRequest, WireUpdate,
+};
+use crate::chain::ChainLayer;
+use crate::config::{BackgroundSyncConfig, WALLET_SYNC_INTERVAL_MINIMUM_SECS};
+use crate::logger::{log_trace, LdkLogger, Logger};
+use crate::types::{ChainMonitor, ChannelManager, Sweeper, Wallet};
+use crate::Error;
+
+use async_trait::async_trait;
+
+/// The two operations a transaction-based engine exposes to the shared loop.
+///
+/// Esplora and Electrum implement these completely differently; only the loop
+/// that drives them is common, so only the loop is shared.
+#[async_trait]
+pub(crate) trait TxBasedBackend: Send + Sync {
+	async fn sync_onchain_wallet(&self) -> Result<(), Error>;
+
+	async fn sync_lightning_wallet(
+		&self, channel_manager: Arc<ChannelManager>, chain_monitor: Arc<ChainMonitor>,
+		output_sweeper: Arc<Sweeper>,
+	) -> Result<(), Error>;
+}
+
+/// The background loop shared by both transaction-based engines.
+///
+/// Moved verbatim from `ChainSource::start_tx_based_sync_loop`; the only
+/// changes are that the backend is a parameter rather than `self`, and fee
+/// refreshes go through the layer's FEE slot.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_tx_based_sync_loop(
+	backend: &dyn TxBasedBackend, layer: Arc<ChainLayer>,
+	mut stop_sync_receiver: tokio::sync::watch::Receiver<()>, channel_manager: Arc<ChannelManager>,
+	chain_monitor: Arc<ChainMonitor>, output_sweeper: Arc<Sweeper>,
+	background_sync_config: &BackgroundSyncConfig, logger: Arc<Logger>,
+) {
+	// Setup syncing intervals
+	let onchain_wallet_sync_interval_secs = background_sync_config
+		.onchain_wallet_sync_interval_secs
+		.max(WALLET_SYNC_INTERVAL_MINIMUM_SECS);
+	let mut onchain_wallet_sync_interval =
+		tokio::time::interval(Duration::from_secs(onchain_wallet_sync_interval_secs));
+	onchain_wallet_sync_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+	let fee_rate_cache_update_interval_secs = background_sync_config
+		.fee_rate_cache_update_interval_secs
+		.max(WALLET_SYNC_INTERVAL_MINIMUM_SECS);
+	let mut fee_rate_update_interval =
+		tokio::time::interval(Duration::from_secs(fee_rate_cache_update_interval_secs));
+	// When starting up, we just blocked on updating, so skip the first tick.
+	fee_rate_update_interval.reset();
+	fee_rate_update_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+	let lightning_wallet_sync_interval_secs = background_sync_config
+		.lightning_wallet_sync_interval_secs
+		.max(WALLET_SYNC_INTERVAL_MINIMUM_SECS);
+	let mut lightning_wallet_sync_interval =
+		tokio::time::interval(Duration::from_secs(lightning_wallet_sync_interval_secs));
+	lightning_wallet_sync_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+	// Start the syncing loop.
+	loop {
+		tokio::select! {
+			_ = stop_sync_receiver.changed() => {
+				log_trace!(
+					logger,
+					"Stopping background syncing on-chain wallet.",
+					);
+				return;
+			}
+			_ = onchain_wallet_sync_interval.tick() => {
+				let _ = backend.sync_onchain_wallet().await;
+			}
+			_ = fee_rate_update_interval.tick() => {
+				let _ = layer.update_fee_rate_estimates().await;
+			}
+			_ = lightning_wallet_sync_interval.tick() => {
+				let _ = backend.sync_lightning_wallet(
+					Arc::clone(&channel_manager),
+					Arc::clone(&chain_monitor),
+					Arc::clone(&output_sweeper),
+					).await;
+			}
+		}
+	}
+}
+
+/// Keeps the on-chain and Lightning wallets in step with the chain.
+#[async_trait]
+pub(crate) trait SyncEngine: Send + Sync {
+	/// Stable identifier, for logs and for answering "which engine is running".
+	fn name(&self) -> &'static str;
+
+	/// Start any runtime-dependent part of the engine. Only electrum has one.
+	fn start(&self, _runtime: Arc<tokio::runtime::Runtime>) -> Result<(), Error> {
+		Ok(())
+	}
+
+	/// Stop any runtime-dependent part of the engine.
+	fn stop(&self) {}
+
+	/// One full foreground sync pass, as triggered by
+	/// [`crate::Node::sync_wallets`].
+	///
+	/// The per-engine ORDER is load-bearing and reproduced exactly from the
+	/// pre-seam implementation: transaction-based syncs the Lightning wallet
+	/// *before* the on-chain wallet. The caller refreshes fees first, in both
+	/// cases, before calling this.
+	///
+	/// Takes the layer for the same reason [`SyncEngine::run_background`]
+	/// does: the data a pass consumes from a slot — the block-polling engine's
+	/// mempool poll — goes through that slot's chain, so a swapped adapter
+	/// applies to a foreground pass exactly as to a background one. A
+	/// transaction-based engine carries unconfirmed transactions in its own
+	/// sync and asks nothing of the layer here.
+	async fn sync_once(
+		&self, layer: &ChainLayer, channel_manager: Arc<ChannelManager>,
+		chain_monitor: Arc<ChainMonitor>, output_sweeper: Arc<Sweeper>,
+	) -> Result<(), Error>;
+
+	/// Run until `stop_sync_receiver` fires.
+	///
+	/// Takes the layer so fee refreshes go through the FEE slot rather than
+	/// through the engine's own backend — otherwise a swapped fee adapter
+	/// would apply to foreground calls and silently not to background ones.
+	async fn run_background(
+		&self, layer: Arc<ChainLayer>, stop_sync_receiver: tokio::sync::watch::Receiver<()>,
+		channel_manager: Arc<ChannelManager>, chain_monitor: Arc<ChainMonitor>,
+		output_sweeper: Arc<Sweeper>,
+	);
+
+	/// Whether this engine has no mempool view of its own, so the on-chain
+	/// wallet only learns of the node's own broadcasts if the BROADCAST tail
+	/// tells it.
+	///
+	/// An engine that syncs against a mempool — every engine today — sees its
+	/// own transactions come back and must answer `false`, or the tail would
+	/// stamp a fresh `last_seen` on every rebroadcast for nothing. A
+	/// block-filter engine answers `true`, because for it the tail is the
+	/// only way the wallet ever hears that the coins a just-sent transaction
+	/// spent are gone.
+	fn tracks_own_broadcasts(&self) -> bool {
+		false
+	}
+
+	/// The on-chain wallet this engine keeps in step, for the BROADCAST tail
+	/// to record what left the node. `None` for an engine that has none.
+	fn onchain_wallet(&self) -> Option<&Arc<Wallet>> {
+		None
+	}
+
+	/// Whether this node's MEMPOOL chain answers from a mempool this node
+	/// observes itself, so [`ChainLayer::serve_mempool`] may answer other
+	/// nodes from it.
+	///
+	/// Defaults to refusing, for the reason [`SyncEngine::serve_wallet_sync`]
+	/// does: a chain filled from a provider would forward another node's
+	/// question to a third node. The engines whose chain is their own chain
+	/// source answer `true`: the block-polling engine over its bitcoind, and
+	/// the Electrum engine over its server, which indexes the mempool by
+	/// script. The Esplora engine's chain is empty and a Dependent node's is
+	/// its provider.
+	fn serves_mempool(&self) -> bool {
+		false
+	}
+
+	/// Whether this node may serve chain answers to other nodes at all.
+	///
+	/// Serving means answering from a chain source this node observes
+	/// itself. The engines over a real one — Esplora, Electrum, bitcoind —
+	/// answer `true`. Defaults to `false`: a Dependent node's every slot is
+	/// filled from its provider, and a filter-following node borrows what its
+	/// filters cannot show it, so either would forward another node's
+	/// question to a third node — a chain of trust nobody checked. Every
+	/// [`ChainLayer`] `serve_*` entry point refuses when this is `false`,
+	/// before the question reaches a slot.
+	fn serves_peers(&self) -> bool {
+		false
+	}
+
+	/// The compact-block-filter sync status, for an engine that follows the
+	/// chain by filters; `None` for every other engine. Never blocks.
+	fn cbf_sync_status(&self) -> Option<crate::chain::CbfSyncStatus> {
+		None
+	}
+
+	/// Watch an arbitrary transaction — one the local wallet need not own —
+	/// for the TX_STATUS slot, with the output script it can be found by
+	/// (Peerswap B5, [`crate::Node::watch_txid`]).
+	///
+	/// Defaults to a no-op: the transaction-based and block-polling engines
+	/// answer TX_STATUS by asking their chain source about the txid at query
+	/// time, and need nothing registered ahead of it. A filter-driven engine
+	/// has no history to look back into, so it must be told *before* the
+	/// transaction confirms which block to look in — that is what this hook
+	/// is for.
+	#[cfg(feature = "swaps")]
+	fn watch_tx(&self, _txid: Txid, _script_pubkey: bitcoin::ScriptBuf) {}
+
+	/// Stop watching `txid`; see [`SyncEngine::watch_tx`].
+	#[cfg(feature = "swaps")]
+	fn unwatch_tx(&self, _txid: &Txid) {}
+
+	/// Whether `block` is on the chain this engine considers best: `Some(true)`
+	/// if it is, `Some(false)` if this engine knows a different block at that
+	/// height, `None` if it cannot say.
+	///
+	/// The reorg-consistency check a hybrid node runs on an answer a provider
+	/// [`Anchored`] to its own tip: an answer computed on a chain this node does
+	/// not consider best is refused, and the chain advances. Defaults to `None`
+	/// — an engine that follows no header chain of its own (transaction-based,
+	/// Dependent) cannot check, and an unchecked answer is applied as it always
+	/// was. Only an engine with its own view of the headers answers.
+	///
+	/// [`Anchored`]: crate::chain::seam::Anchored
+	async fn is_on_chain(&self, _block: &BlockId) -> Option<bool> {
+		None
+	}
+
+	/// `Filter` registration. Transaction-based engines must watch these;
+	/// block-polling engines see every block anyway and ignore them.
+	fn register_tx(&self, _txid: &Txid, _script_pubkey: &Script) {}
+
+	/// See [`SyncEngine::register_tx`].
+	fn register_output(&self, _output: WatchedOutput) {}
+
+	/// Answer another node's on-chain wallet sync request — the serving half
+	/// of the Dependent tier.
+	///
+	/// Defaults to refusing. Serving means running an arbitrary scan against
+	/// a real chain source, which only a node that has one can do; a Dependent
+	/// node must refuse rather than forward, or a chain of nodes could end up
+	/// believing an answer none of them checked.
+	async fn serve_wallet_sync(&self, _req: &WireSyncRequest) -> Result<WireUpdate, Error> {
+		Err(Error::ChainServeUnsupported)
+	}
+
+	/// Answer another node's Lightning sync request.
+	///
+	/// See [`SyncEngine::serve_wallet_sync`] for why this defaults to
+	/// refusing.
+	async fn serve_lightning_sync(
+		&self, _req: &WireLightningSyncRequest,
+	) -> Result<WireLightningSyncResponse, Error> {
+		Err(Error::ChainServeUnsupported)
+	}
+}

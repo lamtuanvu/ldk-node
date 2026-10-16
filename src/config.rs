@@ -26,7 +26,7 @@ use std::time::Duration;
 const DEFAULT_NETWORK: Network = Network::Bitcoin;
 const DEFAULT_BDK_WALLET_SYNC_INTERVAL_SECS: u64 = 80;
 const DEFAULT_LDK_WALLET_SYNC_INTERVAL_SECS: u64 = 30;
-const DEFAULT_FEE_RATE_CACHE_UPDATE_INTERVAL_SECS: u64 = 60 * 10;
+pub(crate) const DEFAULT_FEE_RATE_CACHE_UPDATE_INTERVAL_SECS: u64 = 60 * 10;
 const DEFAULT_PROBING_LIQUIDITY_LIMIT_MULTIPLIER: u64 = 3;
 const DEFAULT_ANCHOR_PER_CHANNEL_RESERVE_SATS: u64 = 25_000;
 
@@ -183,6 +183,153 @@ impl Default for Config {
 			node_alias: None,
 		}
 	}
+}
+
+/// Configuration of the compact-block-filter (BIP157/158) chain source.
+///
+/// ### Defaults
+///
+/// | Parameter                 | Value  |
+/// |---------------------------|--------|
+/// | `wallet_birthday_height`  | None   |
+/// | `external_fee`            | None   |
+/// | `utxo_source`             | false  |
+/// | `required_peers`          | 1      |
+/// | `source`                  | P2p    |
+#[cfg(feature = "cbf")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CbfConfig {
+	/// The lowest height whose block may hold a transaction of this wallet: the wallet
+	/// birthday. Rounded *down* to the nearest checkpoint compiled into the crate (mainnet
+	/// only), which seeds a fresh wallet and floors the height the filter sync resumes from.
+	///
+	/// A filter scan never starts from genesis: a wallet whose persisted chain offers no
+	/// usable checkpoint resumes from this birthday, and refuses to sync at all when none is
+	/// configured. Set it for every wallet handed over from another chain source.
+	pub wallet_birthday_height: Option<u32>,
+	/// An external, mempool-aware server asked for fee estimates ahead of the node's own
+	/// coinbase-derived ones. Without it the FEE slot has only the blocks the node downloads.
+	pub external_fee: Option<CbfExternalFee>,
+	/// Whether to verify BOLT-7 channel announcements against the filters: existence-only,
+	/// since a block filter can say an output was created and not yet spent, but not what it
+	/// holds. Off by default; announcements are then accepted unverified.
+	pub utxo_source: bool,
+	/// Number of peers that must agree on filter headers before they are accepted.
+	pub required_peers: u8,
+	/// Where the headers, filter headers, filters and blocks come from: the Bitcoin P2P
+	/// network (the default), a node source supplied through
+	/// [`NodeBuilder::set_cbf_filter_source`], or the node source with P2P as its fallback.
+	///
+	/// [`NodeBuilder::set_cbf_filter_source`]: crate::NodeBuilder::set_cbf_filter_source
+	pub source: CbfSource,
+}
+
+#[cfg(feature = "cbf")]
+impl Default for CbfConfig {
+	fn default() -> Self {
+		Self {
+			wallet_birthday_height: None,
+			external_fee: None,
+			utxo_source: false,
+			required_peers: DEFAULT_CBF_REQUIRED_PEERS,
+			source: CbfSource::default(),
+		}
+	}
+}
+
+/// Where a compact-block-filter node gets its raw chain data from.
+///
+/// Whatever the source, every header, filter header, filter and block is checked by this
+/// node before it is applied: a source cannot make the node accept a header, a chain or a
+/// block that is not valid. What a single node source *can* do is leave a transaction out of
+/// its filters — see [`CbfSource::trusts_source_for_inclusion`].
+#[cfg(feature = "cbf")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CbfSource {
+	/// The Bitcoin P2P network, through kyoto: the trusted peers configured with the chain
+	/// source, or the DNS seeds.
+	#[default]
+	P2p,
+	/// Only the filter source given to [`NodeBuilder::set_cbf_filter_source`] — typically
+	/// another Node device serving raw BIP157 data. Kyoto is never built and the node opens no
+	/// Bitcoin P2P connection. Building without a filter source fails.
+	///
+	/// **Trusts the source for inclusion.** Headers (proof of work, difficulty), block
+	/// contents, and the agreement of filters with filter headers are verified; that the
+	/// filters leave no transaction out is not, and cannot be with one source. A source that
+	/// omits a transaction — a revoked commitment spending a channel's funding outpoint, say —
+	/// hides it from this node. See [`CbfSource::trusts_source_for_inclusion`].
+	///
+	/// A source that keeps sending data that fails verification fails the sync closed; it is
+	/// tried again from scratch after a backoff of up to ten minutes. A tip more than three
+	/// hours old by this node's clock is reported as syncing, not synced (regtest aside).
+	///
+	/// [`NodeBuilder::set_cbf_filter_source`]: crate::NodeBuilder::set_cbf_filter_source
+	Node,
+	/// The filter source first. The node falls back to the P2P network for the rest of the run
+	/// when the source stays unavailable for five minutes, keeps sending data that fails
+	/// verification, or serves a tip more than three hours old (regtest aside). Building without
+	/// a filter source fails.
+	///
+	/// **Trusts the source for inclusion** while it is used, as [`CbfSource::Node`] does: an
+	/// omission is not something the node can detect, so it is no reason to fall back.
+	NodeThenP2p,
+}
+
+#[cfg(feature = "cbf")]
+impl CbfSource {
+	/// Whether this source needs the filter source given to
+	/// [`NodeBuilder::set_cbf_filter_source`].
+	///
+	/// [`NodeBuilder::set_cbf_filter_source`]: crate::NodeBuilder::set_cbf_filter_source
+	pub fn uses_node_source(&self) -> bool {
+		matches!(self, Self::Node | Self::NodeThenP2p)
+	}
+
+	/// What a node filter source is trusted with, in words an app can show its operator.
+	pub const NODE_SOURCE_TRUST_NOTE: &'static str =
+		"Compact-block-filter sync through a single node source: headers (proof of work, \
+		 difficulty), block contents and filter/filter-header consistency are verified, but \
+		 the source is trusted not to leave transactions out of its filters. A source that \
+		 omits one (for example a revoked commitment spending a channel's funding output) \
+		 hides it from this node. Do not use a source that could gain from that, such as a \
+		 channel counterparty on mainnet.";
+
+	/// Whether this source trusts the node source not to leave transactions out of its
+	/// filters: `true` for [`CbfSource::Node`] and [`CbfSource::NodeThenP2p`], `false` for
+	/// [`CbfSource::P2p`], whose peers are compared.
+	///
+	/// This crate does not know who runs the source; the app does. An app should refuse a node
+	/// source where it would pay to hide a transaction — on mainnet, when the source node is
+	/// also one of this node's channel counterparties.
+	pub fn trusts_source_for_inclusion(&self) -> bool {
+		self.uses_node_source()
+	}
+
+	/// [`CbfSource::NODE_SOURCE_TRUST_NOTE`] when this source
+	/// [trusts the node source for inclusion](CbfSource::trusts_source_for_inclusion), for the
+	/// app to surface; `None` otherwise.
+	pub fn trust_note(&self) -> Option<&'static str> {
+		self.trusts_source_for_inclusion().then_some(Self::NODE_SOURCE_TRUST_NOTE)
+	}
+}
+
+/// Number of peers that must agree on filter headers before they are accepted.
+#[cfg(feature = "cbf")]
+pub(crate) const DEFAULT_CBF_REQUIRED_PEERS: u8 = 1;
+
+/// An external fee-estimation server for a compact-block-filter node.
+///
+/// By default CBF derives fee rates from recent blocks' coinbase outputs. An external source
+/// provides more accurate, per-target estimates from a mempool-aware server; it is asked
+/// first, and the coinbase-derived rates stand in when it cannot answer.
+#[cfg(feature = "cbf")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CbfExternalFee {
+	/// An Esplora HTTP server, by URL.
+	Esplora(String),
+	/// An Electrum server, by URL.
+	Electrum(String),
 }
 
 /// Configuration options pertaining to 'Anchor' channels, i.e., channels for which the
@@ -554,6 +701,19 @@ mod tests {
 	use super::Config;
 	use super::NodeAlias;
 	use super::SocketAddress;
+
+	#[cfg(feature = "cbf")]
+	#[test]
+	fn node_sources_say_they_trust_the_source_for_inclusion() {
+		use super::CbfSource;
+		assert!(!CbfSource::P2p.trusts_source_for_inclusion());
+		assert_eq!(CbfSource::P2p.trust_note(), None);
+		for source in [CbfSource::Node, CbfSource::NodeThenP2p] {
+			assert!(source.trusts_source_for_inclusion());
+			let note = source.trust_note().expect("a note to surface");
+			assert!(note.contains("trusted not to leave transactions out"), "{}", note);
+		}
+	}
 
 	#[test]
 	fn node_announce_channel() {
