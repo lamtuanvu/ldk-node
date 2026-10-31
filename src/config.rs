@@ -227,7 +227,9 @@ impl Default for Config {
 pub struct CbfConfig {
 	/// The lowest height whose block may hold a transaction of this wallet: the wallet
 	/// birthday. Rounded *down* to the nearest checkpoint compiled into the crate (mainnet
-	/// only), which seeds a fresh wallet and floors the height the filter sync resumes from.
+	/// only), which seeds a fresh wallet — unless the node is given a birthday block of its
+	/// own (`NodeBuilder::set_wallet_birthday`), which wins — and floors the height the
+	/// filter sync resumes from.
 	///
 	/// A filter scan never starts from genesis: a wallet whose persisted chain offers no
 	/// usable checkpoint resumes from this birthday, and refuses to sync at all when none is

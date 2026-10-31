@@ -447,7 +447,14 @@ impl NodeBuilder {
 	/// wallet created beside a running node (a secondary) cannot hold anything older than
 	/// its creation, and a fresh wallet rooted at genesis asks a pruned or block-polling
 	/// chain source for history it does not have. Ignored once the wallet has persisted a
-	/// block of its own; a filter-following host's compiled birthday wins over it.
+	/// block of its own.
+	///
+	/// It wins over a filter-following host's compiled birthday
+	/// (`CbfConfig::wallet_birthday_height`), which seeds a fresh wallet only when no
+	/// birthday is given here: a wallet seeded at a running node's best block joins the
+	/// running filter sync there, with nothing to replay, where the compiled checkpoint is
+	/// thousands of blocks back. `best_block` must be a block of the chain, hash and height:
+	/// a filter-following node anchors its sync on it.
 	pub fn set_wallet_birthday(&mut self, best_block: BestBlock) -> &mut Self {
 		self.wallet_birthday = Some(best_block);
 		self
@@ -599,10 +606,12 @@ impl NodeBuilder {
 	///
 	/// A fresh wallet is seeded at the compiled checkpoint below
 	/// [`CbfConfig::wallet_birthday_height`], and so are a fresh
-	/// `ChannelManager` and sweeper; a wallet with a persisted block is never
-	/// rewound. A filter scan never starts from genesis: a wallet whose
-	/// persisted chain offers no usable checkpoint resumes from the birthday,
-	/// and refuses to sync at all when none is configured.
+	/// `ChannelManager` and sweeper — at the caller's own birthday instead
+	/// when one is set ([`NodeBuilder::set_wallet_birthday`]); a wallet with a
+	/// persisted block is never rewound. A filter scan never starts from
+	/// genesis: a wallet whose persisted chain offers no usable checkpoint
+	/// resumes from the birthday, and refuses to sync at all when none is
+	/// configured.
 	#[cfg(feature = "cbf")]
 	pub fn set_chain_source_cbf(&mut self, peers: Vec<String>, config: CbfConfig) -> &mut Self {
 		self.chain_data_source_config = Some(ChainDataSourceConfig::Cbf { peers, config });
@@ -1674,11 +1683,14 @@ fn build_with_store_internal(
 		.and_then(|height| birthday_checkpoint(config.network, height))
 		.map(|checkpoint| BestBlock::new(checkpoint.hash, checkpoint.height));
 
-	// The block a fresh wallet's components start at: a filter-following host's compiled
-	// birthday checkpoint, else the birthday the caller set (a secondary created beside a
-	// running node), else genesis.
+	// The block a fresh wallet's components start at: the birthday the caller set (a
+	// secondary created beside a running node, at that node's best block: it needs nothing
+	// older, and joins a running filter sync there with nothing to replay), else a
+	// filter-following host's compiled birthday checkpoint, else genesis. The node's
+	// `wallet_birthday_height` — the target's, where a filter rescan for it may start — is
+	// the same block's.
 	#[cfg(feature = "cbf")]
-	let fresh_birthday: Option<BestBlock> = cbf_birthday.or(wallet_birthday);
+	let fresh_birthday: Option<BestBlock> = wallet_birthday.or(cbf_birthday);
 	#[cfg(not(feature = "cbf"))]
 	let fresh_birthday: Option<BestBlock> = wallet_birthday;
 
