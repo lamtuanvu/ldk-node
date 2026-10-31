@@ -2954,6 +2954,25 @@ mod tests {
 	/// A target whose wallet, `ChannelManager` and sweeper all start at `at`, registered with
 	/// the engine's registry as the layer registers one before it tells the engine.
 	fn target_at(engine: &CbfSyncEngine, label: &str, at: BestBlock) -> Arc<SyncTarget> {
+		target_seeded(engine, label, at, &[BlockId { height: at.height, hash: at.block_hash }])
+	}
+
+	/// [`target_at`], with a wallet that holds the block of every height in `from..=to` — a
+	/// node synced block by block, whose resume walks back along its own checkpoints.
+	fn target_with_history(
+		engine: &CbfSyncEngine, label: &str, source: &FakeSource, from: u32, to: u32,
+	) -> Arc<SyncTarget> {
+		let checkpoints: Vec<BlockId> = (from..=to)
+			.map(|height| BlockId { height, hash: source.block_at(height).block_hash() })
+			.collect();
+		let at = BestBlock::new(source.block_at(to).block_hash(), to);
+		target_seeded(engine, label, at, &checkpoints)
+	}
+
+	/// A target whose every component is at `at`, its wallet seeded with `checkpoints`.
+	fn target_seeded(
+		engine: &CbfSyncEngine, label: &str, at: BestBlock, checkpoints: &[BlockId],
+	) -> Arc<SyncTarget> {
 		use crate::chain::target::test_support::target_spec_at;
 		use crate::chain::test_wallet::fresh_regtest_wallet;
 		use crate::tx_broadcaster::TransactionBroadcaster;
@@ -2965,8 +2984,9 @@ mod tests {
 		let broadcaster = Arc::new(TransactionBroadcaster::new(Arc::clone(&logger)));
 		let fee_estimator = Arc::new(OnchainFeeEstimator::new());
 		let wallet = fresh_regtest_wallet(&kv_store, &broadcaster, &fee_estimator, &logger);
-		let seeded =
-			wallet.latest_checkpoint().insert(BlockId { height: at.height, hash: at.block_hash });
+		let seeded = checkpoints
+			.iter()
+			.fold(wallet.latest_checkpoint(), |chain, block| chain.insert(*block));
 		wallet
 			.apply_update(bdk_wallet::Update { chain: Some(seeded), ..Default::default() })
 			.expect("the wallet is seeded at the block");
@@ -3139,6 +3159,44 @@ mod tests {
 		assert_eq!(source.calls("filters"), filters, "nothing was replayed for c or e");
 		assert!(engine.is_synced(), "nothing halted");
 		assert_eq!(a.channel_manager.current_best_block(), at(29));
+
+		engine.stop();
+		let _ = std::fs::remove_dir_all(&dir);
+	}
+
+	/// The Pi2 boot order (2026-10-31, a mainnet Pi Zero): the primary launches the sync, which
+	/// resumes it [`crate::chain::cbf::REORG_SAFETY_BLOCKS`] below its own tip while the
+	/// applicator starts above that tip; a secondary a few blocks behind the primary — above
+	/// the anchor — starts while the source does not answer yet. The loop has queued nothing
+	/// above the secondary's tip, but the applicator is past it: the rescan must still reach
+	/// the applicator, or every block the secondary needs is dropped as out of sequence and it
+	/// waits for ever (seen live: active and healthy, its tip five blocks behind the primary's).
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn a_target_above_the_anchor_but_below_the_launch_tip_joins_at_boot() {
+		let source = Arc::new(FakeSource::new(30, &[]));
+		let (engine, dir) = node_engine(&source, "join-boot");
+		let at = |height: u32| BestBlock::new(source.block_at(height).block_hash(), height);
+
+		// a's wallet holds every block from 12 to 25: the launch resumes it at 18, seven below
+		// its tip, and the applicator starts at 26.
+		let a = target_with_history(&engine, "a", &source, 12, 25);
+		// The source refuses the first call, as the provider refused chain.headers on the Pi.
+		source.fail_next(1);
+		let handle = tokio::runtime::Handle::current();
+		engine.launch_over(&handle, listener_deps(), &engine.targets);
+
+		// b, at 21 — above a's anchor, below a's tip — starts right after a.
+		let b = target_at(&engine, "b", at(21));
+		engine.target_registered(&b).expect("b joins the running sync");
+		wait_for("b to be followed to the tip", || {
+			b.channel_manager.current_best_block() == at(29) && engine.is_synced()
+		})
+		.await;
+		let fanout = engine.listeners.lock().unwrap().clone().expect("launched");
+		assert_eq!(fanout.join_state(b.id), Some(JOIN_JOINED));
+		assert_eq!(b.onchain_wallet.current_best_block(), at(29));
+		assert_eq!(b.output_sweeper.current_best_block(), at(29));
+		assert_eq!(a.channel_manager.current_best_block(), at(29), "a skipped the replay");
 
 		engine.stop();
 		let _ = std::fs::remove_dir_all(&dir);

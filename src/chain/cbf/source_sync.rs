@@ -1107,8 +1107,9 @@ impl SourceSync {
 	/// When blocks above the replay's start were queued, [`ChainOp::Rescan`] goes first, on the
 	/// same queue — the applicator must expect the replayed heights before the first of them
 	/// arrives — and the filter batches that follow fetch, verify and queue every block above
-	/// it again. A start at or above everything queued so far needs nothing: the listener that
-	/// asked is reached by the next block anyway.
+	/// it again. A start at or above everything queued so far fetches nothing again — the blocks
+	/// after it are still to come — but the rescan is queued all the same: the applicator can
+	/// have started above that start, and would drop the blocks the listener needs.
 	async fn serve_replays(&mut self) -> Result<(), StepError> {
 		while let Ok(request) = self.replay_rx.try_recv() {
 			self.pending_replays.push(request);
@@ -1153,12 +1154,22 @@ impl SourceSync {
 			return Ok(());
 		};
 		if from >= self.filters_through {
+			// Nothing above it is queued by this loop yet, so nothing is fetched again: the
+			// blocks after it are still to come. The applicator may be past it all the same:
+			// it starts above the lowest tip of the nodes in the launch, which can lie above
+			// both the anchor this loop resumed from and the tip of a node that joined after
+			// the launch — a secondary an app starts right after its primary, a few blocks
+			// behind it (a mainnet Pi Zero, 2026-10-31). Without the rescan the applicator
+			// drops the blocks that node needs as out of sequence, and it waits for ever. The
+			// applicator ignores a rescan that starts at or above the block it expects next.
 			log_debug!(
 				self.logger,
-				"CBF replay from height {} asked; nothing above it is queued yet (queued through {}).",
+				"CBF replay from height {} asked; nothing above it is queued yet (queued through {}), so only the applicator is told to expect height {}.",
 				from,
-				self.filters_through
+				self.filters_through,
+				from + 1
 			);
+			self.send(ChainOp::Rescan { from_height: from }).await?;
 			return Ok(());
 		}
 		log_info!(
@@ -1240,9 +1251,9 @@ impl SourceSync {
 		let Some(lowest) = pending.iter().map(|request| request.height).min() else {
 			return;
 		};
-		if lowest >= self.filters_through {
-			return;
-		}
+		// Sent even when this loop queued nothing above `lowest`: the applicator may have
+		// started above it all the same (see `serve_replays`), and ignores a rescan it does
+		// not need.
 		log_info!(
 			self.logger,
 			"CBF rewinding to height {} before the P2P fallback, for a listener that joined late.",
@@ -2327,20 +2338,43 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn a_replay_request_at_or_above_what_was_queued_queues_nothing() {
+	async fn a_replay_request_at_or_above_what_was_queued_fetches_nothing_again() {
 		let mut h = start(FakeSource::new(30, &[]), 10, fast_tuning());
 		h.ops_until_synced().await;
 		let (filters, filter_headers) =
 			(h.source.calls("filters"), h.source.calls("filter_headers"));
 
-		// At the tip, and above it: every block a listener there needs is still to come.
+		// At the tip, and above it: every block a listener there needs is still to come, so
+		// nothing is fetched or queued again. Only the rescan goes out, from the lowest asked:
+		// the applicator, which may have started above it, rewinds to it or ignores it.
 		h.ask_replay(29);
 		h.replay_tx.send(BlockId { height: 45, hash: BlockHash::all_zeros() }).unwrap();
+		assert_eq!(h.next_op().await, Op::Rescan(29));
 		h.assert_quiet().await;
 		assert_eq!(h.source.calls("filters"), filters, "nothing was fetched again");
 		assert_eq!(h.source.calls("filter_headers"), filter_headers);
 		// Still synced to the same tip: it is confirmed, not announced again.
 		assert_eq!(h.next_any_op().await, Op::TipConfirmed(29));
+		assert_eq!(h.stop().await, SourceSyncEnd::Stopped);
+	}
+
+	/// The Pi2 boot order (2026-10-31): a node joins while the loop is still on its way up from
+	/// the anchor it resumed from, with its tip above that anchor. Nothing above the node's tip
+	/// is queued yet, so nothing is queued again — but the rescan still goes out first, for an
+	/// applicator that started above the node's tip, followed by every block from the anchor
+	/// up as on any catch-up.
+	#[tokio::test]
+	async fn a_replay_asked_before_the_loop_passed_it_still_queues_the_rescan_first() {
+		let source = FakeSource::new(30, &[]);
+		// The source refuses the first call, as a provider refused chain.headers for 21 s on
+		// the Pi; the request comes in while the loop waits to resume.
+		source.fail_next(1);
+		let mut h = start(source, 10, fast_tuning());
+		h.ask_replay(15);
+		let mut expected = vec![Op::Rescan(15)];
+		expected.extend(filtered(11..=29));
+		expected.push(Op::Synced(29));
+		assert_eq!(h.ops_until_synced().await, expected);
 		assert_eq!(h.stop().await, SourceSyncEnd::Stopped);
 	}
 
