@@ -167,6 +167,17 @@ pub(crate) mod test_support {
 		label: &str, wallet: Arc<Wallet>, kv_store: Arc<DynStore>, broadcaster: Arc<Broadcaster>,
 		fee_estimator: Arc<OnchainFeeEstimator>, logger: Arc<Logger>,
 	) -> SyncTargetSpec {
+		let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest).block_hash();
+		let best_block = BestBlock::new(genesis, 0);
+		target_spec_at(label, wallet, kv_store, broadcaster, fee_estimator, logger, best_block)
+	}
+
+	/// [`target_spec`] with the `ChannelManager` and the sweeper starting at `best_block`, as a
+	/// node built at a birthday starts them; seeding the wallet there is the caller's.
+	pub(crate) fn target_spec_at(
+		label: &str, wallet: Arc<Wallet>, kv_store: Arc<DynStore>, broadcaster: Arc<Broadcaster>,
+		fee_estimator: Arc<OnchainFeeEstimator>, logger: Arc<Logger>, best_block: BestBlock,
+	) -> SyncTargetSpec {
 		let config = Arc::new(Config { network: Network::Regtest, ..Config::default() });
 		let chain_monitor: Arc<ChainMonitor> = Arc::new(chainmonitor::ChainMonitor::new(
 			None,
@@ -198,8 +209,6 @@ pub(crate) mod test_support {
 		));
 		let message_router =
 			Arc::new(MessageRouter::new(Arc::clone(&network_graph), Arc::clone(&keys_manager)));
-		let genesis = bitcoin::blockdata::constants::genesis_block(config.network).block_hash();
-		let best_block = BestBlock::new(genesis, 0);
 		let channel_manager = Arc::new(channelmanager::ChannelManager::new(
 			Arc::clone(&fee_estimator),
 			Arc::clone(&chain_monitor),
