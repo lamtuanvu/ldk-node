@@ -93,6 +93,7 @@ mod gossip;
 pub mod graph;
 mod hex_utils;
 pub mod io;
+mod journal;
 pub mod liquidity;
 pub mod logger;
 mod message_handler;
@@ -161,8 +162,11 @@ use error::Error;
 
 pub use event::Event;
 
+pub use journal::{HtlcDestinationKind, JournalEvent, PathHop, JOURNAL_QUEUE_CAPACITY};
+
 pub use io::utils::generate_entropy_mnemonic;
 
+use journal::JournalQueue;
 use path_failure::PathFailureStore;
 /// Per-payment path-failure detail captured from LDK's `PaymentPathFailed` event
 /// (cooperative cycle-balance observability). The types are always public; the
@@ -322,6 +326,8 @@ pub struct Node {
 	/// Opens funded by another wallet ([`Node::open_channel_with_funding`]), in memory: an
 	/// unfunded channel does not survive a restart either.
 	external_fundings: Arc<funding::ExternalFundings>,
+	/// In-memory, non-persisted payment-journal observations; see [`JournalEvent`].
+	journal: Arc<JournalQueue>,
 	/// Reorg-aware swap-txid watch registry (Peerswap native primitive B5).
 	#[cfg(feature = "swaps")]
 	swap_tx_watch: Arc<chain::SwapTxWatch>,
@@ -626,6 +632,7 @@ impl Node {
 			Arc::clone(&self.peer_store),
 			Arc::clone(&self.path_failures),
 			Arc::clone(&self.external_fundings),
+			Arc::clone(&self.journal),
 			Arc::clone(&self.runtime),
 			Arc::clone(&self.logger),
 			Arc::clone(&self.config),
@@ -2355,6 +2362,19 @@ impl Node {
 	#[cfg(feature = "cycles")]
 	pub fn path_failure(&self, payment_id: &PaymentId) -> Option<PathFailureInfo> {
 		self.path_failures.get(payment_id)
+	}
+
+	/// Removes and returns up to `max` of the oldest queued [`JournalEvent`]s, oldest first.
+	///
+	/// Non-blocking. The queue is in memory only (bounded to [`JOURNAL_QUEUE_CAPACITY`], oldest
+	/// dropped first) and is empty again after a restart.
+	pub fn drain_journal_events(&self, max: usize) -> Vec<JournalEvent> {
+		self.journal.drain(max)
+	}
+
+	/// The number of [`JournalEvent`]s evicted because the queue was full, since startup.
+	pub fn journal_events_dropped(&self) -> u64 {
+		self.journal.dropped()
 	}
 
 	/// Remove the payment with the given id from the store.

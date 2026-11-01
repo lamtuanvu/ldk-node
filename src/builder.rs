@@ -2323,6 +2323,7 @@ fn build_with_store_internal(
 		wallet_birthday_height: fresh_birthday.map(|b| b.height),
 		path_failures: Arc::new(crate::path_failure::PathFailureStore::new()),
 		external_fundings: Arc::new(crate::funding::ExternalFundings::default()),
+		journal: Arc::new(crate::journal::JournalQueue::new()),
 		#[cfg(feature = "swaps")]
 		swap_tx_watch: Arc::new(crate::chain::SwapTxWatch::new()),
 	})
