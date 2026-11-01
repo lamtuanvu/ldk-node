@@ -58,6 +58,22 @@
 //! used. Nothing new is persisted: the resume point comes from the wallet and LDK stores, as it
 //! does for kyoto.
 //!
+//! # Replays
+//!
+//! A listener can join while the loop runs — a wallet created at runtime, a node started after
+//! the one that launched the sync — and the blocks already queued may be above its tip. The
+//! engine then asks for a replay from the listener's tip ([`ReplaySender`]). Between two steps,
+//! never inside one, the loop takes the requests made since. When the lowest is below the
+//! headers held — a node that fell behind the one that launched the sync, below its resume
+//! anchor even — the headers between are fetched and held too, authenticated as ancestors of the
+//! held chain by their hashes, as the headers a resume holds below its anchor are by the
+//! anchor's; no replay reaches more than [`SourceTuning::max_replay_depth`] below the tip held.
+//! A request whose block is not the one held at its height is on another chain: nothing is
+//! replayed for it. Then, when blocks above the lowest tip were queued, the loop queues
+//! [`ChainOp::Rescan`] and every block above it again, fetched and verified as on the first pass
+//! and matched against the scripts as they are now. The applicator rewinds on the rescan; the
+//! gated fan-out lets each listener already past a block skip it and the one that joined take it.
+//!
 //! [`CbfSource::trusts_source_for_inclusion`]: crate::config::CbfSource::trusts_source_for_inclusion
 
 use std::collections::HashSet;
@@ -189,6 +205,18 @@ impl HeaderChain {
 		self.filter_headers.truncate(keep);
 	}
 
+	/// Holds `headers`, the run just below the lowest held, the first of them at `base`.
+	fn prepend(&mut self, base: u32, headers: Vec<Header>) {
+		debug_assert_eq!(base as usize + headers.len(), self.base as usize);
+		let mut hashes: Vec<BlockHash> = headers.iter().map(Header::block_hash).collect();
+		hashes.append(&mut self.hashes);
+		let mut filter_headers = vec![None; headers.len()];
+		filter_headers.append(&mut self.filter_headers);
+		let mut held = headers;
+		held.append(&mut self.headers);
+		*self = Self { base, headers: held, hashes, filter_headers };
+	}
+
 	/// Drops everything below `height`, keeping at least the tip.
 	fn prune_below(&mut self, height: u32) {
 		let drop =
@@ -238,6 +266,24 @@ pub(crate) fn new_shared_header_chain() -> SharedHeaderChain {
 pub(crate) fn lock_headers(chain: &SharedHeaderChain) -> MutexGuard<'_, HeaderChain> {
 	chain.lock().unwrap_or_else(|e| e.into_inner())
 }
+
+/// Asks a running [`SourceSync`] to queue every block above a listener's tip again: what a
+/// listener that joined below the blocks already queued needs. Each request names the tip, so a
+/// listener on another chain is told apart. The engine holds the sender for as long as the loop
+/// runs; see [`SourceSync::serve_replays`].
+pub(crate) type ReplaySender = mpsc::UnboundedSender<BlockId>;
+
+/// The loop's end of a [`ReplaySender`].
+pub(crate) type ReplayReceiver = mpsc::UnboundedReceiver<BlockId>;
+
+/// The replay requests of one [`SourceSync`].
+pub(crate) fn replay_channel() -> (ReplaySender, ReplayReceiver) {
+	mpsc::unbounded_channel()
+}
+
+/// The deepest a replay reaches below the tip held: a year of blocks. The headers between are
+/// held while the replay passes them, under 8 MiB at the start of the deepest one.
+pub(crate) const MAX_REPLAY_DEPTH: u32 = 365 * 144;
 
 /// The scripts every filter is matched against — the wallet's and LDK's — behind a seam so the
 /// loop can be driven without a wallet.
@@ -558,6 +604,8 @@ pub(crate) struct SourceTuning {
 	/// `Some((first, max))`: after failing closed on invalid data, `node` mode starts over after
 	/// `first`, doubling up to `max`, rather than staying failed until the node restarts.
 	pub(crate) restart_backoff: Option<(Duration, Duration)>,
+	/// How far below the tip held a replay may reach; see [`MAX_REPLAY_DEPTH`].
+	pub(crate) max_replay_depth: u32,
 }
 
 impl SourceTuning {
@@ -578,6 +626,7 @@ impl SourceTuning {
 			stale_tip_after: (network != Network::Regtest).then_some(STALE_TIP_AFTER),
 			stale_report_interval: CBF_PEER_WAIT_REPORT_INTERVAL,
 			restart_backoff: Some((SOURCE_RESTART_FIRST_BACKOFF, SOURCE_RESTART_MAX_BACKOFF)),
+			max_replay_depth: MAX_REPLAY_DEPTH,
 		}
 	}
 }
@@ -784,11 +833,21 @@ pub(crate) struct SourceSync {
 	resumed: bool,
 	/// Every filter up to this height has been verified and its op queued.
 	filters_through: u32,
+	/// Every block up to this height has had its op queued on the chain held: above
+	/// `filters_through` while a replay queues again what the listeners already took, which a
+	/// reorg must disconnect too.
+	queued_through: u32,
 	/// The tip a `Synced` op was last queued for; cleared by anything that moves the chain.
 	synced_at: Option<BlockHash>,
 	scripts: Arc<dyn WatchedScripts>,
 	script_cache: ScriptCache,
 	ops_tx: mpsc::Sender<ChainOp>,
+	/// Replay requests; see [`Self::serve_replays`].
+	replay_rx: ReplayReceiver,
+	/// Whether a request can still come: with every sender gone, the idle wait stops listening.
+	replay_open: bool,
+	/// The replays asked for and not yet served.
+	pending_replays: Vec<BlockId>,
 	sync_state_tx: watch::Sender<CbfSyncState>,
 	full_block_permits: Arc<Semaphore>,
 	stop_rx: watch::Receiver<bool>,
@@ -800,7 +859,7 @@ impl SourceSync {
 	#[allow(clippy::too_many_arguments)]
 	pub(crate) fn new(
 		source: Arc<dyn FilterSource>, network: Network, anchor: BlockId, chain: SharedHeaderChain,
-		scripts: Arc<dyn WatchedScripts>, ops_tx: mpsc::Sender<ChainOp>,
+		scripts: Arc<dyn WatchedScripts>, ops_tx: mpsc::Sender<ChainOp>, replay_rx: ReplayReceiver,
 		sync_state_tx: watch::Sender<CbfSyncState>, full_block_permits: Arc<Semaphore>,
 		stop_rx: watch::Receiver<bool>, tuning: SourceTuning, logger: Arc<Logger>,
 	) -> Self {
@@ -811,10 +870,14 @@ impl SourceSync {
 			chain,
 			resumed: false,
 			filters_through: anchor.height,
+			queued_through: anchor.height,
 			synced_at: None,
 			scripts,
 			script_cache: ScriptCache::default(),
 			ops_tx,
+			replay_rx,
+			replay_open: true,
+			pending_replays: Vec::new(),
 			sync_state_tx,
 			full_block_permits,
 			stop_rx,
@@ -830,6 +893,11 @@ impl SourceSync {
 	/// the failure is published and logged, and after the backoff the loop starts over with a
 	/// clean slate — no strikes, and no filter header taken as verified, so the next span's
 	/// predecessor is taken from the source again. The headers held stay: they verified.
+	///
+	/// Replay requests are served at the start of every step ([`Self::serve_replays`]); one
+	/// that arrives while the loop waits for the next tip poll cuts the wait short. Before
+	/// handing over to kyoto the loop takes no more, and rewinds the applicator for the ones
+	/// already made ([`Self::rewind_for_handover`]).
 	pub(crate) async fn run(mut self) -> SourceSyncEnd {
 		let mut policy = SourceRetryPolicy::new(self.tuning.clone());
 		let mut restart_backoff = self.tuning.restart_backoff.map(|(first, _)| first);
@@ -855,7 +923,7 @@ impl SourceSync {
 					}
 					if progress == Progress::Idle {
 						restart_backoff = self.tuning.restart_backoff.map(|(first, _)| first);
-						if !self.sleep(self.tuning.poll_interval).await {
+						if !self.idle(self.tuning.poll_interval).await {
 							return SourceSyncEnd::Stopped;
 						}
 					}
@@ -897,6 +965,7 @@ impl SourceSync {
 								self.source.name(),
 								why
 							);
+							self.rewind_for_handover().await;
 							return SourceSyncEnd::FallBack;
 						},
 						RetryDecision::Fail => {
@@ -1004,14 +1073,206 @@ impl SourceSync {
 		!interrupted && !*self.stop_rx.borrow()
 	}
 
+	/// Waits out the tip poll interval; `false` when told to stop. A replay request cuts the
+	/// wait short: a listener that joined must not wait a whole poll for its blocks.
+	async fn idle(&mut self, duration: Duration) -> bool {
+		let deadline = tokio::time::Instant::now() + duration;
+		loop {
+			tokio::select! {
+				biased;
+				// A dropped sender is a stop too.
+				_ = self.stop_rx.changed() => return false,
+				request = self.replay_rx.recv(), if self.replay_open => match request {
+					Some(request) => {
+						self.pending_replays.push(request);
+						break;
+					},
+					// Every sender is gone: nobody can ask any more.
+					None => self.replay_open = false,
+				},
+				_ = tokio::time::sleep_until(deadline) => break,
+			}
+		}
+		!*self.stop_rx.borrow()
+	}
+
+	/// Serves the replays asked for since the last step: one, from the lowest tip asked.
+	///
+	/// When that tip is below the headers held, the headers between are held first
+	/// ([`Self::hold_headers_from`]); a failure there is a failed step, retried with the
+	/// requests kept. Nothing is replayed for a tip more than [`SourceTuning::max_replay_depth`]
+	/// below the tip held, nor for one whose block is not the block held at its height: that
+	/// listener is on another chain.
+	///
+	/// When blocks above the replay's start were queued, [`ChainOp::Rescan`] goes first, on the
+	/// same queue — the applicator must expect the replayed heights before the first of them
+	/// arrives — and the filter batches that follow fetch, verify and queue every block above
+	/// it again. A start at or above everything queued so far fetches nothing again — the blocks
+	/// after it are still to come — but the rescan is queued all the same: the applicator can
+	/// have started above that start, and would drop the blocks the listener needs.
+	async fn serve_replays(&mut self) -> Result<(), StepError> {
+		while let Ok(request) = self.replay_rx.try_recv() {
+			self.pending_replays.push(request);
+		}
+		if self.pending_replays.is_empty() {
+			return Ok(());
+		}
+		let held_tip = lock_headers(&self.chain).tip().map_or(self.anchor.height, |tip| tip.height);
+		let floor = held_tip.saturating_sub(self.tuning.max_replay_depth);
+		let reachable = self.pending_replays.iter().map(|request| request.height);
+		if let Some(lowest) = reachable.filter(|height| *height >= floor).min() {
+			self.hold_headers_from(lowest).await?;
+		}
+
+		let mut from: Option<u32> = None;
+		for request in std::mem::take(&mut self.pending_replays) {
+			if request.height < floor {
+				log_warn!(
+					self.logger,
+					"CBF replay refused for the listener at height {}: it is more than {} blocks below the tip held, {}; nothing is queued again for it.",
+					request.height,
+					self.tuning.max_replay_depth,
+					held_tip
+				);
+				continue;
+			}
+			let held = lock_headers(&self.chain).hash(request.height);
+			if let Some(held) = held.filter(|held| *held != request.hash) {
+				log_error!(
+					self.logger,
+					"CBF replay refused for the listener at height {}: its block {} is not the one filter source '{}' gave this sync there ({}), so it is on another chain; nothing is queued again for it.",
+					request.height,
+					request.hash,
+					self.source.name(),
+					held
+				);
+				continue;
+			}
+			from = Some(from.map_or(request.height, |from| from.min(request.height)));
+		}
+		let Some(from) = from else {
+			return Ok(());
+		};
+		if from >= self.filters_through {
+			// Nothing above it is queued by this loop yet, so nothing is fetched again: the
+			// blocks after it are still to come. The applicator may be past it all the same:
+			// it starts above the lowest tip of the nodes in the launch, which can lie above
+			// both the anchor this loop resumed from and the tip of a node that joined after
+			// the launch — a secondary an app starts right after its primary, a few blocks
+			// behind it (a mainnet Pi Zero, 2026-10-31). Without the rescan the applicator
+			// drops the blocks that node needs as out of sequence, and it waits for ever. The
+			// applicator ignores a rescan that starts at or above the block it expects next.
+			log_debug!(
+				self.logger,
+				"CBF replay from height {} asked; nothing above it is queued yet (queued through {}), so only the applicator is told to expect height {}.",
+				from,
+				self.filters_through,
+				from + 1
+			);
+			self.send(ChainOp::Rescan { from_height: from }).await?;
+			return Ok(());
+		}
+		log_info!(
+			self.logger,
+			"CBF queueing blocks {}..={} from filter source '{}' again for a listener that joined late.",
+			from + 1,
+			self.filters_through,
+			self.source.name()
+		);
+		self.send(ChainOp::Rescan { from_height: from }).await?;
+		self.filters_through = from;
+		self.synced_at = None;
+		mark_syncing(&self.sync_state_tx);
+		Ok(())
+	}
+
+	/// Holds every header from `height` up. Below the lowest held, the headers between are
+	/// fetched, checked to link up into the held chain and to carry their proof of work, and
+	/// held: they are authenticated as its ancestors by their hashes alone, as the headers a
+	/// resume holds below its anchor are by the anchor's. Pruning drops them again once the
+	/// filters have passed them.
+	async fn hold_headers_from(&mut self, height: u32) -> Result<(), StepError> {
+		let (base, lowest_held) = {
+			let chain = lock_headers(&self.chain);
+			match chain.header(chain.base()) {
+				Some(header) => (chain.base(), header),
+				// Nothing held yet: the resume holds what the first replay needs.
+				None => return Ok(()),
+			}
+		};
+		if height >= base {
+			return Ok(());
+		}
+		let count = base - height;
+		let mut headers: Vec<Header> = Vec::with_capacity(count as usize);
+		while (headers.len() as u32) < count {
+			let next = height + headers.len() as u32;
+			let ask = (count - headers.len() as u32).min(MAX_HEADERS_PER_REQUEST);
+			let batch = bounded(self.tuning.call_timeout, self.source.headers(next, ask)).await?;
+			if batch.is_empty() {
+				return Err(StepError::Source(SourceError::Invalid(format!(
+					"no headers from height {} though this sync holds the chain from {}",
+					next, base
+				))));
+			}
+			headers.extend(batch.into_iter().take(ask as usize));
+		}
+		check_batch_links(height, &headers)?;
+		if headers.last().map(Header::block_hash) != Some(lowest_held.prev_blockhash) {
+			return Err(VerifyFailure::BatchLink { height: base }.into());
+		}
+		for (i, header) in headers.iter().enumerate() {
+			if header.validate_pow(header.target()).is_err() {
+				let height = height + i as u32;
+				return Err(VerifyFailure::Header(HeaderCheck::ProofOfWork { height }).into());
+			}
+		}
+		lock_headers(&self.chain).prepend(height, headers);
+		log_info!(
+			self.logger,
+			"CBF holding headers from height {} (from {} until now) through filter source '{}', for a replay.",
+			height,
+			base,
+			self.source.name()
+		);
+		Ok(())
+	}
+
+	/// The loop hands over to kyoto: no request is taken any more — a late one fails at the
+	/// engine, which then refuses its target — and for the ones already made the applicator is
+	/// rewound now, without asking the source the loop is giving up on: kyoto, resuming from
+	/// the lowest listener, replays into it from there.
+	async fn rewind_for_handover(&mut self) {
+		self.replay_rx.close();
+		while let Ok(request) = self.replay_rx.try_recv() {
+			self.pending_replays.push(request);
+		}
+		let pending = std::mem::take(&mut self.pending_replays);
+		let Some(lowest) = pending.iter().map(|request| request.height).min() else {
+			return;
+		};
+		// Sent even when this loop queued nothing above `lowest`: the applicator may have
+		// started above it all the same (see `serve_replays`), and ignores a rescan it does
+		// not need.
+		log_info!(
+			self.logger,
+			"CBF rewinding to height {} before the P2P fallback, for a listener that joined late.",
+			lowest
+		);
+		if self.send(ChainOp::Rescan { from_height: lowest }).await.is_err() {
+			log_debug!(self.logger, "CBF rewind before the P2P fallback dropped: no applicator.");
+		}
+	}
+
 	/// One unit of progress: resume, a header batch, a reorg, a filter batch, or the `Synced`
-	/// that ends a catch-up.
+	/// that ends a catch-up — after the replays asked for since the last step are served.
 	async fn step(&mut self) -> Result<Progress, StepError> {
 		if !self.resumed {
 			self.resume().await?;
 			self.resumed = true;
 			return Ok(Progress::Advanced);
 		}
+		self.serve_replays().await?;
 
 		// Re-read every step: after any failure, a stop hash taken from an older tip may no
 		// longer be on the source's chain.
@@ -1136,6 +1397,7 @@ impl SourceSync {
 
 		*lock_headers(&self.chain) = HeaderChain::from_headers(lowest, headers);
 		self.filters_through = anchor.height;
+		self.queued_through = anchor.height;
 		log_info!(
 			self.logger,
 			"CBF resuming from height {} ({}) through filter source '{}'; holding headers from {}.",
@@ -1200,10 +1462,11 @@ impl SourceSync {
 			return Err(StepError::LessWork { fork });
 		}
 
-		// Ours above the fork, as far as ops were queued for it, tip first.
+		// Ours above the fork, as far as ops were queued for it, tip first: during a replay
+		// that is above the filters the replay has reached.
 		let abandoned: Vec<(Header, u32)> = {
 			let mut chain = lock_headers(&self.chain);
-			let abandoned = ((fork + 1)..=ours.height.min(self.filters_through))
+			let abandoned = ((fork + 1)..=ours.height.min(self.queued_through))
 				.rev()
 				.filter_map(|height| chain.header(height).map(|header| (header, height)))
 				.collect();
@@ -1219,6 +1482,7 @@ impl SourceSync {
 			fork
 		);
 		self.filters_through = self.filters_through.min(fork);
+		self.queued_through = self.queued_through.min(fork);
 		self.synced_at = None;
 		if !abandoned.is_empty() {
 			self.send(ChainOp::Disconnect { headers: abandoned }).await?;
@@ -1377,6 +1641,7 @@ impl SourceSync {
 			self.send(op).await?;
 			lock_headers(&self.chain).set_filter_header(height, filter_header);
 			self.filters_through = height;
+			self.queued_through = self.queued_through.max(height);
 		}
 		self.prune();
 		Ok(())
@@ -1563,6 +1828,8 @@ pub(crate) mod test_support {
 		pub(crate) filters_cap: Option<usize>,
 		/// `block` never answers.
 		pub(crate) hang_blocks: bool,
+		/// `block` answers once this is cleared again.
+		pub(crate) hold_blocks: bool,
 	}
 
 	pub(crate) struct FakeSource {
@@ -1583,6 +1850,7 @@ pub(crate) mod test_support {
 					filter_headers_cap: None,
 					filters_cap: None,
 					hang_blocks: false,
+					hold_blocks: false,
 				}),
 			};
 			source.mine(len, matched, 0);
@@ -1761,6 +2029,9 @@ pub(crate) mod test_support {
 			if hang {
 				std::future::pending::<()>().await;
 			}
+			while self.st().hold_blocks {
+				tokio::time::sleep(Duration::from_millis(1)).await;
+			}
 			let st = self.st();
 			let mut block =
 				st.all.get(&hash).cloned().ok_or_else(|| SourceError::NotFound("block".into()))?;
@@ -1800,6 +2071,7 @@ pub(crate) mod test_support {
 			stale_tip_after: None,
 			stale_report_interval: Duration::from_secs(60),
 			restart_backoff: None,
+			max_replay_depth: MAX_REPLAY_DEPTH,
 		}
 	}
 }
@@ -1827,12 +2099,15 @@ mod tests {
 		Disconnect(Vec<u32>),
 		Synced(u32),
 		TipConfirmed(u32),
+		Rescan(u32),
 	}
 
 	struct Harness {
 		source: Arc<FakeSource>,
 		chain: SharedHeaderChain,
 		ops_rx: mpsc::Receiver<ChainOp>,
+		/// What the engine holds for a listener that joins: asks the loop for a replay.
+		replay_tx: ReplaySender,
 		sync_state_tx: watch::Sender<CbfSyncState>,
 		stop_tx: watch::Sender<bool>,
 		permits: Arc<Semaphore>,
@@ -1852,6 +2127,7 @@ mod tests {
 			synced_to_tip: false,
 		});
 		let (stop_tx, stop_rx) = watch::channel(false);
+		let (replay_tx, replay_rx) = replay_channel();
 		let permits = Arc::new(Semaphore::new(CBF_FULL_BLOCK_PERMITS));
 		let sync = SourceSync::new(
 			Arc::clone(&source) as Arc<dyn FilterSource>,
@@ -1860,6 +2136,7 @@ mod tests {
 			Arc::clone(&chain),
 			Arc::new(FixedScripts(vec![watched_script()])),
 			ops_tx,
+			replay_rx,
 			sync_state_tx.clone(),
 			Arc::clone(&permits),
 			stop_rx,
@@ -1871,6 +2148,7 @@ mod tests {
 			source,
 			chain,
 			ops_rx,
+			replay_tx,
 			sync_state_tx,
 			stop_tx,
 			permits,
@@ -1880,6 +2158,13 @@ mod tests {
 	}
 
 	impl Harness {
+		/// Asks for a replay from the source's block at `height`, as the engine does for a
+		/// listener whose tip it is.
+		fn ask_replay(&self, height: u32) {
+			let hash = self.source.block_at(height).block_hash();
+			self.replay_tx.send(BlockId { height, hash }).unwrap();
+		}
+
 		/// The next op that moves the chain or ends a catch-up. A `TipConfirmed` moves nothing
 		/// and comes on every idle poll, so it is skipped here; [`Self::next_any_op`] sees it.
 		async fn next_op(&mut self) -> Op {
@@ -1917,6 +2202,7 @@ mod tests {
 					Op::Disconnect(heights)
 				},
 				ChainOp::Synced { tip_height } => Op::Synced(tip_height),
+				ChainOp::Rescan { from_height } => Op::Rescan(from_height),
 				ChainOp::TipConfirmed { tip_height } => Op::TipConfirmed(tip_height),
 			}
 		}
@@ -1999,6 +2285,208 @@ mod tests {
 			h.ops_until_synced().await,
 			vec![Op::Filtered(30), Op::Full(31), Op::Synced(31)]
 		);
+		assert_eq!(h.stop().await, SourceSyncEnd::Stopped);
+	}
+
+	/// The ops of a replay from `from`: the rescan, then every block above it to 29 again (20
+	/// matched, when `with_match`), ending in `Synced(29)`.
+	fn replay_ops(from: u32, with_match: bool) -> Vec<Op> {
+		let mut ops = vec![Op::Rescan(from)];
+		ops.extend((from + 1..=29).map(|h| {
+			if with_match && h == 20 {
+				Op::Full(h)
+			} else {
+				Op::Filtered(h)
+			}
+		}));
+		ops.push(Op::Synced(29));
+		ops
+	}
+
+	#[tokio::test]
+	async fn a_replay_request_queues_a_rescan_then_every_block_above_it_again() {
+		let mut h = start(FakeSource::new(30, &[20]), 10, fast_tuning());
+		h.ops_until_synced().await;
+		assert_eq!(h.source.calls("block"), 1);
+
+		// A listener joined at 15: the rescan goes first, then the filters after 15 come again,
+		// verified and matched anew, and the matched block is fetched again.
+		h.ask_replay(15);
+		assert_eq!(h.ops_until_synced().await, replay_ops(15, true));
+		assert_eq!(h.source.calls("block"), 2, "the matched block was fetched again");
+		assert!(matches!(*h.sync_state_tx.borrow(), CbfSyncState::Active { .. }), "no strike");
+
+		// From the tip on, the loop follows the chain as before.
+		h.source.mine(1, &[], 0);
+		assert_eq!(h.ops_until_synced().await, vec![Op::Filtered(30), Op::Synced(30)]);
+		assert_eq!(h.stop().await, SourceSyncEnd::Stopped);
+	}
+
+	#[tokio::test]
+	async fn a_replay_request_cuts_the_wait_for_the_next_tip_poll_short() {
+		let tuning = SourceTuning { poll_interval: Duration::from_secs(3600), ..fast_tuning() };
+		let mut h = start(FakeSource::new(30, &[]), 10, tuning);
+		h.ops_until_synced().await;
+
+		// Caught up, the loop waits an hour for its next tip poll; a request does not.
+		h.ask_replay(27);
+		assert_eq!(
+			h.ops_until_synced().await,
+			vec![Op::Rescan(27), Op::Filtered(28), Op::Filtered(29), Op::Synced(29)]
+		);
+		assert_eq!(h.stop().await, SourceSyncEnd::Stopped);
+	}
+
+	#[tokio::test]
+	async fn a_replay_request_at_or_above_what_was_queued_fetches_nothing_again() {
+		let mut h = start(FakeSource::new(30, &[]), 10, fast_tuning());
+		h.ops_until_synced().await;
+		let (filters, filter_headers) =
+			(h.source.calls("filters"), h.source.calls("filter_headers"));
+
+		// At the tip, and above it: every block a listener there needs is still to come, so
+		// nothing is fetched or queued again. Only the rescan goes out, from the lowest asked:
+		// the applicator, which may have started above it, rewinds to it or ignores it.
+		h.ask_replay(29);
+		h.replay_tx.send(BlockId { height: 45, hash: BlockHash::all_zeros() }).unwrap();
+		assert_eq!(h.next_op().await, Op::Rescan(29));
+		h.assert_quiet().await;
+		assert_eq!(h.source.calls("filters"), filters, "nothing was fetched again");
+		assert_eq!(h.source.calls("filter_headers"), filter_headers);
+		// Still synced to the same tip: it is confirmed, not announced again.
+		assert_eq!(h.next_any_op().await, Op::TipConfirmed(29));
+		assert_eq!(h.stop().await, SourceSyncEnd::Stopped);
+	}
+
+	/// The Pi2 boot order (2026-10-31): a node joins while the loop is still on its way up from
+	/// the anchor it resumed from, with its tip above that anchor. Nothing above the node's tip
+	/// is queued yet, so nothing is queued again — but the rescan still goes out first, for an
+	/// applicator that started above the node's tip, followed by every block from the anchor
+	/// up as on any catch-up.
+	#[tokio::test]
+	async fn a_replay_asked_before_the_loop_passed_it_still_queues_the_rescan_first() {
+		let source = FakeSource::new(30, &[]);
+		// The source refuses the first call, as a provider refused chain.headers for 21 s on
+		// the Pi; the request comes in while the loop waits to resume.
+		source.fail_next(1);
+		let mut h = start(source, 10, fast_tuning());
+		h.ask_replay(15);
+		let mut expected = vec![Op::Rescan(15)];
+		expected.extend(filtered(11..=29));
+		expected.push(Op::Synced(29));
+		assert_eq!(h.ops_until_synced().await, expected);
+		assert_eq!(h.stop().await, SourceSyncEnd::Stopped);
+	}
+
+	#[tokio::test]
+	async fn a_replay_request_below_the_resume_anchor_replays_from_it() {
+		let mut h = start(FakeSource::new(30, &[]), 10, fast_tuning());
+		h.ops_until_synced().await;
+
+		// A listener that fell behind the one the sync resumed for, at 3: the headers held
+		// from the start of the anchor's retarget period cover it.
+		h.ask_replay(3);
+		assert_eq!(h.ops_until_synced().await, replay_ops(3, false));
+		assert_eq!(h.stop().await, SourceSyncEnd::Stopped);
+	}
+
+	#[tokio::test]
+	async fn a_replay_below_the_headers_held_holds_them_down_to_it_first() {
+		let tuning = SourceTuning { held_headers: 5, ..fast_tuning() };
+		let mut h = start(FakeSource::new(30, &[]), 10, tuning);
+		h.ops_until_synced().await;
+		assert_eq!(lock_headers(&h.chain).base(), 25, "pruned to the last five");
+
+		// The headers from 12 are fetched, linked into the held chain and held, then the
+		// filters above 12 come again; once they have passed, pruning drops the headers again.
+		h.ask_replay(12);
+		assert_eq!(h.ops_until_synced().await, replay_ops(12, false));
+		assert_eq!(lock_headers(&h.chain).base(), 25, "pruned again behind the replay");
+		assert_eq!(h.stop().await, SourceSyncEnd::Stopped);
+	}
+
+	#[tokio::test]
+	async fn a_replay_deeper_than_the_cap_or_off_the_held_chain_queues_nothing() {
+		let tuning = SourceTuning { max_replay_depth: 10, ..fast_tuning() };
+		let mut h = start(FakeSource::new(30, &[]), 10, tuning);
+		h.ops_until_synced().await;
+		let filters = h.source.calls("filters");
+
+		// 12 is 17 below the tip; at 22 the block named is not the one held.
+		h.ask_replay(12);
+		h.replay_tx.send(BlockId { height: 22, hash: BlockHash::all_zeros() }).unwrap();
+		h.assert_quiet().await;
+		assert_eq!(h.source.calls("filters"), filters, "nothing was fetched again");
+
+		// One within the cap and on the chain is still served.
+		h.ask_replay(24);
+		assert_eq!(h.ops_until_synced().await, replay_ops(24, false));
+		assert_eq!(h.stop().await, SourceSyncEnd::Stopped);
+	}
+
+	#[tokio::test]
+	async fn the_lowest_of_the_replays_asked_together_is_served_once() {
+		let mut h = start(FakeSource::new(30, &[]), 10, fast_tuning());
+		h.ops_until_synced().await;
+
+		// Three listeners joined between two steps: one replay, from the lowest.
+		h.ask_replay(25);
+		h.ask_replay(18);
+		h.ask_replay(21);
+		assert_eq!(h.ops_until_synced().await, replay_ops(18, false));
+		h.assert_quiet().await;
+		assert_eq!(h.stop().await, SourceSyncEnd::Stopped);
+	}
+
+	#[tokio::test]
+	async fn a_replay_the_source_cannot_serve_before_a_fall_back_still_rewinds_the_applicator() {
+		let tuning = SourceTuning {
+			held_headers: 5,
+			fallback_after: Some(Duration::from_millis(100)),
+			..fast_tuning()
+		};
+		let mut h = start(FakeSource::new(30, &[]), 10, tuning);
+		h.ops_until_synced().await;
+
+		// The source goes down, and a listener joins below the headers held, which cannot be
+		// fetched now. Before handing over to kyoto — which replays from the lowest listener —
+		// the loop still rewinds the applicator for it.
+		h.take_the_source_down().await;
+		h.ask_replay(12);
+		assert_eq!(h.next_op().await, Op::Rescan(12));
+		assert_eq!(h.end().await, SourceSyncEnd::FallBack);
+	}
+
+	#[tokio::test]
+	async fn a_reorg_during_a_replay_disconnects_every_block_the_listeners_took() {
+		// A call bound that gives up on a hung block fetch quickly.
+		let tuning = SourceTuning { call_timeout: Duration::from_millis(200), ..fast_tuning() };
+		let mut h = start(FakeSource::new(30, &[20]), 10, tuning);
+		h.ops_until_synced().await;
+		let old_28 = h.source.block_at(28).header;
+		let old_29 = h.source.block_at(29).header;
+
+		// The replay stalls at the matched block 20, having queued 16..=19 again.
+		h.source.state.lock().unwrap().hang_blocks = true;
+		h.ask_replay(15);
+		let mut ops = Vec::new();
+		for _ in 0..5 {
+			ops.push(h.next_op().await);
+		}
+		let mut expected = vec![Op::Rescan(15)];
+		expected.extend(filtered(16..=19));
+		assert_eq!(ops, expected);
+
+		// Meanwhile the source replaces 28 and 29. The listeners already past the replay took
+		// them before it began, so they are disconnected though the replay never reached them;
+		// then the replay goes on along the new branch.
+		h.source.reorg(2, 3);
+		h.source.state.lock().unwrap().hang_blocks = false;
+		let mut expected = vec![Op::Disconnect(vec![29, 28]), Op::Full(20)];
+		expected.extend(filtered(21..=30));
+		expected.push(Op::Synced(30));
+		assert_eq!(h.ops_until_synced().await, expected);
+		assert_eq!(h.last_disconnect, vec![(old_29, 29), (old_28, 28)], "the abandoned headers");
 		assert_eq!(h.stop().await, SourceSyncEnd::Stopped);
 	}
 
@@ -2288,6 +2776,12 @@ mod tests {
 		use crate::chain::cbf::fee::new_block_fee_cache;
 		use crate::chain::cbf::WatchLedger;
 		use lightning::util::test_utils::TestStore;
+		use crate::chain::target::test_support::target_spec;
+		use crate::chain::target::TargetRegistry;
+		use crate::chain::test_wallet::fresh_regtest_wallet;
+		use crate::fee_estimator::OnchainFeeEstimator;
+		use crate::tx_broadcaster::TransactionBroadcaster;
+		use crate::types::DynStore;
 
 		let source = Arc::new(source);
 		let anchor = BlockId { height: 10, hash: source.block_at(10).block_hash() };
@@ -2295,8 +2789,20 @@ mod tests {
 		let (sync_state_tx, _) =
 			watch::channel(CbfSyncState::Active { applied_tip: Some(10), synced_to_tip: false });
 		let (stop_tx, stop_rx) = watch::channel(false);
+		let (_replay_tx, replay_rx) = replay_channel();
 		let metrics = Arc::new(RwLock::new(NodeMetrics::default()));
 		let logger = Arc::new(Logger::new_log_facade());
+		// The applicator stamps every registered target's metrics: one regtest target that
+		// shares `metrics`, so the stamps the test reads are the ones the applicator wrote.
+		let kv_store: Arc<DynStore> = Arc::new(TestStore::new(false));
+		let broadcaster = Arc::new(TransactionBroadcaster::new(Arc::clone(&logger)));
+		let fee_estimator = Arc::new(OnchainFeeEstimator::new());
+		let wallet = fresh_regtest_wallet(&kv_store, &broadcaster, &fee_estimator, &logger);
+		let mut spec =
+			target_spec("t", wallet, kv_store, broadcaster, fee_estimator, Arc::clone(&logger));
+		spec.node_metrics = Arc::clone(&metrics);
+		let targets = Arc::new(TargetRegistry::new());
+		targets.register(spec);
 		let applicator = BlockApplicator::new(
 			Arc::new(NoListeners),
 			ops_rx,
@@ -2304,8 +2810,7 @@ mod tests {
 			sync_state_tx.clone(),
 			new_block_fee_cache(),
 			Arc::new(WatchLedger::new()),
-			Arc::new(TestStore::new(false)),
-			Arc::clone(&metrics),
+			targets,
 			Arc::clone(&logger),
 		);
 		tokio::spawn(applicator.run());
@@ -2316,6 +2821,7 @@ mod tests {
 			new_shared_header_chain(),
 			Arc::new(FixedScripts(vec![watched_script()])),
 			ops_tx,
+			replay_rx,
 			sync_state_tx.clone(),
 			Arc::new(Semaphore::new(CBF_FULL_BLOCK_PERMITS)),
 			stop_rx,

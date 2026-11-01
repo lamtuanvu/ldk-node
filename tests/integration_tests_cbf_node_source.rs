@@ -13,6 +13,10 @@
 //! network: every answer goes through the Pro node's public serve functions and the public wire
 //! conversions in `ldk_node::chain_filter_source`, so the hybrid sees exactly the bytes it would
 //! see over a relay.
+//!
+//! The last test runs several hybrid nodes on one [`ChainHost`], as an app runs its wallets,
+//! starts some of them after the host's sync launched, and restarts them in an app's boot
+//! order: the primary first, then a secondary with a wallet and a channel on disk.
 
 #![cfg(feature = "cbf")]
 
@@ -29,8 +33,12 @@ use ldk_node::chain_provider::{
 	WireBlockRequest, WireFilterHeadersRequest, WireFiltersRequest, WireHeadersRequest,
 	CHAIN_WIRE_VERSION,
 };
-use ldk_node::logger::LogLevel;
-use ldk_node::{Builder, CbfConfig, CbfSource, CbfSyncStatus, Node, NodeError};
+use ldk_node::config::Config;
+use ldk_node::lightning::chain::BestBlock;
+use ldk_node::logger::{LogLevel, Logger};
+use ldk_node::{
+	Builder, CbfConfig, CbfSource, CbfSyncStatus, ChainHost, ChainHostBuilder, Node, NodeError,
+};
 
 use bitcoin::block::Header;
 use bitcoin::{Address, Amount, Block, BlockHash};
@@ -341,6 +349,195 @@ fn hybrid_node_follows_regtest_through_a_pro_nodes_raw_routes() {
 
 	hybrid.stop().unwrap();
 	pro.stop().unwrap();
+}
+
+/// A node-source CBF host for several nodes in this process, logging to its own directory.
+fn setup_shared_host(source: Arc<dyn FilterSource>) -> (Arc<ChainHost>, String) {
+	let config = random_config(true).node_config;
+	let dir = config.storage_dir_path.clone();
+	let log_file = Path::new(&dir).join(ldk_node::config::DEFAULT_LOG_FILENAME);
+	let logger = Logger::new_fs_writer(log_file.to_string_lossy().into_owned(), LogLevel::Debug)
+		.expect("the host's log file");
+	let mut builder = ChainHostBuilder::from_config(config);
+	builder.set_logger(Arc::new(logger));
+	builder.set_chain_source_cbf(
+		vec![],
+		CbfConfig { source: CbfSource::Node, wallet_birthday_height: None, ..Default::default() },
+	);
+	builder.set_cbf_filter_source(source);
+	(builder.build().unwrap(), dir)
+}
+
+/// A node on `host` with `config`'s store, built but not started, seeded at `birthday` when
+/// one is given — as an app builds a secondary, at every start.
+fn node_on_host(host: &Arc<ChainHost>, config: &Config, birthday: Option<BestBlock>) -> Node {
+	let mut builder = Builder::from_config(config.clone());
+	builder.set_chain_host(Arc::clone(host));
+	if let Some(birthday) = birthday {
+		builder.set_wallet_birthday(birthday);
+	}
+	builder.set_filesystem_logger(None, Some(LogLevel::Debug));
+	builder.build().unwrap()
+}
+
+fn best_block_at(tip: BlockId) -> BestBlock {
+	BestBlock::new(tip.hash, tip.height)
+}
+
+#[test]
+fn a_node_started_beside_a_running_node_source_sync_joins_it() {
+	let bitcoind = setup_bitcoind();
+	let client = &bitcoind.client;
+	let _ = client.create_wallet("ldk_node_test");
+	let _ = client.load_wallet("ldk_node_test");
+	let miner = client.new_address().unwrap();
+	mine(client, 101, &miner);
+	wait_for_filter_index(client);
+
+	let pro = setup_pro_node(&bitcoind);
+	let source = Arc::new(ProNodeFilterSource::new(Arc::clone(&pro)));
+	let (host, host_dir) = setup_shared_host(Arc::clone(&source) as Arc<dyn FilterSource>);
+	// Nodes sharing a host share a runtime: the host's tasks run on the first one's.
+	let runtime =
+		Arc::new(tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap());
+
+	// The first node launches the host's sync.
+	let first_config = random_config(true).node_config;
+	let first = node_on_host(&host, &first_config, None);
+	first.start_with_runtime(Arc::clone(&runtime)).unwrap();
+	wait_for_hybrid_at_tip(&first, client, "the first node to sync to bitcoind's tip");
+
+	// (f) A second node, built and started on the running sync as a wallet created at
+	// runtime is, seeded at the first node's best block. It used to be refused until the app
+	// restarted; it joins at the tip, with nothing to replay, and takes the next blocks.
+	let birthday = first.status().current_best_block;
+	let second_config = random_config(true).node_config;
+	let second = node_on_host(&host, &second_config, Some(birthday));
+	second.start_with_runtime(Arc::clone(&runtime)).expect("joins the running node-source sync");
+	assert_eq!(second.status().current_best_block, birthday, "seeded at its birthday");
+
+	let second_addr = second.onchain_payment().new_address().unwrap();
+	let second_amount = Amount::from_sat(200_000);
+	client.send_to_address(&second_addr, second_amount).unwrap();
+	mine(client, 6, &miner);
+	wait_for_filter_index(client);
+	wait_for_hybrid_at_tip(&second, client, "the second node to follow the sync it joined");
+	wait_until("the second node's wallet to see its funding", || {
+		second.list_balances().spendable_onchain_balance_sats == second_amount.to_sat()
+	});
+	wait_for_hybrid_at_tip(&first, client, "the first node to follow on");
+	assert_eq!(first.list_balances().total_onchain_balance_sats, 0, "not the first node's coins");
+	// The host's log is buffered: it is read once the line has been written out.
+	wait_until("the host to log the join at the tip", || {
+		log_contains(&host_dir, "joined the running node-source sync at height")
+	});
+	println!("(f) second node joined at {} and took its funding", birthday.height);
+
+	// (g) A third node seeded below the tip, whose funding confirmed after its birthday but
+	// before it started: the running sync queues the filters after its birthday again, and
+	// the replay finds the funding.
+	let third_birthday = best_block_at(bitcoind_tip(client));
+	let third = node_on_host(&host, &random_config(true).node_config, Some(third_birthday));
+	let third_addr = third.onchain_payment().new_address().unwrap();
+	let third_amount = Amount::from_sat(300_000);
+	client.send_to_address(&third_addr, third_amount).unwrap();
+	mine(client, 3, &miner);
+	wait_for_filter_index(client);
+	wait_for_hybrid_at_tip(&first, client, "the running sync to pass the third node's funding");
+	let block_calls = source.calls("block");
+	third.start_with_runtime(Arc::clone(&runtime)).expect("joins below the running sync's tip");
+	wait_for_hybrid_at_tip(&third, client, "the third node to be replayed to the tip");
+	wait_until("the third node's wallet to find its funding in the replay", || {
+		third.list_balances().spendable_onchain_balance_sats == third_amount.to_sat()
+	});
+	wait_until("the host to log the replay", || {
+		log_contains(&host_dir, "again for a listener that joined late")
+	});
+	assert!(source.calls("block") > block_calls, "the funding block was fetched for the replay");
+	wait_for_hybrid_at_tip(&second, client, "the second node to stay at the tip");
+	assert_eq!(second.list_balances().spendable_onchain_balance_sats, second_amount.to_sat());
+	assert_eq!(first.list_balances().total_onchain_balance_sats, 0);
+	println!(
+		"(g) third node seeded at {} was replayed to {:?} and found its funding",
+		third_birthday.height,
+		hybrid_best_block(&third)
+	);
+
+	// (h) An app's boot order: the primary starts and launches the sync, and a secondary — a
+	// wallet and a confirmed private channel on disk, and behind the primary — starts right
+	// after, on the running sync. It was refused on every retry ("Failed to join the chain
+	// host: Node is not running", a mainnet Pi, 2026-10-31).
+	//
+	// The Pro node opens the second node's channel: funds for the Pro node first.
+	let pro_addr = pro.onchain_payment().new_address().unwrap();
+	client.send_to_address(&pro_addr, Amount::from_sat(500_000)).unwrap();
+	mine(client, 1, &miner);
+	wait_until("the Pro node to see its funds", || {
+		pro.sync_wallets().is_ok() && pro.list_balances().spendable_onchain_balance_sats > 0
+	});
+	let second_listens_on = second.listening_addresses().unwrap()[0].clone();
+	pro.open_channel(second.node_id(), second_listens_on, 100_000, None, None).unwrap();
+	wait_until("the channel's funding to reach bitcoind's mempool", || {
+		let funding = pro.list_channels().first().and_then(|c| c.funding_txo);
+		let mempool: Vec<String> =
+			client.call("getrawmempool", &[]).expect("bitcoind answers getrawmempool");
+		funding.is_some_and(|txo| mempool.contains(&txo.txid.to_string()))
+	});
+	mine(client, 6, &miner);
+	wait_for_filter_index(client);
+	wait_until("the channel to be ready on the second node", || {
+		second.list_channels().first().is_some_and(|c| c.is_channel_ready)
+	});
+	let second_onchain = second.list_balances().total_onchain_balance_sats;
+	println!("(h) a private channel from the Pro node is ready on the second node");
+
+	// The second node stops, and falls behind while the others run on.
+	second.stop().unwrap();
+	let stopped_at = second.status().current_best_block;
+	mine(client, 12, &miner);
+	wait_for_filter_index(client);
+	wait_for_hybrid_at_tip(&first, client, "the first node to run on without the second");
+
+	// The app stops and starts again: a new host, the nodes rebuilt from their stores.
+	third.stop().unwrap();
+	first.stop().unwrap();
+	let (host, host_dir) = setup_shared_host(Arc::clone(&source) as Arc<dyn FilterSource>);
+	let first = node_on_host(&host, &first_config, None);
+	first.start_with_runtime(Arc::clone(&runtime)).unwrap();
+	wait_for_hybrid_at_tip(&first, client, "the first node to launch the sync again");
+	// The first node resumed a few blocks below its own tip, so the second is below the anchor
+	// of the sync it joins: no header held there was ever verified for it.
+	let restarted_at = bitcoind_tip(client).height;
+	assert!(stopped_at.height + 7 < restarted_at, "the second node is below the launch anchor");
+	let second = node_on_host(&host, &second_config, Some(birthday));
+	assert_eq!(second.status().current_best_block, stopped_at, "where it stopped");
+	second.start_with_runtime(Arc::clone(&runtime)).expect("the secondary joins after the primary");
+	wait_for_hybrid_at_tip(&second, client, "the second node to be replayed to the tip");
+	// From its own lowest tip: its channel monitor may have been persisted a block or so
+	// behind its `ChannelManager`.
+	wait_until("the host to log the replay from where the second node stopped", || {
+		log_contains(&host_dir, "joined the running node-source sync; replaying filters after")
+	});
+	assert_eq!(second.list_balances().total_onchain_balance_sats, second_onchain);
+	assert!(second.list_channels().first().is_some_and(|c| c.is_channel_ready));
+
+	// Both follow the chain on.
+	mine(client, 1, &miner);
+	wait_for_filter_index(client);
+	wait_for_hybrid_at_tip(&second, client, "the second node to follow the next block");
+	wait_for_hybrid_at_tip(&first, client, "the first node to follow the next block");
+	println!(
+		"(h) restarted: the second node, stopped at {}, joined the sync the first launched and follows it at {:?}",
+		stopped_at.height,
+		hybrid_best_block(&second)
+	);
+
+	second.stop().unwrap();
+	first.stop().unwrap();
+	pro.stop().unwrap();
+	if let Ok(runtime) = Arc::try_unwrap(runtime) {
+		runtime.shutdown_timeout(Duration::from_secs(10));
+	}
 }
 
 #[test]
