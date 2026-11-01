@@ -28,6 +28,7 @@ use crate::io::{
 	EVENT_QUEUE_PERSISTENCE_KEY, EVENT_QUEUE_PERSISTENCE_PRIMARY_NAMESPACE,
 	EVENT_QUEUE_PERSISTENCE_SECONDARY_NAMESPACE,
 };
+use crate::journal::JournalQueue;
 use crate::logger::{log_debug, log_error, log_info, LdkLogger};
 use crate::path_failure::{attribute_path_failure, PathFailureInfo, PathFailureStore};
 
@@ -449,6 +450,7 @@ where
 	L::Target: LdkLogger,
 {
 	event_queue: Arc<EventQueue<L>>,
+	journal: Arc<JournalQueue>,
 	wallet: Arc<Wallet>,
 	bump_tx_event_handler: Arc<BumpTransactionEventHandler>,
 	channel_manager: Arc<ChannelManager>,
@@ -478,10 +480,12 @@ where
 		liquidity_source: Option<Arc<LiquiditySource<Arc<Logger>>>>,
 		payment_store: Arc<PaymentStore>, peer_store: Arc<PeerStore<L>>,
 		path_failures: Arc<PathFailureStore>, external_fundings: Arc<ExternalFundings>,
+		journal: Arc<JournalQueue>,
 		runtime: Arc<RwLock<Option<Arc<tokio::runtime::Runtime>>>>, logger: L, config: Arc<Config>,
 	) -> Self {
 		Self {
 			event_queue,
+			journal,
 			wallet,
 			bump_tx_event_handler,
 			channel_manager,
@@ -1198,9 +1202,12 @@ where
 				};
 			},
 
-			LdkEvent::PaymentPathSuccessful { .. } => {},
+			LdkEvent::PaymentPathSuccessful { payment_id, payment_hash, path, .. } => {
+				self.journal.path_successful(payment_id, payment_hash, &path);
+			},
 			LdkEvent::PaymentPathFailed {
-				payment_id: Some(payment_id),
+				payment_id,
+				payment_hash,
 				payment_failed_permanently,
 				failure,
 				path,
@@ -1208,8 +1215,9 @@ where
 				..
 			} => {
 				// No user-facing event is emitted for a single failed path (the terminal
-				// `PaymentFailed` still follows); we only remember the per-hop detail so
-				// route-driving callers can ask `Node::path_failure` which leg broke.
+				// `PaymentFailed` still follows); we remember the per-hop detail so
+				// route-driving callers can ask `Node::path_failure` which leg broke, and
+				// record an in-memory journal observation.
 				let our_node_id = self.channel_manager.get_our_node_id();
 				let attribution = attribute_path_failure(
 					&path,
@@ -1219,49 +1227,61 @@ where
 					&our_node_id,
 				);
 
-				// The background processor applies the event's `network_update` to the
-				// graph before awaiting this handler, so this reads the graph after that
-				// update: a permanently failed channel is already gone here
-				// (see `PathFailureInfo::graph_pruned`).
-				let graph_pruned =
-					match (attribution.graph_lookup_meaningful, attribution.short_channel_id) {
-						(true, Some(scid)) => {
-							self.network_graph.read_only().channel(scid).is_none()
-						},
-						_ => false,
+				if let Some(payment_id) = payment_id {
+					// The background processor applies the event's `network_update` to the
+					// graph before awaiting this handler, so this reads the graph after that
+					// update: a permanently failed channel is already gone here
+					// (see `PathFailureInfo::graph_pruned`).
+					let graph_pruned =
+						match (attribution.graph_lookup_meaningful, attribution.short_channel_id) {
+							(true, Some(scid)) => {
+								self.network_graph.read_only().channel(scid).is_none()
+							},
+							_ => false,
+						};
+
+					let at_unix_secs = SystemTime::now()
+						.duration_since(UNIX_EPOCH)
+						.map(|d| d.as_secs())
+						.unwrap_or(0);
+
+					let info = PathFailureInfo {
+						short_channel_id: attribution.short_channel_id,
+						failing_node_id: attribution.failing_node_id,
+						hop_index: attribution.hop_index,
+						failure_class: attribution.failure_class,
+						payment_failed_permanently,
+						graph_pruned,
+						at_unix_secs,
 					};
 
-				let at_unix_secs =
-					SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+					log_debug!(
+						self.logger,
+						"Payment path failed for payment {}: class={} scid={:?} hop_index={:?} failing_node={:?} graph_pruned={} permanent={}",
+						payment_id,
+						info.failure_class.as_str(),
+						info.short_channel_id,
+						info.hop_index,
+						info.failing_node_id,
+						info.graph_pruned,
+						info.payment_failed_permanently,
+					);
 
-				let info = PathFailureInfo {
-					short_channel_id: attribution.short_channel_id,
-					failing_node_id: attribution.failing_node_id,
-					hop_index: attribution.hop_index,
-					failure_class: attribution.failure_class,
-					payment_failed_permanently,
-					graph_pruned,
-					at_unix_secs,
-				};
+					self.path_failures.insert(payment_id, info);
+				}
 
-				log_debug!(
-					self.logger,
-					"Payment path failed for payment {}: class={} scid={:?} hop_index={:?} failing_node={:?} graph_pruned={} permanent={}",
+				self.journal.path_failed(
 					payment_id,
-					info.failure_class.as_str(),
-					info.short_channel_id,
-					info.hop_index,
-					info.failing_node_id,
-					info.graph_pruned,
-					info.payment_failed_permanently,
+					payment_hash,
+					payment_failed_permanently,
+					&attribution,
+					&path,
 				);
-
-				self.path_failures.insert(payment_id, info);
 			},
-			LdkEvent::PaymentPathFailed { payment_id: None, .. } => {},
 			LdkEvent::ProbeSuccessful { .. } => {},
 			LdkEvent::ProbeFailed { .. } => {},
-			LdkEvent::HTLCHandlingFailed { failed_next_destination, .. } => {
+			LdkEvent::HTLCHandlingFailed { prev_channel_id, failed_next_destination } => {
+				self.journal.htlc_handling_failed(prev_channel_id, &failed_next_destination);
 				if let Some(liquidity_source) = self.liquidity_source.as_ref() {
 					liquidity_source.handle_htlc_handling_failed(failed_next_destination);
 				}
