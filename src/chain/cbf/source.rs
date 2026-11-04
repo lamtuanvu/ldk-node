@@ -49,6 +49,12 @@ use bitcoin::{Block, BlockHash};
 pub use bdk_chain::BlockId;
 pub use bitcoin::bip158::{BlockFilter, FilterHeader};
 
+/// The per-block bundles a network-backed source can pull: the wire they travel on and the port
+/// an app implements over its transport. See `ChainHostBuilder::set_cbf_bundle_transport` (with
+/// the `cbf` feature).
+pub use crate::chain::provider::{
+	BundleTransport, WireBlockUpdate, WireBlockUpdates, WireSinceRequest, MAX_UPDATES_PER_SINCE,
+};
 pub use crate::chain::provider::{
 	BLOCK_CHUNK_BYTES, MAX_FILTERS_PER_REQUEST, MAX_FILTER_HEADERS_PER_REQUEST,
 	MAX_HEADERS_PER_REQUEST,
@@ -177,6 +183,13 @@ impl From<ChainProviderError> for SourceError {
 pub trait FilterSource: Send + Sync {
 	/// Identifies the source in logs.
 	fn name(&self) -> &'static str;
+
+	/// Whether this source hands out headers and their filters together, so a sync loop should
+	/// use the filters it can already have before asking for more headers. `false` for a source
+	/// whose every question is a separate cost, where the loop reads headers ahead.
+	fn headers_come_with_filters(&self) -> bool {
+		false
+	}
 
 	/// The source's best block.
 	async fn tip(&self) -> Result<BlockId, SourceError>;

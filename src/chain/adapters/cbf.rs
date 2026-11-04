@@ -39,6 +39,8 @@ use lightning_block_sync::{
 	AsyncBlockSourceResult, BlockData, BlockHeaderData, BlockSource, BlockSourceError,
 };
 
+use crate::chain::adapters::dependent::fee_update_from_wire;
+use crate::chain::cbf::bundle_source::BundleFilterSource;
 use crate::chain::cbf::fee::{
 	cbf_percentile_for_target, percentile_of_sorted, BlockFeeCache, CBF_MIN_FEERATE_SAT_PER_KWU,
 	FEE_WINDOW_BLOCKS,
@@ -142,6 +144,36 @@ impl CbfDerivedFee {
 	}
 }
 
+/// FEE from the estimates the Pro node's newest block bundle carried: its own, mempool-aware
+/// rates, at no request of their own. `Unavailable` when no bundle carried any in the last
+/// [`BUNDLE_FEE_MAX_AGE`](crate::chain::cbf::bundle_source::BUNDLE_FEE_MAX_AGE) — the chain then
+/// asks the provider.
+pub(crate) struct CbfBundleFee {
+	bundles: Arc<BundleFilterSource>,
+	logger: Arc<Logger>,
+}
+
+impl CbfBundleFee {
+	pub(crate) fn new(bundles: Arc<BundleFilterSource>, logger: Arc<Logger>) -> Self {
+		Self { bundles, logger }
+	}
+}
+
+#[async_trait]
+impl FeeAction for CbfBundleFee {
+	fn name(&self) -> &'static str {
+		"bundle"
+	}
+
+	async fn fee_rate_update(&self) -> ActionResult<FeeUpdate> {
+		let estimates = self
+			.bundles
+			.fresh_fee_estimates()
+			.ok_or_else(|| ChainActionError::unavailable("no fresh bundle fee estimates"))?;
+		fee_update_from_wire(&estimates, &self.logger)
+	}
+}
+
 /// The canonical samples of the fee window as `source` sees it, read out of `cache`.
 async fn derived_samples<S: FeeBlockSource + ?Sized>(
 	source: &S, cache: &BlockFeeCache,
@@ -198,6 +230,7 @@ impl FeeAction for CbfDerivedFee {
 	}
 
 	async fn fee_rate_update(&self) -> ActionResult<FeeUpdate> {
+		self.engine.derived_fee_asked();
 		let samples =
 			derived_samples(&self.engine.fee_source(), self.engine.block_fee_cache()).await?;
 		if samples.len() < MIN_FEE_SAMPLES {
@@ -1130,6 +1163,7 @@ mod tests {
 			crate::config::CbfSource::P2p,
 			None,
 			None,
+			crate::chain::cbf::fee_sampler::FeeSampleDemand::always(),
 			Arc::new(TargetRegistry::new()),
 			config,
 			Arc::clone(&logger),

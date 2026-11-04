@@ -40,6 +40,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -94,6 +95,78 @@ pub(crate) fn cooldown_after(
 /// How often the sampler looks at the tip. A pass with nothing missing is a few local header
 /// lookups, so this only sets how soon a new block is sampled.
 pub(crate) const CBF_FEE_SAMPLE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Whether the sampler should download blocks at all.
+///
+/// A filter node with no other fee source samples always. On a hybrid node the provider leads
+/// the FEE slot, so the coinbase-derived rates are only its fallback, and the window is worth
+/// a block download per new block only while the provider is not answering:
+///
+/// ```text
+///   fee refresh   provider answers            -> derived adapter never asked -> idle
+///                 provider Unavailable        -> derived adapter asked       -> sample
+///                 (the next refresh the provider answers puts the sampler back to idle)
+/// ```
+///
+/// The derived adapter marks itself asked; the refresh loop brackets each refresh. A refresh
+/// run outside the loop (a `sync_wallets`) can only wake the sampler, never idle it, so a
+/// race between two refreshes costs at most one sampling round, not a missed fallback.
+pub(crate) struct FeeSampleDemand {
+	on_demand: bool,
+	wanted: AtomicBool,
+	asked_this_refresh: AtomicBool,
+}
+
+impl FeeSampleDemand {
+	/// The sampler runs on every pass: the derived rates are this node's own fee market.
+	pub(crate) fn always() -> Self {
+		Self {
+			on_demand: false,
+			wanted: AtomicBool::new(true),
+			asked_this_refresh: AtomicBool::new(false),
+		}
+	}
+
+	/// The sampler runs only after the FEE slot has fallen through to the derived rates.
+	pub(crate) fn on_demand() -> Self {
+		Self {
+			on_demand: true,
+			wanted: AtomicBool::new(false),
+			asked_this_refresh: AtomicBool::new(false),
+		}
+	}
+
+	/// Whether the provider leads, and the sampler idles while it answers.
+	pub(crate) fn is_on_demand(&self) -> bool {
+		self.on_demand
+	}
+
+	/// Whether the next pass should sample.
+	pub(crate) fn wanted(&self) -> bool {
+		!self.on_demand || self.wanted.load(Ordering::Acquire)
+	}
+
+	/// The FEE slot reached the derived adapter. Returns `true` when this woke the sampler.
+	pub(crate) fn derived_asked(&self) -> bool {
+		self.asked_this_refresh.store(true, Ordering::Release);
+		self.on_demand && !self.wanted.swap(true, Ordering::AcqRel)
+	}
+
+	/// A refresh is about to run.
+	pub(crate) fn refresh_started(&self) {
+		self.asked_this_refresh.store(false, Ordering::Release);
+	}
+
+	/// A refresh finished. One that filled the cache without asking the derived adapter means
+	/// the provider answered, and the sampler goes back to idle. Returns `true` when this
+	/// idled it.
+	pub(crate) fn refresh_finished(&self, ok: bool) -> bool {
+		if !self.on_demand || !ok || self.asked_this_refresh.load(Ordering::Acquire) {
+			return false;
+		}
+		self.wanted.swap(false, Ordering::AcqRel)
+	}
+}
 
 /// Why one step of a pass came back without a sample.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -779,5 +852,55 @@ mod tests {
 		assert!(!line.contains('\n'));
 		assert!(line.contains("fetch_timeout=2"), "{}", line);
 		assert!(line.contains("no_permit=1"), "{}", line);
+	}
+
+	#[test]
+	fn a_filter_node_without_a_provider_always_samples() {
+		let demand = FeeSampleDemand::always();
+		assert!(demand.wanted());
+		demand.refresh_started();
+		assert!(!demand.refresh_finished(true), "nothing to idle");
+		assert!(demand.wanted());
+		assert!(!demand.derived_asked(), "it was never asleep");
+	}
+
+	#[test]
+	fn a_hybrid_samples_only_while_the_provider_does_not_answer() {
+		let demand = FeeSampleDemand::on_demand();
+		assert!(!demand.wanted(), "idle until the provider fails");
+
+		// The provider answered: the derived adapter was never asked.
+		demand.refresh_started();
+		assert!(!demand.refresh_finished(true));
+		assert!(!demand.wanted());
+
+		// The provider was Unavailable; the chain fell through to the derived rates.
+		demand.refresh_started();
+		assert!(demand.derived_asked(), "woken");
+		assert!(!demand.refresh_finished(false));
+		assert!(demand.wanted());
+
+		// Still falling through, still sampling; a second ask wakes nothing new.
+		demand.refresh_started();
+		assert!(!demand.derived_asked());
+		assert!(!demand.refresh_finished(true), "the derived rates answered, not the provider");
+		assert!(demand.wanted());
+
+		// The provider is back.
+		demand.refresh_started();
+		assert!(demand.refresh_finished(true), "idled");
+		assert!(!demand.wanted());
+	}
+
+	#[test]
+	fn a_refresh_outside_the_loop_can_wake_the_sampler_but_not_idle_it() {
+		let demand = FeeSampleDemand::on_demand();
+		// A `sync_wallets` refresh falls through while no loop refresh is bracketed.
+		assert!(demand.derived_asked());
+		assert!(demand.wanted());
+		// The loop's own refresh that started before it, and saw the provider answer, still
+		// sees the ask and leaves the sampler on.
+		assert!(!demand.refresh_finished(true));
+		assert!(demand.wanted());
 	}
 }

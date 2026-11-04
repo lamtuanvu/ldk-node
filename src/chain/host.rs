@@ -42,6 +42,8 @@ use crate::chain::{CbfSyncStatus, ChainLayer, ChainSlotStatus, DEFAULT_ESPLORA_S
 #[cfg(feature = "cbf")]
 use crate::chain::cbf::source::FilterSource;
 #[cfg(feature = "cbf")]
+use crate::chain::provider::BundleTransport;
+#[cfg(feature = "cbf")]
 use crate::config::CbfConfig;
 use crate::config::{
 	BitcoindRestClientConfig, Config, ElectrumSyncConfig, EsploraSyncConfig, DEFAULT_LOG_FILENAME,
@@ -68,6 +70,8 @@ pub struct ChainHostBuilder {
 	chain_provider_fallback: Option<Arc<dyn ChainDataProvider>>,
 	#[cfg(feature = "cbf")]
 	cbf_filter_source: Option<Arc<dyn FilterSource>>,
+	#[cfg(feature = "cbf")]
+	cbf_bundle_transport: Option<Arc<dyn BundleTransport>>,
 	raw_chain_source_config: Option<RawChainSourceConfig>,
 	raw_chain_source_allow_insecure_http: bool,
 	logger: Option<Arc<Logger>>,
@@ -89,6 +93,8 @@ impl ChainHostBuilder {
 			chain_provider_fallback: None,
 			#[cfg(feature = "cbf")]
 			cbf_filter_source: None,
+			#[cfg(feature = "cbf")]
+			cbf_bundle_transport: None,
 			raw_chain_source_config: None,
 			raw_chain_source_allow_insecure_http: false,
 			logger: None,
@@ -181,6 +187,21 @@ impl ChainHostBuilder {
 		self
 	}
 
+	/// Reads the node filter source through per-block bundles: when its tip moves, one
+	/// `chain.since` over `transport` answers the new blocks' headers, filter headers and
+	/// filters, and carries the Pro's fee estimates, which then lead the FEE slot after an
+	/// external fee server. The tip is polled as before, and everything a bundle carries is
+	/// verified as raw data is.
+	///
+	/// Wraps the source given to [`Self::set_cbf_filter_source`]; with a P2P CBF source there
+	/// is nothing to bundle and the transport is ignored. A Pro that does not know the route
+	/// leaves the node on the raw routes, and is asked again after half an hour.
+	#[cfg(feature = "cbf")]
+	pub fn set_cbf_bundle_transport(&mut self, transport: Arc<dyn BundleTransport>) -> &mut Self {
+		self.cbf_bundle_transport = Some(transport);
+		self
+	}
+
 	/// See [`Builder::set_raw_chain_source_bitcoind_rpc`](crate::Builder::set_raw_chain_source_bitcoind_rpc).
 	pub fn set_raw_chain_source_bitcoind_rpc(
 		&mut self, url: String, user: String, password: String, cert_sha256: Option<String>,
@@ -220,6 +241,8 @@ impl ChainHostBuilder {
 			chain_provider_fallback,
 			#[cfg(feature = "cbf")]
 			cbf_filter_source,
+			#[cfg(feature = "cbf")]
+			cbf_bundle_transport: None,
 			raw_chain_source_config,
 			raw_chain_source_allow_insecure_http,
 			logger: Some(logger),
@@ -343,6 +366,7 @@ impl ChainHostBuilder {
 					cbf_config.clone(),
 					chain_provider_fallback,
 					self.cbf_filter_source,
+					self.cbf_bundle_transport,
 					Arc::clone(&fee_estimator),
 					Arc::clone(&tx_broadcaster),
 					Arc::clone(&config),

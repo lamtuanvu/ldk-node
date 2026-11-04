@@ -121,7 +121,9 @@ pub use crate::chain::provider as chain_provider;
 /// of it. A Pro node with a raw source (see
 /// [`Builder::set_raw_chain_source_bitcoind_rpc`]) serves that data through
 /// [`Node::chain_serve_headers`] and its siblings; an app implements the trait
-/// over its own transport to consume it.
+/// over its own transport to consume it. The per-block bundles' wire and their
+/// [`chain_filter_source::BundleTransport`] port are re-exported here too: a
+/// Pro node answers them with [`Node::chain_serve_since`].
 pub use crate::chain::cbf::source as chain_filter_source;
 
 pub use crate::chain::adapters::bitcoind_raw::RawSourceStatus;
@@ -2176,6 +2178,26 @@ impl Node {
 		let chain_source = Arc::clone(&self.chain_source);
 		let req = req.clone();
 		runtime.block_on(async move { chain_source.serve_block_chunk(&req).await })
+	}
+
+	/// Serve the bundles of the blocks above `req.from` — header, filter
+	/// header and filter of each, with this node's own fee estimates on the
+	/// newest: at most [`chain_provider::MAX_UPDATES_PER_SINCE`], and no more
+	/// than fit in one peer reply; `more` is set when the reply stops short of
+	/// the tip. Built from the raw source once and cached; see
+	/// [`Node::chain_serve_tip`].
+	///
+	/// Errors with [`Error::ChainServeNotOnBestChain`] when `req.from` is not
+	/// on the raw source's best chain.
+	pub fn chain_serve_since(
+		&self, req: &chain_provider::WireSinceRequest,
+	) -> Result<chain_provider::WireBlockUpdates, Error> {
+		let rt_lock = self.runtime.read().unwrap();
+		let runtime = rt_lock.as_ref().ok_or(Error::NotRunning)?;
+
+		let chain_source = Arc::clone(&self.chain_source);
+		let req = req.clone();
+		runtime.block_on(async move { chain_source.serve_since(&req).await })
 	}
 
 	/// Close a previously opened channel.

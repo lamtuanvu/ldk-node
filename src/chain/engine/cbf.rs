@@ -49,9 +49,10 @@ use crate::chain::cbf::applicator::{
 	BlockApplicator, ChainFanout, ChainOp, CBF_CHAIN_OP_QUEUE_DEPTH, CBF_FULL_BLOCK_PERMITS,
 };
 use crate::chain::cbf::birthday::resolve_birthday;
+use crate::chain::cbf::bundle_source::{BundleFilterSource, BundleTuning};
 use crate::chain::cbf::fee::{new_block_fee_cache, BlockFeeCache};
 use crate::chain::cbf::fee_sampler::{
-	BlockFetch, FeeBlockSource, FeeSampler, SampleFailure, CBF_FEE_SAMPLE_INTERVAL,
+	BlockFetch, FeeBlockSource, FeeSampleDemand, FeeSampler, SampleFailure, CBF_FEE_SAMPLE_INTERVAL,
 };
 use crate::chain::cbf::source::FilterSource;
 use crate::chain::cbf::source_sync::{
@@ -63,7 +64,8 @@ use crate::chain::cbf::{
 	ResumeRefusal, WatchLedger, CBF_BLOCK_FETCH_TIMEOUT_SECS, CBF_HEADER_LOOKUP_TIMEOUT_SECS,
 };
 use crate::chain::engine::SyncEngine;
-use crate::chain::seam::{ActionResult, MempoolQuery, MempoolScope};
+use crate::chain::provider::BundleTransport;
+use crate::chain::seam::ActionResult;
 use crate::chain::target::{SyncTarget, TargetId, TargetRegistry};
 use crate::chain::{BorrowedMempool, MempoolEvictions};
 use crate::fee_estimator::OnchainFeeEstimator;
@@ -505,9 +507,13 @@ pub(crate) struct CbfSyncEngine {
 	source_mode: CbfSource,
 	/// The node filter source, kept only when `source_mode` uses it.
 	filter_source: Option<Arc<dyn FilterSource>>,
-	/// The header chain the node-source sync verified; read by its fee source and
-	/// `is_on_chain`. Empty while kyoto runs.
+	/// The header chain the node-source sync verified; read by its fee source,
+	/// `is_on_chain` and the bundle source. Empty while kyoto runs.
 	source_headers: SharedHeaderChain,
+	/// The bundle source wrapping `filter_source`, when one is set; see [`Self::with_bundles`].
+	bundles: Option<Arc<BundleFilterSource>>,
+	/// When the last mempool question was asked; see [`Self::mempool_pass_is_fresh`].
+	last_mempool_pass: Mutex<Option<std::time::Instant>>,
 	/// Which source feeds the applicator now: [`ACTIVE_P2P`] or [`ACTIVE_NODE`]. Moves from
 	/// node to P2P once, when `node,p2p` falls back.
 	active_source: Arc<AtomicU8>,
@@ -522,6 +528,9 @@ pub(crate) struct CbfSyncEngine {
 	watch_ledger: Arc<WatchLedger>,
 	/// Coinbase-derived fee rates of the blocks the applicator downloaded.
 	block_fee_cache: BlockFeeCache,
+	/// Whether the fee sampler downloads blocks: always on a filter node with no other fee
+	/// source, only while the provider is not answering fees on a hybrid one.
+	fee_demand: Arc<FeeSampleDemand>,
 	/// The [`CBF_FULL_BLOCK_PERMITS`] bound on full blocks held in memory at once: the
 	/// applicator's matched blocks and the FEE adapter's samples share it.
 	full_block_permits: Arc<Semaphore>,
@@ -560,8 +569,8 @@ impl CbfSyncEngine {
 	pub(crate) fn new(
 		peers: Vec<String>, required_peers: u8, wallet_birthday_height: Option<u32>,
 		source_mode: CbfSource, filter_source: Option<Arc<dyn FilterSource>>,
-		external_electrum: Option<ExternalElectrum>, targets: Arc<TargetRegistry>,
-		config: Arc<Config>, logger: Arc<Logger>,
+		external_electrum: Option<ExternalElectrum>, fee_demand: FeeSampleDemand,
+		targets: Arc<TargetRegistry>, config: Arc<Config>, logger: Arc<Logger>,
 	) -> Result<Self, Error> {
 		let filter_source = match (source_mode.uses_node_source(), filter_source) {
 			(true, Some(source)) => Some(source),
@@ -611,6 +620,8 @@ impl CbfSyncEngine {
 			source_mode,
 			filter_source,
 			source_headers: new_shared_header_chain(),
+			bundles: None,
+			last_mempool_pass: Mutex::new(None),
 			active_source: Arc::new(AtomicU8::new(if source_mode.uses_node_source() {
 				ACTIVE_NODE
 			} else {
@@ -624,6 +635,7 @@ impl CbfSyncEngine {
 			registered_scripts: Arc::new(Mutex::new(HashSet::new())),
 			watch_ledger: Arc::new(WatchLedger::new()),
 			block_fee_cache: new_block_fee_cache(),
+			fee_demand: Arc::new(fee_demand),
 			full_block_permits: Arc::new(Semaphore::new(CBF_FULL_BLOCK_PERMITS)),
 			runtime_status: Arc::new(Mutex::new(CbfRuntimeStatus::Stopped)),
 			launch_generation: AtomicU64::new(0),
@@ -638,6 +650,42 @@ impl CbfSyncEngine {
 			config,
 			logger,
 		})
+	}
+
+	/// Reads the node source through per-block bundles over `transport`: one `since` per new
+	/// block answers its header, filter header and filter; see
+	/// [`crate::chain::cbf::bundle_source`]. Without a node source — kyoto over P2P — there is
+	/// nothing to bundle, and the transport is ignored.
+	pub(crate) fn with_bundles(mut self, transport: Arc<dyn BundleTransport>) -> Self {
+		let Some(inner) = self.filter_source.take() else {
+			log_info!(
+				self.logger,
+				"A chain bundle transport ('{}') is set, but the CBF source is P2P; ignoring it.",
+				transport.name()
+			);
+			return self;
+		};
+		log_info!(
+			self.logger,
+			"CBF node source '{}' pulls per-block bundles through '{}' when its tip moves.",
+			inner.name(),
+			transport.name()
+		);
+		let bundles = Arc::new(BundleFilterSource::new(
+			inner,
+			transport,
+			Arc::clone(&self.source_headers),
+			BundleTuning::default(),
+			Arc::clone(&self.logger),
+		));
+		self.filter_source = Some(Arc::clone(&bundles) as Arc<dyn FilterSource>);
+		self.bundles = Some(bundles);
+		self
+	}
+
+	/// The bundle source, when one is set.
+	pub(crate) fn bundles(&self) -> Option<&Arc<BundleFilterSource>> {
+		self.bundles.as_ref()
 	}
 
 	/// The gated listener of one target; see [`ChainListener::new_gated`].
@@ -957,44 +1005,49 @@ impl CbfSyncEngine {
 		}
 	}
 
-	/// Borrow a mempool view from the layer's MEMPOOL chain for everything this node watches —
-	/// the wallet's scripts and LDK's — and apply it to the on-chain wallet.
-	///
-	/// The layer refuses an answer anchored to a tip this engine does not consider best, keeps
-	/// fresh own broadcasts from being evicted on a borrowed word, and stamps the answer on
-	/// this node's clock ([`ChainLayer::borrow_mempool`]). Evictions are applied only as
-	/// `evictions` says; see [`Self::mempool_borrow_due`].
-	///
-	/// One borrow per target: each wallet's view is its own scripts and its own known
-	/// unconfirmed transactions, and the answer is applied to that wallet alone.
-	// TODO(multi-wallet P2): one question for every target's scripts, split on apply.
+	/// Borrow one mempool view from the layer's MEMPOOL chain for every wallet at once — their
+	/// scripts and known unconfirmed transactions, and LDK's scripts — and apply each wallet's
+	/// share; see [`ChainLayer::borrow_mempool`]. Asks nothing unless
+	/// [`ChainLayer::mempool_wanted`]. `None` when nothing was asked.
 	async fn borrow_mempool(
-		&self, layer: &ChainLayer, target: &SyncTarget, evictions: MempoolEvictions,
-	) -> ActionResult<BorrowedMempool> {
-		let mut scripts = target.onchain_wallet.list_watched_scripts();
-		scripts.extend(
-			self.registered_scripts.lock().unwrap_or_else(|e| e.into_inner()).iter().cloned(),
-		);
-		let query = MempoolQuery {
-			scripts,
-			known_unconfirmed: target.onchain_wallet.get_unconfirmed_txids(),
-			scope: MempoolScope::Incremental { best_processed_height: self.applied_tip_height() },
-		};
+		&self, layer: &ChainLayer, evictions: MempoolEvictions,
+	) -> Option<ActionResult<BorrowedMempool>> {
+		if !layer.mempool_wanted(MEMPOOL_RECEIVE_WINDOW) {
+			return None;
+		}
+		let targets = layer.targets().snapshot();
+		let registered =
+			self.registered_scripts.lock().unwrap_or_else(|e| e.into_inner()).clone();
 		let started = std::time::Instant::now();
-		let borrowed = layer.borrow_mempool(target, &query, evictions).await?;
-		log_trace!(
-			self.logger,
-			"Borrowed a mempool view of {} unconfirmed and {} evicted transactions via {} in {}ms",
-			borrowed.unconfirmed,
-			borrowed.evicted,
-			borrowed.by,
-			started.elapsed().as_millis()
-		);
-		Ok(borrowed)
+		let borrowed = layer
+			.borrow_mempool(&targets, &registered, self.applied_tip_height(), evictions)
+			.await;
+		*self.last_mempool_pass.lock().unwrap_or_else(|e| e.into_inner()) =
+			Some(std::time::Instant::now());
+		if let Ok(borrowed) = &borrowed {
+			log_trace!(
+				self.logger,
+				"Borrowed a mempool view of {} unconfirmed and {} evicted transactions via {} in {}ms",
+				borrowed.unconfirmed,
+				borrowed.evicted,
+				borrowed.by,
+				started.elapsed().as_millis()
+			);
+		}
+		Some(borrowed)
 	}
 
-	/// Whether the background loop borrows a mempool view on this tick, and with which
-	/// evictions: `None` when there is no chain to borrow from.
+	/// Whether a foreground pass finds the background's view, or the pass of the wallet before
+	/// it, still fresh: a caller syncing every wallet in turn asks once.
+	fn mempool_pass_is_fresh(&self) -> bool {
+		self.last_mempool_pass
+			.lock()
+			.unwrap_or_else(|e| e.into_inner())
+			.map_or(false, |at| at.elapsed() < MEMPOOL_PASS_FRESH)
+	}
+
+	/// With which evictions the background loop borrows a mempool view on this tick: `None`
+	/// when there is no chain to borrow from.
 	///
 	/// A node catching up — kyoto still syncing, or waiting for peers after a cold boot whose
 	/// network came up late — borrows too. Gating the borrow on being synced stopped it for
@@ -1214,9 +1267,11 @@ impl WatchedScripts for EngineScripts {
 }
 
 /// Keeps the block-fee cache warm until `stop` fires; see [`FeeSampler`]. A pass is raced
-/// against the stop, so shutting down never waits out a block download.
+/// against the stop, so shutting down never waits out a block download. A tick the
+/// [`FeeSampleDemand`] does not want is skipped: no lookup, no download.
 async fn run_fee_sampler(
-	mut sampler: FeeSampler<CbfFeeSource>, mut stop: tokio::sync::watch::Receiver<()>,
+	mut sampler: FeeSampler<CbfFeeSource>, demand: Arc<FeeSampleDemand>,
+	mut stop: tokio::sync::watch::Receiver<()>,
 ) {
 	let mut tick = tokio::time::interval(CBF_FEE_SAMPLE_INTERVAL);
 	tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1225,12 +1280,24 @@ async fn run_fee_sampler(
 			_ = stop.changed() => return,
 			_ = tick.tick() => {},
 		}
+		if !demand.wanted() {
+			continue;
+		}
 		tokio::select! {
 			_ = stop.changed() => return,
 			_ = sampler.pass_logged() => {},
 		}
 	}
 }
+
+/// How long after a receive address is handed out the mempool is asked about it, so a payment
+/// to it shows before it confirms. After that an incoming payment shows at its first
+/// confirmation, which the filters see at no extra cost.
+pub(crate) const MEMPOOL_RECEIVE_WINDOW: Duration = Duration::from_secs(2 * 60 * 60);
+
+/// How long a mempool pass stands for the foreground passes after it, so a caller syncing each
+/// wallet in turn asks once.
+const MEMPOOL_PASS_FRESH: Duration = Duration::from_secs(5);
 
 /// The interval on which the background loop borrows a mempool view: the on-chain wallet sync
 /// interval every other engine polls its chain source on. [`crate::config::CbfConfig`] carries
@@ -1257,6 +1324,18 @@ impl CbfSyncEngine {
 	/// Coinbase-derived fee rates of the blocks the applicator downloaded, by height.
 	pub(crate) fn block_fee_cache(&self) -> &BlockFeeCache {
 		&self.block_fee_cache
+	}
+
+	/// The FEE slot fell through to the coinbase-derived rates: wake the sampler if it was
+	/// idling behind the provider.
+	pub(crate) fn derived_fee_asked(&self) {
+		if self.fee_demand.derived_asked() {
+			log_info!(
+				self.logger,
+				"CBF fee sampler woken: the provider did not answer fees, so the node samples \
+				 recent blocks for its own rates until it does."
+			);
+		}
 	}
 
 	/// The chain as the fee sampler and the FEE adapter read it — kyoto's header chain or the
@@ -1465,13 +1544,14 @@ impl SyncEngine for CbfSyncEngine {
 	/// The mempool is supplementary: a filter-driven engine has none of its own, and a
 	/// provider that cannot answer this pass does not make the pass fail — the chain is
 	/// synced regardless. The background loop borrows on its own cadence too; this pass asks
-	/// again so a caller of `sync_wallets` sees the mempool as of now.
+	/// again, when the mempool is wanted at all, so a caller of `sync_wallets` sees it as of
+	/// now.
 	async fn sync_once(&self, layer: &ChainLayer, target: &Arc<SyncTarget>) -> Result<(), Error> {
 		self.wait_until_synced_within(CBF_SYNC_WAIT_TIMEOUT).await?;
 
-		if layer.has_mempool_chain() {
+		if layer.has_mempool_chain() && !self.mempool_pass_is_fresh() {
 			// Just waited for the sync, but a block may have landed since: ask again.
-			if let Err(e) = self.borrow_mempool(layer, target, self.mempool_evictions()).await {
+			if let Some(Err(e)) = self.borrow_mempool(layer, self.mempool_evictions()).await {
 				log_error!(
 					self.logger,
 					"Could not borrow a mempool view this pass; the filter sync is complete \
@@ -1521,13 +1601,25 @@ impl SyncEngine for CbfSyncEngine {
 		self.launch_over(runtime.handle(), deps, layer.targets());
 
 		// Samples the fee window's blocks in its own task: a block download takes seconds
-		// to minutes on one mainnet peer, and must hold up neither tick below.
+		// to minutes on one mainnet peer, and must hold up neither tick below. Behind a
+		// provider that answers fees it idles; see `FeeSampleDemand`.
 		let sampler = FeeSampler::new(
 			self.fee_source(),
 			Arc::clone(&self.block_fee_cache),
 			Arc::clone(&self.logger),
 		);
-		runtime.spawn(run_fee_sampler(sampler, stop_sync_receiver.clone()));
+		if self.fee_demand.is_on_demand() {
+			log_info!(
+				self.logger,
+				"CBF fee sampler idle: fees come from the provider; recent blocks are sampled \
+				 only while it does not answer."
+			);
+		}
+		runtime.spawn(run_fee_sampler(
+			sampler,
+			Arc::clone(&self.fee_demand),
+			stop_sync_receiver.clone(),
+		));
 
 		let mut fee_rate_update_interval =
 			tokio::time::interval(Duration::from_secs(DEFAULT_FEE_RATE_CACHE_UPDATE_INTERVAL_SECS));
@@ -1558,6 +1650,7 @@ impl SyncEngine for CbfSyncEngine {
 				_ = fee_rate_update_interval.tick(), if fee_refresh.is_none() => {
 					let layer = Arc::clone(&layer);
 					let logger = Arc::clone(&self.logger);
+					self.fee_demand.refresh_started();
 					fee_refresh = Some(runtime.spawn(async move {
 						let refreshed = layer.update_fee_rate_estimates().await;
 						if let Err(e) = &refreshed {
@@ -1574,6 +1667,9 @@ impl SyncEngine for CbfSyncEngine {
 					fee_refresh = None;
 					// A refresh that panicked or was cancelled did not fill the cache.
 					let ok = finished.unwrap_or(false);
+					if self.fee_demand.refresh_finished(ok) {
+						log_info!(self.logger, "CBF fee sampler idle: the provider answers fees again.");
+					}
 					if let Some(retry) = fee_cadence.after(ok) {
 						fee_rate_update_interval.reset_after(retry);
 					}
@@ -1585,22 +1681,20 @@ impl SyncEngine for CbfSyncEngine {
 					let Some(evictions) = self.mempool_borrow_due(&layer) else {
 						continue;
 					};
-					for target in layer.targets().snapshot() {
-						// A borrow runs up to its chain's budget; a stop must not wait it out.
-						tokio::select! {
-							_ = stop_sync_receiver.changed() => {
-								log_trace!(self.logger, "Stopping CBF background loop mid-borrow.");
-								return;
-							}
-							borrowed = self.borrow_mempool(&layer, &target, evictions) => {
-								// Every tick asks again, so one that cannot answer is not news.
-								if let Err(e) = borrowed {
-									log_debug!(
-										self.logger,
-										"CBF background mempool borrow failed this tick: {}",
-										e
-									);
-								}
+					// A borrow runs up to its chain's budget; a stop must not wait it out.
+					tokio::select! {
+						_ = stop_sync_receiver.changed() => {
+							log_trace!(self.logger, "Stopping CBF background loop mid-borrow.");
+							return;
+						}
+						borrowed = self.borrow_mempool(&layer, evictions) => {
+							// Every tick asks again, so one that cannot answer is not news.
+							if let Some(Err(e)) = borrowed {
+								log_debug!(
+									self.logger,
+									"CBF background mempool borrow failed this tick: {}",
+									e
+								);
 							}
 						}
 					}
@@ -2851,6 +2945,7 @@ mod tests {
 			source_mode,
 			filter_source,
 			None,
+			FeeSampleDemand::always(),
 			Arc::new(TargetRegistry::new()),
 			config,
 			logger,

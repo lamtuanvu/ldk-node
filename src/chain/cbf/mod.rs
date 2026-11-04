@@ -17,6 +17,7 @@
 
 pub(crate) mod applicator;
 pub(crate) mod birthday;
+pub(crate) mod bundle_source;
 pub(crate) mod fee;
 pub(crate) mod fee_sampler;
 pub(crate) mod header_verify;

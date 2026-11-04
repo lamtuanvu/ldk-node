@@ -235,8 +235,9 @@ pub struct CbfConfig {
 	/// usable checkpoint resumes from this birthday, and refuses to sync at all when none is
 	/// configured. Set it for every wallet handed over from another chain source.
 	pub wallet_birthday_height: Option<u32>,
-	/// An external, mempool-aware server asked for fee estimates ahead of the node's own
-	/// coinbase-derived ones. Without it the FEE slot has only the blocks the node downloads.
+	/// An external, mempool-aware server asked for fee estimates first, ahead of the provider
+	/// (when one is set) and the node's own coinbase-derived rates. Without either, the FEE
+	/// slot has only the blocks the node downloads.
 	pub external_fee: Option<CbfExternalFee>,
 	/// Whether to verify BOLT-7 channel announcements against the filters: existence-only,
 	/// since a block filter can say an output was created and not yet spent, but not what it

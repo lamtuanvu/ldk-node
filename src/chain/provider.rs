@@ -58,6 +58,11 @@ use async_trait::async_trait;
 /// nodes running different versions must fail loudly, not silently disagree.
 pub const CHAIN_WIRE_VERSION: u16 = 1;
 
+/// How old a fee estimate may be and still pass for current, in seconds: a Pro stops serving its
+/// cache past this, and a node stops using what a bundle carried. Three of the 10-minute
+/// refreshes, so one or two failed ones do not lose the answer.
+pub(crate) const FEE_ESTIMATES_MAX_AGE_SECS: u64 = 30 * 60;
+
 /// Why a [`ChainDataProvider`] call did not produce an answer.
 ///
 /// The distinction between these is load-bearing, not cosmetic: a Dependent
@@ -636,6 +641,92 @@ pub struct WireBlockChunk {
 	pub bytes_hex: String,
 }
 
+// ── PER-BLOCK BUNDLES ────────────────────────────────────────────────────────
+//
+// A hybrid node that follows a Pro node's raw data asks one question per new
+// block instead of three: `WireSinceRequest` answers with a `WireBlockUpdate`
+// per block. Each is the raw data the node would otherwise ask for — header,
+// filter header and filter — so the node verifies it exactly as it verifies the
+// raw routes. The node owns its cursor; the Pro keeps nothing per node. The
+// consuming side is `BundleTransport`.
+
+/// Most updates one [`WireSinceRequest`] may ask for: a day of blocks.
+pub const MAX_UPDATES_PER_SINCE: u32 = 144;
+
+/// "Give me the updates of every block above `from`."
+///
+/// No `deny_unknown_fields`: the host adds its own fields (the caller's node
+/// id) to the payload it hands the serving app.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireSinceRequest {
+	/// Wire contract version; see [`CHAIN_WIRE_VERSION`].
+	pub version: u16,
+	/// The block to continue from. Refused when it is not on the serving
+	/// node's best chain; the asker then follows the raw routes, whose reorg
+	/// handling decides.
+	pub from: WireBlockId,
+	/// Most updates wanted; the serving node caps it at
+	/// [`MAX_UPDATES_PER_SINCE`].
+	pub max_blocks: u32,
+	/// When above zero, the asker holds this many bytes of the filter of the
+	/// block right above `from`, from a reply that carried only a piece of it
+	/// ([`WireBlockUpdate::filter_total`]): the reply is that block alone, with
+	/// the next piece of its filter.
+	#[serde(default, skip_serializing_if = "is_zero")]
+	pub filter_offset: u32,
+}
+
+fn is_zero(value: &u32) -> bool {
+	*value == 0
+}
+
+/// One block's raw BIP157/158 data, as a `since` reply carries it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireBlockUpdate {
+	/// Wire contract version; see [`CHAIN_WIRE_VERSION`].
+	pub version: u16,
+	/// Height of the block.
+	pub height: u32,
+	/// Hash of the block, hex, RPC byte order.
+	pub block_hash: String,
+	/// The consensus-encoded header, hex.
+	pub header_hex: String,
+	/// The filter header of the block below, hex, RPC byte order.
+	pub previous_filter_header: String,
+	/// This block's filter header, hex, RPC byte order.
+	pub filter_header: String,
+	/// The BIP158 basic filter, hex: the whole of it, unless `filter_total`
+	/// says this is a piece.
+	pub filter_hex: String,
+	/// Set when the filter did not fit one reply: `filter_hex` is the piece
+	/// starting at `filter_offset`, and this is the whole filter's length in
+	/// bytes. The asker continues with [`WireSinceRequest::filter_offset`].
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub filter_total: Option<u32>,
+	/// Where in the filter `filter_hex` starts, in bytes, when it is a piece.
+	#[serde(default, skip_serializing_if = "is_zero")]
+	pub filter_offset: u32,
+	/// The serving node's own current fee estimates, when it has them. A
+	/// `since` reply carries them on its newest update only.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub fee_estimates: Option<WireFeeEstimates>,
+}
+
+/// A run of block updates: a `since` reply.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireBlockUpdates {
+	/// Wire contract version; see [`CHAIN_WIRE_VERSION`].
+	pub version: u16,
+	/// The serving node's best block.
+	pub tip: WireBlockId,
+	/// Consecutive updates, ascending by height. Empty when the asker is at
+	/// or above the serving node's tip.
+	pub updates: Vec<WireBlockUpdate>,
+	/// `true` when the serving node stopped before its tip — at the reply
+	/// size, or at the count asked; the asker continues from the last update.
+	pub more: bool,
+}
+
 // ── THE PORT ─────────────────────────────────────────────────────────────────
 
 /// A remote source of chain data.
@@ -690,4 +781,23 @@ pub trait ChainDataProvider: Send + Sync {
 	) -> Result<WireMempoolResponse, ChainProviderError> {
 		Err(ChainProviderError::Refused("unsupported".into()))
 	}
+}
+
+/// How a hybrid node asks the Pro node it follows for per-block bundles.
+/// Implemented by the embedding app over its peer transport, as
+/// [`ChainDataProvider`] is.
+///
+/// A serving node that does not know the route — an older Pro — must come back
+/// as [`ChainProviderError::Refused`] with a reason starting `unsupported`: the
+/// node then asks the raw routes, and tries this one again only after a long
+/// backoff (half an hour), since the same answer may mean a Pro whose app is
+/// restarting. A `from` off the serving node's best chain comes back refused
+/// with a reason containing `not on best chain`.
+#[async_trait]
+pub trait BundleTransport: Send + Sync {
+	/// Identifies the transport in logs.
+	fn name(&self) -> String;
+
+	/// The updates of the blocks above `req.from`.
+	async fn since(&self, req: WireSinceRequest) -> Result<WireBlockUpdates, ChainProviderError>;
 }

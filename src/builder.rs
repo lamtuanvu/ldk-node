@@ -592,13 +592,15 @@ impl NodeBuilder {
 	///
 	/// The node downloads headers and filters from its peers, fetches only
 	/// the blocks whose filters match its own scripts, and broadcasts over
-	/// P2P; fee rates are derived from the coinbase outputs of the blocks it
-	/// downloads unless [`CbfConfig::external_fee`] names a server. What
-	/// filters cannot show — a mempool, the status of a transaction it did
-	/// not watch before it confirmed, a mempool-aware fee market — is
-	/// borrowed from the provider set through
+	/// P2P. What filters cannot show — a mempool, the status of a
+	/// transaction it did not watch before it confirmed, a mempool-aware fee
+	/// market — is borrowed from the provider set through
 	/// [`NodeBuilder::set_chain_provider_fallback`], when one is; without
-	/// one the node runs on the filters and its peers alone.
+	/// one the node runs on the filters and its peers alone. Fee rates come
+	/// from [`CbfConfig::external_fee`] when it names a server, then from the
+	/// provider, and only then from the coinbase outputs of recent blocks,
+	/// which the node downloads for that purpose only while nothing ahead of
+	/// them answers.
 	///
 	/// `peers` are trusted peers as `host:port`; an empty list leaves
 	/// discovery to the DNS seeds. A peer that does not parse fails the

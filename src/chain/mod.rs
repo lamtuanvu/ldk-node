@@ -518,9 +518,41 @@ pub(crate) mod test_wallet {
 		kv_store: &Arc<DynStore>, broadcaster: &Arc<Broadcaster>,
 		fee_estimator: &Arc<OnchainFeeEstimator>, logger: &Arc<Logger>,
 	) -> Arc<Wallet> {
+		wallet_over(
+			EXTERNAL_DESCRIPTOR.to_string(),
+			INTERNAL_DESCRIPTOR.to_string(),
+			kv_store,
+			broadcaster,
+			fee_estimator,
+			logger,
+		)
+	}
+
+	/// A wallet with keys of its own, for a test that holds more than one.
+	#[cfg(feature = "cbf")]
+	pub(crate) fn fresh_regtest_wallet_with_seed(
+		seed: [u8; 32], kv_store: &Arc<DynStore>, broadcaster: &Arc<Broadcaster>,
+		fee_estimator: &Arc<OnchainFeeEstimator>, logger: &Arc<Logger>,
+	) -> Arc<Wallet> {
+		let master = bitcoin::bip32::Xpriv::new_master(Network::Regtest, &seed).expect("a seed");
+		wallet_over(
+			format!("wpkh({}/84h/1h/0h/0/*)", master),
+			format!("wpkh({}/84h/1h/0h/1/*)", master),
+			kv_store,
+			broadcaster,
+			fee_estimator,
+			logger,
+		)
+	}
+
+	fn wallet_over(
+		external: String, internal: String, kv_store: &Arc<DynStore>,
+		broadcaster: &Arc<Broadcaster>, fee_estimator: &Arc<OnchainFeeEstimator>,
+		logger: &Arc<Logger>,
+	) -> Arc<Wallet> {
 		let config = Arc::new(Config { network: Network::Regtest, ..Config::default() });
 		let mut persister = KVStoreWalletPersister::new(Arc::clone(kv_store), Arc::clone(logger));
-		let bdk_wallet = BdkWallet::create(EXTERNAL_DESCRIPTOR, INTERNAL_DESCRIPTOR)
+		let bdk_wallet = BdkWallet::create(external, internal)
 			.network(Network::Regtest)
 			.create_wallet(&mut persister)
 			.expect("valid test descriptors");
