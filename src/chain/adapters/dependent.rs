@@ -31,7 +31,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use bitcoin::{FeeRate, Transaction};
 
 use crate::chain::provider::{
-	ChainDataProvider, WireBroadcastRequest, WireSyncRequest, CHAIN_WIRE_VERSION,
+	ChainDataProvider, WireBroadcastRequest, WireFeeEstimates, WireSyncRequest, CHAIN_WIRE_VERSION,
 };
 use crate::chain::seam::{
 	ActionResult, Anchored, BroadcastAction, BroadcastRejection, ChainActionError, FeeAction,
@@ -41,8 +41,13 @@ use crate::chain::seam::{
 use crate::chain::wire_convert::{
 	check_version, mempool_query_to_wire, tx_to_wire, wire_to_mempool_answer, wire_update_to_bdk,
 };
-use crate::fee_estimator::{apply_post_estimation_adjustments, conf_target_from_wire_name};
+use crate::fee_estimator::{
+	apply_post_estimation_adjustments, conf_target_from_wire_name, ConfirmationTarget,
+};
 use crate::logger::{log_error, log_trace, LdkLogger, Logger};
+use lightning::chain::chaininterface::{
+	ConfirmationTarget as LdkConfirmationTarget, FEERATE_FLOOR_SATS_PER_KW,
+};
 
 #[cfg(feature = "swaps")]
 use crate::chain::provider::WireTxStatusRequest;
@@ -121,44 +126,95 @@ impl DependentChainAdapter {
 			ChainActionError::from(e)
 		})?;
 
-		check_version(estimates.version).map_err(|e| {
-			log_error!(self.logger, "Rejecting fee rate estimates from provider: {}", e);
-			ChainActionError::unavailable(e.to_string())
-		})?;
-
-		let mut new_fee_rate_cache = HashMap::with_capacity(estimates.targets.len());
-		for entry in &estimates.targets {
-			let Some(target) = conf_target_from_wire_name(&entry.target) else {
-				// A target this build does not know. Skipping it is right —
-				// guessing which local target it meant would silently apply
-				// the wrong rate — but it must be visible.
-				log_trace!(
-					self.logger,
-					"Ignoring unknown confirmation target '{}' from chain provider",
-					entry.target
-				);
-				continue;
-			};
-
-			// The serving node has already applied its own per-target policy;
-			// the post-estimation adjustments are this node's own floors and
-			// caps, so they still belong here.
-			let fee_rate = FeeRate::from_sat_per_kwu(entry.sat_per_kwu);
-			new_fee_rate_cache.insert(target, apply_post_estimation_adjustments(target, fee_rate));
-		}
-
-		// An empty cache would leave every target at its hardcoded fallback
-		// while looking like a successful update, so refuse it outright.
-		if new_fee_rate_cache.is_empty() {
-			log_error!(
-				self.logger,
-				"Chain provider returned no usable fee rate estimates; keeping the previous cache"
-			);
-			return Err(ChainActionError::unavailable("no usable fee rate estimates"));
-		}
-
-		Ok(FeeUpdate::Apply { cache: new_fee_rate_cache, log_unchanged: false })
+		fee_update_from_wire(&estimates, &self.logger)
 	}
+}
+
+/// The most a provider's word can set any fee rate to: 1,000 sat/vB, above every sustained rate
+/// so far and low enough that one lying number cannot burn a wallet. An honest Pro in a spike
+/// above this has its whole answer refused, and the chain falls through to the next adapter.
+pub(crate) const MAX_PROVIDER_FEE_SAT_PER_KWU: u64 = 250_000;
+
+/// The least a provider's word can say: LDK's relay floor, 1 sat/vB rounded up. A Pro serves
+/// through [`OnchainFeeEstimator`], which floors every read here, so an honest one never sends
+/// less, and anything lower (a 0 meant to sink a sweep) is a lie or a bug.
+///
+/// [`OnchainFeeEstimator`]: crate::fee_estimator::OnchainFeeEstimator
+pub(crate) const MIN_PROVIDER_FEE_SAT_PER_KWU: u64 = FEERATE_FLOOR_SATS_PER_KW as u64;
+
+/// What a provider's rate, in bounds, sets `target` to. The two targets a peer's `update_fee` is
+/// held to are not the provider's to raise: below them LDK force-closes the channel, so one number
+/// from a lying provider would close every channel this node has. Whatever it says, they stay at
+/// the floor, which is also what a node with no estimate at all uses, so a peer's commitment fee
+/// is taken down to the relay floor. Anchors are what pays for a commitment that is too low then.
+fn provider_rate_for(target: ConfirmationTarget, bounded_sat_per_kwu: u64) -> u64 {
+	match target {
+		ConfirmationTarget::Lightning(
+			LdkConfirmationTarget::MinAllowedAnchorChannelRemoteFee
+			| LdkConfirmationTarget::MinAllowedNonAnchorChannelRemoteFee,
+		) => FEERATE_FLOOR_SATS_PER_KW as u64,
+		_ => bounded_sat_per_kwu,
+	}
+}
+
+/// A provider's fee estimates as a fee-cache update: checked, and re-floored
+/// locally. Shared by every adapter that takes another node's estimates — asked
+/// for, or carried by a block bundle. One known target out of bounds refuses the whole answer, so
+/// nothing of it is applied and the fee chain falls through to its next adapter.
+pub(crate) fn fee_update_from_wire(
+	estimates: &WireFeeEstimates, logger: &Logger,
+) -> ActionResult<FeeUpdate> {
+	check_version(estimates.version).map_err(|e| {
+		log_error!(logger, "Rejecting fee rate estimates from provider: {}", e);
+		ChainActionError::unavailable(e.to_string())
+	})?;
+
+	let mut new_fee_rate_cache = HashMap::with_capacity(estimates.targets.len());
+	for entry in &estimates.targets {
+		let Some(target) = conf_target_from_wire_name(&entry.target) else {
+			// A target this build does not know. Skipping it is right —
+			// guessing which local target it meant would silently apply
+			// the wrong rate — but it must be visible.
+			log_trace!(
+				logger,
+				"Ignoring unknown confirmation target '{}' from chain provider",
+				entry.target
+			);
+			continue;
+		};
+
+		if !(MIN_PROVIDER_FEE_SAT_PER_KWU..=MAX_PROVIDER_FEE_SAT_PER_KWU)
+			.contains(&entry.sat_per_kwu)
+		{
+			log_error!(
+				logger,
+				"Rejecting fee rate estimates from provider: {} is {} sat/kwu, outside {}..={}",
+				entry.target,
+				entry.sat_per_kwu,
+				MIN_PROVIDER_FEE_SAT_PER_KWU,
+				MAX_PROVIDER_FEE_SAT_PER_KWU
+			);
+			return Err(ChainActionError::unavailable("provider fee rate out of bounds"));
+		}
+
+		// The serving node has already applied its own per-target policy;
+		// the post-estimation adjustments are this node's own floors and
+		// caps, so they still belong here.
+		let fee_rate = FeeRate::from_sat_per_kwu(provider_rate_for(target, entry.sat_per_kwu));
+		new_fee_rate_cache.insert(target, apply_post_estimation_adjustments(target, fee_rate));
+	}
+
+	// An empty cache would leave every target at its hardcoded fallback
+	// while looking like a successful update, so refuse it outright.
+	if new_fee_rate_cache.is_empty() {
+		log_error!(
+			logger,
+			"Chain provider returned no usable fee rate estimates; keeping the previous cache"
+		);
+		return Err(ChainActionError::unavailable("no usable fee rate estimates"));
+	}
+
+	Ok(FeeUpdate::Apply { cache: new_fee_rate_cache, log_unchanged: false })
 }
 
 #[async_trait]
@@ -441,11 +497,82 @@ mod tests {
 	use super::*;
 
 	use crate::chain::provider::{
-		ChainProviderError, WireFeeEstimates, WireLightningSyncRequest, WireLightningSyncResponse,
-		WireTxStatusRequest, WireTxStatusResponse, WireUpdate,
+		ChainProviderError, WireFeeEstimates, WireFeeTarget, WireLightningSyncRequest,
+		WireLightningSyncResponse, WireTxStatusRequest, WireTxStatusResponse, WireUpdate,
 	};
 	use crate::chain::seam::MempoolScope;
 	use crate::logger::Logger;
+
+	fn wire_fees(entries: &[(&str, u64)]) -> WireFeeEstimates {
+		WireFeeEstimates {
+			version: CHAIN_WIRE_VERSION,
+			targets: entries
+				.iter()
+				.map(|(target, sat_per_kwu)| WireFeeTarget {
+					target: (*target).to_string(),
+					sat_per_kwu: *sat_per_kwu,
+				})
+				.collect(),
+		}
+	}
+
+	fn fee_update(entries: &[(&str, u64)]) -> ActionResult<FeeUpdate> {
+		fee_update_from_wire(&wire_fees(entries), &Logger::new_log_facade())
+	}
+
+	fn applied(entries: &[(&str, u64)]) -> HashMap<ConfirmationTarget, FeeRate> {
+		match fee_update(entries) {
+			Ok(FeeUpdate::Apply { cache, .. }) => cache,
+			other => panic!("expected an update, got {:?}", other.map(|_| ())),
+		}
+	}
+
+	#[test]
+	fn the_provider_fee_bounds_are_the_relay_floor_and_1000_sat_per_vb() {
+		assert_eq!(MIN_PROVIDER_FEE_SAT_PER_KWU, 253);
+		assert_eq!(MAX_PROVIDER_FEE_SAT_PER_KWU, 1_000 * 250);
+	}
+
+	/// One number out of bounds says the whole answer cannot be trusted: nothing of it is
+	/// applied, and the refusal is one the fee chain falls through.
+	#[test]
+	fn a_provider_fee_out_of_bounds_rejects_the_whole_update() {
+		for bad in [0, 1, 252, 250_001, 10_000_000, u64::MAX] {
+			let update =
+				fee_update(&[("onchain_payment", 1_000), ("ldk.urgent_onchain_sweep", bad)]);
+			assert!(
+				matches!(update, Err(ChainActionError::Unavailable { .. })),
+				"{bad} must be refused and fall through"
+			);
+		}
+	}
+
+	#[test]
+	fn a_provider_fee_at_the_bounds_is_taken_as_it_is() {
+		let cache = applied(&[("onchain_payment", 253), ("channel_funding", 250_000)]);
+		assert_eq!(cache[&ConfirmationTarget::OnchainPayment].to_sat_per_kwu(), 253);
+		assert_eq!(cache[&ConfirmationTarget::ChannelFunding].to_sat_per_kwu(), 250_000);
+	}
+
+	/// A peer's `update_fee` below these is a force close (`check_remote_fee`), so a provider's
+	/// word never raises them, not even inside the bounds.
+	#[test]
+	fn a_provider_can_never_raise_the_fee_this_node_demands_of_its_peers() {
+		let cache = applied(&[
+			("ldk.min_allowed_anchor_channel_remote_fee", 250_000),
+			("ldk.min_allowed_non_anchor_channel_remote_fee", 250_000),
+		]);
+		assert_eq!(cache.len(), 2);
+		assert!(cache.values().all(|rate| rate.to_sat_per_kwu() == 253), "{cache:?}");
+	}
+
+	/// A target this build does not know is skipped before it is judged: a newer Pro's new
+	/// target must not cost this node the rest of the answer.
+	#[test]
+	fn an_unknown_target_out_of_bounds_costs_nothing() {
+		let cache = applied(&[("onchain_payment", 1_000), ("from_the_future", u64::MAX)]);
+		assert_eq!(cache.len(), 1);
+	}
 
 	/// A provider built against the port as it shipped: it implements the
 	/// five original calls and inherits `mempool`'s refusing default.

@@ -52,10 +52,10 @@ use bdk_wallet::{KeychainKind, Update};
 
 use crate::chain::cbf::source::{FilterHeaders, IndexedFilter};
 use crate::chain::provider::{
-	ChainProviderError, WireAnchor, WireBlockChunk, WireBlockId, WireChainTip, WireFilterHeaders,
-	WireFilters, WireHeaders, WireIndexedFilter, WireMempoolRequest, WireMempoolResponse,
-	WireOutPoint, WireSeenAt, WireSyncRequest, WireTxOut, WireUnconfirmedTx, WireUpdate,
-	BLOCK_CHUNK_BYTES, CHAIN_WIRE_VERSION,
+	ChainProviderError, WireAnchor, WireBlockChunk, WireBlockId, WireBlockUpdate, WireChainTip,
+	WireFeeEstimates, WireFilterHeaders, WireFilters, WireHeaders, WireIndexedFilter,
+	WireMempoolRequest, WireMempoolResponse, WireOutPoint, WireSeenAt, WireSyncRequest, WireTxOut,
+	WireUnconfirmedTx, WireUpdate, BLOCK_CHUNK_BYTES, CHAIN_WIRE_VERSION,
 };
 use crate::chain::seam::{MempoolAnswer, MempoolQuery, MempoolScope};
 
@@ -523,6 +523,102 @@ pub fn filters_from_wire(wire: &WireFilters) -> Result<Vec<IndexedFilter>, Chain
 			})
 		})
 		.collect()
+}
+
+/// One block's raw BIP157/158 data, decoded: what a [`WireBlockUpdate`]
+/// carries. Built once per block by a serving node, held by a pulling client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BlockBundle {
+	pub(crate) height: u32,
+	/// The hash of `header`; checked on decoding.
+	pub(crate) hash: BlockHash,
+	pub(crate) header: Header,
+	/// The filter header of the block below.
+	pub(crate) previous_filter_header: FilterHeader,
+	pub(crate) filter_header: FilterHeader,
+	pub(crate) filter: BlockFilter,
+}
+
+impl BlockBundle {
+	/// Whether `filter_header` commits to `filter` on top of
+	/// `previous_filter_header` — the one check a bundle can make of itself.
+	pub(crate) fn is_self_consistent(&self) -> bool {
+		self.filter.filter_header(&self.previous_filter_header) == self.filter_header
+	}
+
+	/// Roughly what the bundle takes as JSON on the wire.
+	pub(crate) fn wire_size(&self) -> usize {
+		// Header and three hashes as hex, the filter as hex, and the keys.
+		80 * 2 + 3 * 64 + self.filter.content.len() * 2 + 256
+	}
+
+	/// Roughly what the bundle takes in memory.
+	pub(crate) fn mem_size(&self) -> usize {
+		std::mem::size_of::<Self>() + self.filter.content.len()
+	}
+}
+
+/// A bundle, projected onto the wire.
+pub(crate) fn block_update_to_wire(
+	bundle: &BlockBundle, fee_estimates: Option<WireFeeEstimates>,
+) -> WireBlockUpdate {
+	WireBlockUpdate {
+		version: CHAIN_WIRE_VERSION,
+		height: bundle.height,
+		block_hash: bundle.hash.to_string(),
+		header_hex: header_to_wire(&bundle.header),
+		previous_filter_header: bundle.previous_filter_header.to_string(),
+		filter_header: bundle.filter_header.to_string(),
+		filter_hex: bundle.filter.content.to_lower_hex_string(),
+		filter_total: None,
+		filter_offset: 0,
+		fee_estimates,
+	}
+}
+
+/// A bundle whose filter does not fit one reply, projected onto the wire with
+/// the `len` bytes of it from `offset`. Past the end, the piece is empty.
+pub(crate) fn block_update_piece_to_wire(
+	bundle: &BlockBundle, offset: usize, len: usize,
+) -> WireBlockUpdate {
+	let content = &bundle.filter.content;
+	let start = offset.min(content.len());
+	let end = start.saturating_add(len).min(content.len());
+	WireBlockUpdate {
+		filter_hex: content[start..end].to_lower_hex_string(),
+		filter_total: Some(content.len() as u32),
+		filter_offset: start as u32,
+		..block_update_to_wire(
+			&BlockBundle { filter: BlockFilter { content: Vec::new() }, ..bundle.clone() },
+			None,
+		)
+	}
+}
+
+/// A bundle, decoded from the wire. Checks shape only, and that the block
+/// hash is the header's: whether the data is true is for the verifying sync.
+#[cfg(any(feature = "cbf", test))]
+pub(crate) fn block_update_from_wire(
+	wire: &WireBlockUpdate,
+) -> Result<BlockBundle, ChainProviderError> {
+	check_version(wire.version)?;
+	let header = header_from_wire(&wire.header_hex)?;
+	let hash = block_hash_from_wire(&wire.block_hash)?;
+	if header.block_hash() != hash {
+		return Err(malformed(
+			"block update",
+			format_args!("header at height {} does not hash to {}", wire.height, hash),
+		));
+	}
+	let content = Vec::<u8>::from_hex(&wire.filter_hex).map_err(|e| malformed("filter", e))?;
+	Ok(BlockBundle {
+		height: wire.height,
+		hash,
+		header,
+		previous_filter_header: filter_header_from_wire(&wire.previous_filter_header)?,
+		filter_header: filter_header_from_wire(&wire.filter_header)?,
+		filter: BlockFilter { content },
+	})
 }
 
 /// How many [`BLOCK_CHUNK_BYTES`] chunks a block of `len` bytes takes; at

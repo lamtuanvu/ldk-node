@@ -191,6 +191,13 @@ impl HeaderChain {
 		self.hashes.iter().rposition(|h| h == hash).map(|i| self.base + i as u32)
 	}
 
+	/// Holds `header` on top, unverified: for tests that need a chain held.
+	#[cfg(test)]
+	pub(crate) fn push_for_test(&mut self, header: Header) {
+		let hash = header.block_hash();
+		self.push(header, hash);
+	}
+
 	fn push(&mut self, header: Header, hash: BlockHash) {
 		self.headers.push(header);
 		self.hashes.push(hash);
@@ -1287,8 +1294,15 @@ impl SourceSync {
 			if tip.height <= ours.height {
 				return self.reorg(tip, ours).await;
 			}
-			let room =
-				(self.filters_through + self.tuning.header_lookahead).saturating_sub(ours.height);
+			// A source whose headers come with their filters has the filters of the headers
+			// held in hand: use them before asking for more of both.
+			let room = if self.source.headers_come_with_filters()
+				&& self.filters_through < ours.height
+			{
+				0
+			} else {
+				(self.filters_through + self.tuning.header_lookahead).saturating_sub(ours.height)
+			};
 			if room > 0 {
 				let count = (tip.height - ours.height).min(room).min(MAX_HEADERS_PER_REQUEST);
 				let headers =
@@ -1318,7 +1332,14 @@ impl SourceSync {
 		}
 
 		if self.filters_through < ours.height {
-			self.filter_batch(ours.height).await?;
+			if let Err(error) = self.filter_batch(ours.height).await {
+				// With no room for headers nothing above has looked at the next one, and a batch
+				// whose stop hash left the best chain fails until something does.
+				if !tip_on_our_chain && self.next_header_left(ours).await {
+					return self.reorg(tip, ours).await;
+				}
+				return Err(error);
+			}
 			return Ok(Progress::Advanced);
 		}
 		if !tip_on_our_chain {
@@ -1428,6 +1449,15 @@ impl SourceSync {
 			let keep_from =
 				(tip.height + 1).saturating_sub(self.tuning.held_headers).min(self.filters_through);
 			chain.prune_below(keep_from);
+		}
+	}
+
+	/// Whether the source's next header no longer builds on `ours`. Anything but a clear yes is a
+	/// no: the caller then reports the failure it already has.
+	async fn next_header_left(&self, ours: BlockId) -> bool {
+		match bounded(self.tuning.call_timeout, self.source.headers(ours.height + 1, 1)).await {
+			Ok(headers) => headers.first().map_or(false, |h| h.prev_blockhash != ours.hash),
+			Err(_) => false,
 		}
 	}
 
@@ -1830,6 +1860,8 @@ pub(crate) mod test_support {
 		pub(crate) hang_blocks: bool,
 		/// `block` answers once this is cleared again.
 		pub(crate) hold_blocks: bool,
+		/// `filter_headers` is down while this is set; headers still answer.
+		pub(crate) hold_filter_headers: bool,
 	}
 
 	pub(crate) struct FakeSource {
@@ -1851,10 +1883,15 @@ pub(crate) mod test_support {
 					filters_cap: None,
 					hang_blocks: false,
 					hold_blocks: false,
+					hold_filter_headers: false,
 				}),
 			};
 			source.mine(len, matched, 0);
 			source
+		}
+
+		pub(crate) fn hold_filter_headers(&self, hold: bool) {
+			self.st().hold_filter_headers = hold;
 		}
 
 		fn st(&self) -> MutexGuard<'_, FakeState> {
@@ -1990,6 +2027,9 @@ pub(crate) mod test_support {
 			&self, start_height: u32, stop_hash: BlockHash,
 		) -> Result<FilterHeaders, SourceError> {
 			let st = self.enter("filter_headers")?;
+			if st.hold_filter_headers {
+				return Err(SourceError::unavailable("filter headers are held"));
+			}
 			let (start, stop) = Self::span(&st, start_height, stop_hash)?;
 			let chain = Self::filter_header_chain(&st, stop);
 			let mut previous =
@@ -2086,6 +2126,9 @@ mod tests {
 	use bitcoin::CompactTarget;
 
 	use crate::chain::cbf::applicator::CBF_FULL_BLOCK_PERMITS;
+	use crate::chain::cbf::bundle_source::test_support::ServerTransport;
+	use crate::chain::cbf::bundle_source::{BundleFilterSource, BundleTuning};
+	use crate::chain::provider::{BundleTransport, ChainProviderError};
 	use crate::NodeMetrics;
 
 	/// Any single wait in these tests; a test that would otherwise hang fails instead.
@@ -2118,9 +2161,19 @@ mod tests {
 
 	fn start(source: FakeSource, anchor_height: u32, tuning: SourceTuning) -> Harness {
 		let source = Arc::new(source);
+		let filter_source = Arc::clone(&source) as Arc<dyn FilterSource>;
+		let chain = new_shared_header_chain();
+		start_over(source, filter_source, chain, anchor_height, tuning)
+	}
+
+	/// The loop over `filter_source` — which reads `source`'s chain, a wrapper of it say —
+	/// verifying into `chain`.
+	fn start_over(
+		source: Arc<FakeSource>, filter_source: Arc<dyn FilterSource>, chain: SharedHeaderChain,
+		anchor_height: u32, tuning: SourceTuning,
+	) -> Harness {
 		let anchor =
 			BlockId { height: anchor_height, hash: source.block_at(anchor_height).block_hash() };
-		let chain = new_shared_header_chain();
 		let (ops_tx, ops_rx) = mpsc::channel(1024);
 		let (sync_state_tx, _) = watch::channel(CbfSyncState::Active {
 			applied_tip: Some(anchor_height),
@@ -2130,7 +2183,7 @@ mod tests {
 		let (replay_tx, replay_rx) = replay_channel();
 		let permits = Arc::new(Semaphore::new(CBF_FULL_BLOCK_PERMITS));
 		let sync = SourceSync::new(
-			Arc::clone(&source) as Arc<dyn FilterSource>,
+			filter_source,
 			Network::Regtest,
 			anchor,
 			Arc::clone(&chain),
@@ -2334,6 +2387,244 @@ mod tests {
 			h.ops_until_synced().await,
 			vec![Op::Rescan(27), Op::Filtered(28), Op::Filtered(29), Op::Synced(29)]
 		);
+		assert_eq!(h.stop().await, SourceSyncEnd::Stopped);
+	}
+
+	/// The loop over per-block bundles: `node` is the inner source the raw routes answer from,
+	/// `pro` an identical chain the bundles come from. Mine on both to move the chain.
+	fn start_bundled(
+		matched: &[u32], tuning: SourceTuning,
+	) -> (Harness, Arc<BundleFilterSource>, Arc<ServerTransport>, Arc<FakeSource>) {
+		start_bundled_tuned(matched, tuning, BundleTuning::default())
+	}
+
+	fn start_bundled_tuned(
+		matched: &[u32], tuning: SourceTuning, bundle_tuning: BundleTuning,
+	) -> (Harness, Arc<BundleFilterSource>, Arc<ServerTransport>, Arc<FakeSource>) {
+		let node = Arc::new(FakeSource::new(30, matched));
+		let pro = Arc::new(FakeSource::new(30, matched));
+		let transport = Arc::new(ServerTransport::new(Arc::clone(&pro) as Arc<dyn FilterSource>));
+		let chain = new_shared_header_chain();
+		let bundles = Arc::new(BundleFilterSource::new(
+			Arc::clone(&node) as Arc<dyn FilterSource>,
+			Arc::clone(&transport) as Arc<dyn BundleTransport>,
+			Arc::clone(&chain),
+			bundle_tuning,
+			Arc::new(Logger::new_log_facade()),
+		));
+		let h = start_over(node, Arc::clone(&bundles) as Arc<dyn FilterSource>, chain, 10, tuning);
+		(h, bundles, transport, pro)
+	}
+
+	/// The raw reads of the data a bundle carries.
+	fn raw_bundle_reads(source: &FakeSource) -> [usize; 2] {
+		["filter_headers", "filters"].map(|m| source.calls(m))
+	}
+
+	#[tokio::test]
+	async fn a_new_block_arrives_through_one_since_and_no_raw_read_of_its_data() {
+		let (mut h, _bundles, transport, pro) = start_bundled(&[25], fast_tuning());
+		let mut expected: Vec<Op> = (11..=29)
+			.map(|height| if height == 25 { Op::Full(height) } else { Op::Filtered(height) })
+			.collect();
+		expected.push(Op::Synced(29));
+		assert_eq!(h.ops_until_synced().await, expected);
+		assert_eq!(transport.calls("since"), 1, "one reply carried the whole catch-up");
+		let headers_at_resume = h.source.calls("headers");
+		assert_eq!(raw_bundle_reads(&h.source), [0, 0]);
+		assert_eq!(h.source.calls("block"), 1, "a matched block is fetched as before");
+		assert!(h.source.calls("tip") >= 1, "the tip is polled");
+
+		for (i, height) in [30u32, 31, 32].into_iter().enumerate() {
+			h.source.mine(1, &[], 0);
+			pro.mine(1, &[], 0);
+			assert_eq!(h.ops_until_synced().await, vec![Op::Filtered(height), Op::Synced(height)]);
+			assert_eq!(transport.calls("since"), 2 + i, "one per new block");
+		}
+		assert_eq!(raw_bundle_reads(&h.source), [0, 0]);
+		assert_eq!(h.source.calls("headers"), headers_at_resume);
+		assert_eq!(lock_headers(&h.chain).tip(), Some(h.source.tip_id()));
+		assert_eq!(h.stop().await, SourceSyncEnd::Stopped);
+	}
+
+	/// A long absence: more blocks than one `since` may carry. Several pulls, each continuing
+	/// where the last ended, and still no raw read.
+	#[tokio::test]
+	async fn a_node_far_behind_catches_up_over_several_pulls() {
+		let (mut h, _bundles, transport, pro) = start_bundled(&[], fast_tuning());
+		h.ops_until_synced().await;
+		h.source.mine(400, &[], 0);
+		pro.mine(400, &[], 0);
+		let ops = h.ops_until_synced().await;
+		assert_eq!(ops.last(), Some(&Op::Synced(429)));
+		assert_eq!(ops.len(), 401);
+		assert_eq!(transport.calls("since"), 1 + 3, "400 blocks at 144 a reply, after the first");
+		assert_eq!(raw_bundle_reads(&h.source), [0, 0]);
+		assert_eq!(lock_headers(&h.chain).tip(), Some(h.source.tip_id()));
+		assert_eq!(h.stop().await, SourceSyncEnd::Stopped);
+	}
+
+	/// A reorg: the tip moved off the verified chain. The refused pull leaves no backoff, the raw
+	/// routes find the fork, and the next pull continues from it.
+	#[tokio::test]
+	async fn a_reorg_is_followed_through_the_raw_routes_then_bundles_resume() {
+		let (mut h, _bundles, transport, pro) = start_bundled(&[], fast_tuning());
+		h.ops_until_synced().await;
+		let raw_headers_before = h.source.calls("headers");
+		let pulls_before = transport.calls("since");
+
+		h.source.reorg(2, 3);
+		pro.reorg(2, 3);
+		assert_eq!(
+			h.ops_until_synced().await,
+			vec![
+				Op::Disconnect(vec![29, 28]),
+				Op::Filtered(28),
+				Op::Filtered(29),
+				Op::Filtered(30),
+				Op::Synced(30)
+			]
+		);
+		assert!(h.source.calls("headers") > raw_headers_before, "the fork search reads raw");
+		assert!(transport.calls("since") > pulls_before, "the new branch came as bundles");
+
+		h.source.mine(1, &[], 0);
+		pro.mine(1, &[], 0);
+		let pulls = transport.calls("since");
+		assert_eq!(h.ops_until_synced().await, vec![Op::Filtered(31), Op::Synced(31)]);
+		assert_eq!(transport.calls("since"), pulls + 1);
+		assert_eq!(lock_headers(&h.chain).tip(), Some(h.source.tip_id()));
+		assert_eq!(h.stop().await, SourceSyncEnd::Stopped);
+	}
+
+	/// Waits until the loop holds headers through `height` and has been refused the filter
+	/// headers above what it verified: its filters are behind its headers.
+	async fn filters_behind_at(h: &Harness, height: u32) {
+		let refused = h.source.calls("filter_headers");
+		tokio::time::timeout(WAIT, async {
+			while lock_headers(&h.chain).tip().map(|t| t.height) != Some(height)
+				|| h.source.calls("filter_headers") <= refused
+			{
+				tokio::time::sleep(Duration::from_millis(5)).await;
+			}
+		})
+		.await
+		.expect("the headers moved on while the filters stayed behind");
+	}
+
+	/// The stop hash of the next filter batch left the best chain while the filters were behind.
+	/// Every filter call now fails, so a loop that only reads headers once the filters caught up
+	/// never sees why. Raw routes under a source whose headers come with their filters.
+	#[tokio::test]
+	async fn a_reorg_while_the_filters_are_behind_recovers_on_the_raw_routes() {
+		let (mut h, _bundles, transport, pro) = start_bundled(&[], fast_tuning());
+		transport
+			.refuse_with(Some(ChainProviderError::Refused("unsupported: unknown route".into())));
+		assert_eq!(h.ops_until_synced().await.last(), Some(&Op::Synced(29)));
+
+		h.source.hold_filter_headers(true);
+		h.source.mine(2, &[], 0);
+		pro.mine(2, &[], 0);
+		filters_behind_at(&h, 31).await;
+
+		h.source.reorg(2, 4);
+		pro.reorg(2, 4);
+		h.source.hold_filter_headers(false);
+		assert_eq!(h.ops_until_synced().await.last(), Some(&Op::Synced(33)));
+		assert_eq!(lock_headers(&h.chain).tip(), Some(h.source.tip_id()));
+		assert_eq!(h.stop().await, SourceSyncEnd::Stopped);
+	}
+
+	/// The same with `since` answering again by the time of the reorg: the look for the next
+	/// header goes through a pull the Pro refuses, the raw routes find the fork, bundles resume.
+	#[tokio::test]
+	async fn a_reorg_while_the_filters_are_behind_recovers_when_bundles_answer_again() {
+		let bundle_tuning =
+			BundleTuning { retry_after: Duration::from_millis(10), ..BundleTuning::default() };
+		let (mut h, _bundles, transport, pro) =
+			start_bundled_tuned(&[], fast_tuning(), bundle_tuning);
+		assert_eq!(h.ops_until_synced().await.last(), Some(&Op::Synced(29)));
+
+		transport.refuse_with(Some(ChainProviderError::Refused("failed: down".into())));
+		h.source.hold_filter_headers(true);
+		h.source.mine(2, &[], 0);
+		pro.mine(2, &[], 0);
+		filters_behind_at(&h, 31).await;
+
+		h.source.reorg(2, 4);
+		pro.reorg(2, 4);
+		h.source.hold_filter_headers(false);
+		transport.refuse_with(None);
+		assert_eq!(h.ops_until_synced().await.last(), Some(&Op::Synced(33)));
+		assert_eq!(lock_headers(&h.chain).tip(), Some(h.source.tip_id()));
+
+		h.source.mine(1, &[], 0);
+		pro.mine(1, &[], 0);
+		let pulls = transport.calls("since");
+		assert_eq!(h.ops_until_synced().await, vec![Op::Filtered(34), Op::Synced(34)]);
+		assert_eq!(transport.calls("since"), pulls + 1, "the next block came as a bundle");
+		assert_eq!(h.stop().await, SourceSyncEnd::Stopped);
+	}
+
+	/// No bundles at all: a full header lookahead leaves no room to read a header either.
+	#[tokio::test]
+	async fn a_reorg_with_the_header_lookahead_full_recovers() {
+		let tuning = SourceTuning { header_lookahead: 2, ..fast_tuning() };
+		let mut h = start(FakeSource::new(30, &[]), 10, tuning);
+		assert_eq!(h.ops_until_synced().await.last(), Some(&Op::Synced(29)));
+
+		h.source.hold_filter_headers(true);
+		h.source.mine(2, &[], 0);
+		filters_behind_at(&h, 31).await;
+
+		h.source.reorg(2, 4);
+		h.source.hold_filter_headers(false);
+		assert_eq!(h.ops_until_synced().await.last(), Some(&Op::Synced(33)));
+		assert_eq!(lock_headers(&h.chain).tip(), Some(h.source.tip_id()));
+		assert_eq!(h.stop().await, SourceSyncEnd::Stopped);
+	}
+
+	/// A failed filter batch with the tip still on our chain is only a failed batch.
+	#[tokio::test]
+	async fn a_failed_filter_batch_without_a_reorg_keeps_every_block() {
+		let (mut h, _bundles, transport, pro) = start_bundled(&[], fast_tuning());
+		transport
+			.refuse_with(Some(ChainProviderError::Refused("unsupported: unknown route".into())));
+		assert_eq!(h.ops_until_synced().await.last(), Some(&Op::Synced(29)));
+
+		h.source.hold_filter_headers(true);
+		h.source.mine(2, &[], 0);
+		pro.mine(2, &[], 0);
+		filters_behind_at(&h, 31).await;
+		h.source.mine(1, &[], 0);
+		pro.mine(1, &[], 0);
+		let reads = h.source.calls("filter_headers");
+		tokio::time::timeout(WAIT, async {
+			while h.source.calls("filter_headers") < reads + 3 {
+				tokio::time::sleep(Duration::from_millis(5)).await;
+			}
+		})
+		.await
+		.unwrap();
+		h.source.hold_filter_headers(false);
+		assert_eq!(
+			h.ops_until_synced().await,
+			vec![Op::Filtered(30), Op::Filtered(31), Op::Filtered(32), Op::Synced(32)]
+		);
+		assert_eq!(h.stop().await, SourceSyncEnd::Stopped);
+	}
+
+	#[tokio::test]
+	async fn a_pro_without_the_route_is_followed_through_the_raw_routes() {
+		let (mut h, _bundles, transport, pro) = start_bundled(&[], fast_tuning());
+		transport
+			.refuse_with(Some(ChainProviderError::Refused("unsupported: unknown route".into())));
+		assert_eq!(h.ops_until_synced().await.last(), Some(&Op::Synced(29)));
+		h.source.mine(1, &[], 0);
+		pro.mine(1, &[], 0);
+		assert_eq!(h.ops_until_synced().await, vec![Op::Filtered(30), Op::Synced(30)]);
+		assert_eq!(transport.calls("since"), 1, "not asked again inside the backoff");
+		assert!(h.source.calls("filters") >= 2, "the raw routes answered");
 		assert_eq!(h.stop().await, SourceSyncEnd::Stopped);
 	}
 

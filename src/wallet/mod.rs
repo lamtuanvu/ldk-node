@@ -100,6 +100,9 @@ where
 	/// The broadcast policy of every transaction this wallet builds, and the ones held for a
 	/// rebroadcast, whose inputs stay reserved; see [`crate::broadcast_queue`].
 	broadcast_queue: Arc<BroadcastQueue>,
+	/// When a receive address was last handed out. In memory: a restart forgets it, and an
+	/// incoming payment then shows at its first confirmation, as outside the window.
+	last_address_reveal: Mutex<Option<std::time::Instant>>,
 	fee_estimator: E,
 	payment_store: Arc<PaymentStore>,
 	config: Arc<Config>,
@@ -126,6 +129,7 @@ where
 			persister,
 			broadcaster,
 			broadcast_queue,
+			last_address_reveal: Mutex::new(None),
 			fee_estimator,
 			payment_store,
 			config,
@@ -663,6 +667,8 @@ where
 		WalletSource::sign_psbt(self, psbt).map_err(|()| Error::WalletOperationFailed)
 	}
 
+	/// A new external address for this node's own use: LDK's destination and shutdown scripts.
+	/// One to give to someone is [`Self::get_new_receive_address`].
 	pub(crate) fn get_new_address(&self) -> Result<bitcoin::Address, Error> {
 		let mut locked_wallet = self.inner.lock().unwrap();
 		let mut locked_persister = self.persister.lock().unwrap();
@@ -673,6 +679,21 @@ where
 			Error::PersistenceFailed
 		})?;
 		Ok(address_info.address)
+	}
+
+	/// A new address to give to someone, who may pay it now; see
+	/// [`Self::address_revealed_within`].
+	pub(crate) fn get_new_receive_address(&self) -> Result<bitcoin::Address, Error> {
+		let address = self.get_new_address()?;
+		*self.last_address_reveal.lock().unwrap() = Some(std::time::Instant::now());
+		Ok(address)
+	}
+
+	/// Whether a receive address was handed out within `window`: someone may be paying it now.
+	// Called by the filter-driven sync engine only.
+	#[cfg_attr(not(feature = "cbf"), allow(dead_code))]
+	pub(crate) fn address_revealed_within(&self, window: std::time::Duration) -> bool {
+		self.last_address_reveal.lock().unwrap().map_or(false, |at| at.elapsed() < window)
 	}
 
 	fn get_new_internal_address(&self) -> Result<bitcoin::Address, Error> {

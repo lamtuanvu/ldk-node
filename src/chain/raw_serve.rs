@@ -53,19 +53,22 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use bitcoin::block::Header;
 use bitcoin::consensus::encode::serialize;
 use bitcoin::BlockHash;
 
 use crate::chain::adapters::bitcoind_raw::RawSourceHealth;
 use crate::chain::cbf::source::{FilterHeaders, FilterSource, IndexedFilter, SourceError};
 use crate::chain::provider::{
-	WireBlockChunk, WireBlockRequest, WireChainTip, WireFilterHeaders, WireFilterHeadersRequest,
-	WireFilters, WireFiltersRequest, WireHeaders, WireHeadersRequest, MAX_FILTERS_PER_REQUEST,
-	MAX_FILTER_HEADERS_PER_REQUEST, MAX_HEADERS_PER_REQUEST,
+	WireBlockChunk, WireBlockRequest, WireBlockUpdate, WireBlockUpdates, WireChainTip,
+	WireFilterHeaders, WireFilterHeadersRequest, WireFilters, WireFiltersRequest, WireHeaders,
+	WireHeadersRequest, WireSinceRequest, CHAIN_WIRE_VERSION, MAX_FILTERS_PER_REQUEST,
+	MAX_FILTER_HEADERS_PER_REQUEST, MAX_HEADERS_PER_REQUEST, MAX_UPDATES_PER_SINCE,
 };
 use crate::chain::wire_convert::{
-	block_chunk_count, block_chunk_to_wire, block_hash_from_wire, chain_tip_to_wire, check_version,
-	filter_headers_to_wire, filters_to_wire, headers_to_wire,
+	block_chunk_count, block_chunk_to_wire, block_hash_from_wire, block_id_from_wire,
+	block_id_to_wire, block_update_piece_to_wire, block_update_to_wire, chain_tip_to_wire,
+	check_version, filter_headers_to_wire, filters_to_wire, headers_to_wire, BlockBundle,
 };
 use crate::logger::{log_debug, log_info, log_trace, log_warn, LdkLogger, Logger};
 use crate::Error;
@@ -105,6 +108,26 @@ pub(crate) const FILTER_HEADERS_PER_REPLY: u32 = 200;
 /// [`MAX_HEADERS_PER_REQUEST`] headers take, kept as a backstop.
 pub(crate) const HEADER_BYTES_PER_REPLY: usize = FILTER_BYTES_PER_REPLY;
 
+/// Block bundles kept for `since` replies, by count — a day of blocks, what
+/// one `since` may ask for…
+pub(crate) const BUNDLE_CACHE_ENTRIES: usize = MAX_UPDATES_PER_SINCE as usize;
+/// …and by bytes: a day of mainnet filters is about 4 MiB.
+pub(crate) const BUNDLE_CACHE_BYTES: usize = 8 * 1024 * 1024;
+
+/// JSON bytes of updates one `since` reply carries at most: the same margin
+/// under [`MAX_PEER_REPLY_BYTES`](crate::chain::provider::MAX_PEER_REPLY_BYTES)
+/// a filters reply keeps. A block whose update alone is larger goes as pieces
+/// of [`SINCE_FILTER_PIECE_BYTES`].
+pub(crate) const SINCE_REPLY_BYTES: usize = 800 * 1024;
+
+/// Raw filter bytes one piece of an oversized filter carries; hex doubles them,
+/// as a block chunk's.
+pub(crate) const SINCE_FILTER_PIECE_BYTES: usize = FILTER_BYTES_PER_REPLY;
+
+/// Blocks one source read of a `since` covers at most. A mainnet span this
+/// long is about one filters reply's worth of bytes.
+pub(crate) const SINCE_READ_SPAN: usize = NEAR_TIP_SPAN;
+
 /// Serves asking the source at the same time.
 pub(crate) const RAW_SERVE_CONCURRENCY: usize = 3;
 
@@ -114,6 +137,12 @@ pub(crate) const RAW_SERVE_SMALL_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const RAW_SERVE_FILTERS_TIMEOUT: Duration = Duration::from_secs(40);
 /// Deadline of a block-chunk serve: under the host's 54 s.
 pub(crate) const RAW_SERVE_BLOCK_TIMEOUT: Duration = Duration::from_secs(50);
+/// Deadline of a `since` serve: well under the host's 45 s, so the reply,
+/// relayed, still arrives in time.
+pub(crate) const RAW_SERVE_SINCE_TIMEOUT: Duration = Duration::from_secs(30);
+/// After this much of a `since` serve no new source read starts: the updates
+/// gathered so far go, with `more` set, and the asker continues.
+pub(crate) const RAW_SERVE_SINCE_READ_BUDGET: Duration = Duration::from_secs(20);
 
 /// The bounds a [`RawChainServer`] applies; [`RawServeLimits::default`] in
 /// production, shortened in the tests.
@@ -123,6 +152,10 @@ pub(crate) struct RawServeLimits {
 	pub(crate) small_timeout: Duration,
 	pub(crate) filters_timeout: Duration,
 	pub(crate) block_timeout: Duration,
+	pub(crate) since_timeout: Duration,
+	pub(crate) since_read_budget: Duration,
+	pub(crate) since_reply_bytes: usize,
+	pub(crate) since_piece_bytes: usize,
 }
 
 impl Default for RawServeLimits {
@@ -132,6 +165,10 @@ impl Default for RawServeLimits {
 			small_timeout: RAW_SERVE_SMALL_TIMEOUT,
 			filters_timeout: RAW_SERVE_FILTERS_TIMEOUT,
 			block_timeout: RAW_SERVE_BLOCK_TIMEOUT,
+			since_timeout: RAW_SERVE_SINCE_TIMEOUT,
+			since_read_budget: RAW_SERVE_SINCE_READ_BUDGET,
+			since_reply_bytes: SINCE_REPLY_BYTES,
+			since_piece_bytes: SINCE_FILTER_PIECE_BYTES,
 		}
 	}
 }
@@ -222,6 +259,8 @@ pub(crate) struct RawChainServer {
 	blocks: Mutex<BoundedLru<BlockHash, Arc<Vec<u8>>>>,
 	filter_headers: Mutex<BoundedLru<(u32, BlockHash), FilterHeaders>>,
 	filters: Mutex<BoundedLru<(u32, BlockHash), Vec<IndexedFilter>>>,
+	/// Each block's bundle, built once for every `since` that passes it.
+	bundles: Mutex<BoundedLru<BlockHash, Arc<BlockBundle>>>,
 	/// Turns at the source; see [`RAW_SERVE_CONCURRENCY`].
 	permits: Semaphore,
 	/// One gate per block being fetched, so concurrent chunk requests for it
@@ -249,6 +288,7 @@ impl RawChainServer {
 				FILTER_HEADER_CACHE_BYTES,
 			)),
 			filters: Mutex::new(BoundedLru::new(NEAR_TIP_CACHE_ENTRIES, FILTER_CACHE_BYTES)),
+			bundles: Mutex::new(BoundedLru::new(BUNDLE_CACHE_ENTRIES, BUNDLE_CACHE_BYTES)),
 			permits: Semaphore::new(limits.concurrency.max(1)),
 			block_flights: Mutex::new(HashMap::new()),
 			limits,
@@ -515,6 +555,221 @@ impl RawChainServer {
 				),
 			)
 		})
+	}
+
+	/// The bundles of the best-chain blocks above `req.from`, ascending: at
+	/// most `req.max_blocks` (capped at [`MAX_UPDATES_PER_SINCE`]), and no
+	/// more than fit in [`SINCE_REPLY_BYTES`]. `more` says the reply stopped
+	/// short of the tip. A first block too large for that goes alone, as the
+	/// first piece of its filter, and `req.filter_offset` asks for the next.
+	///
+	/// [`Error::ChainServeNotOnBestChain`] when `req.from` is not on the
+	/// source's best chain; an empty reply when it is at or above the tip.
+	pub(crate) async fn serve_since(
+		&self, req: &WireSinceRequest,
+	) -> Result<WireBlockUpdates, Error> {
+		check_version(req.version).map_err(|e| self.refuse("since", e))?;
+		let from = block_id_from_wire(&req.from).map_err(|e| self.refuse("since", e))?;
+		let max_blocks = req.max_blocks.clamp(1, MAX_UPDATES_PER_SINCE);
+		let started = tokio::time::Instant::now();
+
+		self.deadline("since", self.limits.since_timeout, async {
+			let _turn = self.turn().await?;
+			let tip = self.source.tip().await.map_err(|e| self.source_failed("since", e))?;
+			if let Some(reason) = self.not_ready() {
+				log_info!(
+					self.logger,
+					"Refusing a since request at height {}: the source is not ready: {}",
+					tip.height,
+					reason
+				);
+				return Err(Error::ChainServeFailed);
+			}
+			let reply = |updates: Vec<WireBlockUpdate>, more: bool| WireBlockUpdates {
+				version: CHAIN_WIRE_VERSION,
+				tip: block_id_to_wire(&tip),
+				updates,
+				more,
+			};
+			if from.height > tip.height {
+				return Ok(reply(Vec::new(), false));
+			}
+			if from.height == tip.height {
+				if from.hash != tip.hash {
+					return Err(self.not_on_best_chain(from.height));
+				}
+				return Ok(reply(Vec::new(), false));
+			}
+
+			let count = if req.filter_offset > 0 { 1 } else { max_blocks.min(tip.height - from.height) };
+			let mut headers = self
+				.source
+				.headers(from.height, count + 1)
+				.await
+				.map_err(|e| self.source_failed("since", e))?;
+			if headers.first().map(Header::block_hash) != Some(from.hash) {
+				return Err(self.not_on_best_chain(from.height));
+			}
+			// Keep the run that links to `from`: a reorg between the tip read
+			// and the headers read cuts it short, never makes it wrong.
+			let links = headers.windows(2).take_while(|w| w[1].prev_blockhash == w[0].block_hash());
+			let linked = links.count();
+			headers.truncate(linked + 1);
+			let above = &headers[1..];
+
+			if req.filter_offset > 0 {
+				let Some(header) = above.first() else {
+					return Err(self.not_on_best_chain(from.height));
+				};
+				let cached = self.bundles.lock().unwrap().get(&header.block_hash());
+				let bundle = match cached {
+					Some(bundle) => bundle,
+					None => {
+						let mut read = self
+							.read_bundles("since", from.height + 1, std::slice::from_ref(header))
+							.await?;
+						read.swap_remove(0)
+					},
+				};
+				let offset = req.filter_offset as usize;
+				if offset >= bundle.filter.content.len() {
+					return Err(self.refuse(
+						"since",
+						format_args!(
+							"filter offset {} of a {}-byte filter",
+							offset,
+							bundle.filter.content.len()
+						),
+					));
+				}
+				let piece = block_update_piece_to_wire(&bundle, offset, self.limits.since_piece_bytes);
+				return Ok(reply(vec![piece], from.height + 1 < tip.height));
+			}
+
+			let mut updates: Vec<WireBlockUpdate> = Vec::new();
+			let mut bytes = 0usize;
+			let mut i = 0usize;
+			'fill: while i < above.len() {
+				let height = from.height + 1 + i as u32;
+				let cached = self.bundles.lock().unwrap().get(&above[i].block_hash());
+				let read = match cached {
+					Some(bundle) => vec![bundle],
+					None => {
+						if !updates.is_empty() && started.elapsed() >= self.limits.since_read_budget
+						{
+							break 'fill;
+						}
+						let uncached = above[i..]
+							.iter()
+							.take(SINCE_READ_SPAN)
+							.take_while(|h| {
+								self.bundles.lock().unwrap().get(&h.block_hash()).is_none()
+							})
+							.count()
+							.max(1);
+						self.read_bundles("since", height, &above[i..i + uncached]).await?
+					},
+				};
+				for bundle in read {
+					let size = bundle.wire_size();
+					if size > self.limits.since_reply_bytes && updates.is_empty() {
+						let piece = block_update_piece_to_wire(&bundle, 0, self.limits.since_piece_bytes);
+						return Ok(reply(vec![piece], true));
+					}
+					if bytes + size > self.limits.since_reply_bytes {
+						break 'fill;
+					}
+					bytes += size;
+					updates.push(block_update_to_wire(&bundle, None));
+					i += 1;
+				}
+			}
+			let reached = from.height + updates.len() as u32;
+			log_trace!(
+				self.logger,
+				"Served {} block updates from height {} (tip {})",
+				updates.len(),
+				from.height + 1,
+				tip.height
+			);
+			Ok(reply(updates, reached < tip.height))
+		})
+		.await
+	}
+
+	fn not_on_best_chain(&self, height: u32) -> Error {
+		log_debug!(
+			self.logger,
+			"Refusing a since request: the block it starts from, at height {}, is not on the best chain",
+			height
+		);
+		Error::ChainServeNotOnBestChain
+	}
+
+	/// Reads the bundles of `headers` — consecutive, the first at `start` —
+	/// from the source, as many from the first as one filters read gives (at
+	/// least one), and caches them. Each is checked to commit to its filter.
+	async fn read_bundles(
+		&self, what: &str, start: u32, headers: &[Header],
+	) -> Result<Vec<Arc<BlockBundle>>, Error> {
+		let stop_hash = headers.last().expect("at least one header").block_hash();
+		let filter_headers = self
+			.source
+			.filter_headers(start, stop_hash)
+			.await
+			.map_err(|e| self.source_failed(what, e))?;
+		let span = filter_headers.headers.len().min(headers.len());
+		if span == 0 {
+			return Err(self.source_failed(what, SourceError::Invalid("no filter headers".into())));
+		}
+		let filters = self
+			.source
+			.filters(start, headers[span - 1].block_hash())
+			.await
+			.map_err(|e| self.source_failed(what, e))?;
+		let span = filters.len().min(span);
+		if span == 0 {
+			return Err(self.source_failed(what, SourceError::Invalid("no filters".into())));
+		}
+
+		let mut previous = filter_headers.previous;
+		let mut out = Vec::with_capacity(span);
+		for (i, indexed) in filters.into_iter().take(span).enumerate() {
+			let height = start + i as u32;
+			let header = headers[i];
+			let hash = header.block_hash();
+			if indexed.height != height || indexed.block_hash != hash {
+				return Err(self.source_failed(
+					what,
+					SourceError::Invalid(format!(
+						"filter at height {} is for another block",
+						height
+					)),
+				));
+			}
+			let bundle = BlockBundle {
+				height,
+				hash,
+				header,
+				previous_filter_header: previous,
+				filter_header: filter_headers.headers[i],
+				filter: indexed.filter,
+			};
+			if !bundle.is_self_consistent() {
+				return Err(self.source_failed(
+					what,
+					SourceError::Invalid(format!(
+						"filter header at height {} does not commit to its filter",
+						height
+					)),
+				));
+			}
+			previous = bundle.filter_header;
+			let bundle = Arc::new(bundle);
+			self.bundles.lock().unwrap().insert(hash, Arc::clone(&bundle), bundle.mem_size());
+			out.push(bundle);
+		}
+		Ok(out)
 	}
 
 	/// Fetches `hash` into the block cache, once however many chunk requests
@@ -974,6 +1229,9 @@ mod tests {
 			small_timeout: Duration::from_millis(300),
 			filters_timeout: Duration::from_secs(5),
 			block_timeout: Duration::from_secs(5),
+			since_timeout: Duration::from_secs(5),
+			since_read_budget: Duration::from_secs(4),
+			..RawServeLimits::default()
 		};
 		let server = RawChainServer::with_limits(
 			Arc::clone(&source) as Arc<dyn FilterSource>,
@@ -1128,5 +1386,230 @@ mod tests {
 		let fh = filter_headers_from_wire(&fh).unwrap();
 		assert_eq!(fh.headers.len(), 2);
 		assert_eq!(source.filter(38).filter_header(&fh.previous), fh.headers[0]);
+	}
+	fn since_req(source: &MockFilterSource, from: u32, max_blocks: u32) -> WireSinceRequest {
+		WireSinceRequest {
+			version: CHAIN_WIRE_VERSION,
+			from: crate::chain::provider::WireBlockId {
+				height: from,
+				hash: source.blocks[from as usize].block_hash().to_string(),
+			},
+			max_blocks,
+			filter_offset: 0,
+		}
+	}
+
+	/// The updates decode, run on from `from`, link, and chain their filter headers.
+	fn check_run(source: &MockFilterSource, from: u32, reply: &WireBlockUpdates) {
+		let mut below = source.blocks[from as usize].block_hash();
+		let mut previous_fh: Option<FilterHeader> = None;
+		for (i, update) in reply.updates.iter().enumerate() {
+			let bundle = crate::chain::wire_convert::block_update_from_wire(update).unwrap();
+			assert_eq!(bundle.height, from + 1 + i as u32);
+			assert_eq!(bundle.hash, source.blocks[bundle.height as usize].block_hash());
+			assert_eq!(bundle.header.prev_blockhash, below);
+			assert!(bundle.is_self_consistent());
+			if let Some(fh) = previous_fh {
+				assert_eq!(bundle.previous_filter_header, fh);
+			}
+			below = bundle.hash;
+			previous_fh = Some(bundle.filter_header);
+		}
+	}
+
+	#[tokio::test]
+	async fn a_bundle_is_built_once_for_every_asker() {
+		let (server, source) = server(MockFilterSource::new(30, 10));
+		let first = server.serve_since(&since_req(&source, 19, 1)).await.unwrap();
+		let second = server.serve_since(&since_req(&source, 19, 1)).await.unwrap();
+		assert_eq!(first, second);
+		assert_eq!((source.calls("filters"), source.calls("filter_headers")), (1, 1));
+		let bundle =
+			crate::chain::wire_convert::block_update_from_wire(&first.updates[0]).unwrap();
+		assert_eq!(bundle.hash, source.blocks[20].block_hash());
+		assert_eq!(bundle.filter, source.filter(20));
+		assert!(bundle.is_self_consistent());
+		assert_eq!(first.updates[0].fee_estimates, None, "the layer adds those");
+
+		// One that passes it reads only the blocks it does not hold.
+		let reply = server.serve_since(&since_req(&source, 19, 2)).await.unwrap();
+		assert_eq!(reply.updates[0], first.updates[0]);
+		assert_eq!(source.calls("filters"), 2);
+	}
+
+	#[tokio::test]
+	async fn since_answers_the_blocks_above_from_and_says_when_there_are_more() {
+		let (server, source) = server(MockFilterSource::new(30, 10));
+		let reply = server.serve_since(&since_req(&source, 5, 10)).await.unwrap();
+		assert_eq!(reply.updates.len(), 10);
+		assert!(reply.more);
+		assert_eq!(reply.tip.height, 29);
+		check_run(&source, 5, &reply);
+
+		let reply = server.serve_since(&since_req(&source, 25, 144)).await.unwrap();
+		assert_eq!(reply.updates.len(), 4);
+		assert!(!reply.more);
+		check_run(&source, 25, &reply);
+	}
+
+	#[tokio::test]
+	async fn since_asks_for_at_most_a_day_of_blocks() {
+		let (server, source) = server(MockFilterSource::new(200, 10));
+		let reply = server.serve_since(&since_req(&source, 0, 1000)).await.unwrap();
+		assert_eq!(reply.updates.len(), MAX_UPDATES_PER_SINCE as usize);
+		assert!(reply.more);
+		check_run(&source, 0, &reply);
+	}
+
+	#[tokio::test]
+	async fn since_at_or_above_the_tip_is_empty() {
+		let (server, source) = server(MockFilterSource::new(30, 10));
+		let at_tip = server.serve_since(&since_req(&source, 29, 10)).await.unwrap();
+		assert!(at_tip.updates.is_empty());
+		assert!(!at_tip.more);
+
+		let mut above = since_req(&source, 29, 10);
+		above.from.height = 40;
+		let reply = server.serve_since(&above).await.unwrap();
+		assert!(reply.updates.is_empty());
+		assert!(!reply.more);
+	}
+
+	#[tokio::test]
+	async fn since_from_a_block_off_the_best_chain_is_refused() {
+		let (server, source) = server(MockFilterSource::new(30, 10));
+		let mut stale = since_req(&source, 10, 10);
+		stale.from.hash = BlockHash::all_zeros().to_string();
+		assert_eq!(server.serve_since(&stale).await, Err(Error::ChainServeNotOnBestChain));
+
+		let mut stale_tip = since_req(&source, 29, 10);
+		stale_tip.from.hash = source.blocks[28].block_hash().to_string();
+		assert_eq!(server.serve_since(&stale_tip).await, Err(Error::ChainServeNotOnBestChain));
+
+		let mut bad = since_req(&source, 10, 10);
+		bad.version = CHAIN_WIRE_VERSION + 1;
+		assert_eq!(server.serve_since(&bad).await, Err(Error::ChainServeFailed));
+	}
+
+	#[tokio::test]
+	async fn since_stops_under_one_peer_reply() {
+		let mut big = MockFilterSource::new(30, 10);
+		big.filter_bytes = Some(150 * 1024);
+		let (big_server, source) = server(big);
+		let reply = big_server.serve_since(&since_req(&source, 5, 10)).await.unwrap();
+		assert_eq!(reply.updates.len(), 2, "a third would outgrow the reply");
+		assert!(reply.more);
+		check_run(&source, 5, &reply);
+		let json = serde_json::to_vec(&reply).unwrap();
+		assert!(json.len() < MAX_PEER_REPLY_BYTES, "{} bytes", json.len());
+	}
+
+	/// A filter no reply can hold goes as pieces: every reply fits, each piece
+	/// starts where the last ended, and together they are the filter.
+	#[tokio::test]
+	async fn a_filter_larger_than_one_reply_is_served_in_pieces() {
+		use bitcoin::hex::FromHex;
+
+		const FILTER_BYTES: usize = MAX_PEER_REPLY_BYTES + 100 * 1024;
+		let mut huge = MockFilterSource::new(30, 10);
+		huge.filter_bytes = Some(FILTER_BYTES);
+		let (server, source) = server(huge);
+
+		let mut req = since_req(&source, 5, 1);
+		let mut assembled = Vec::new();
+		loop {
+			let reply = server.serve_since(&req).await.unwrap();
+			let json = serde_json::to_vec(&reply).unwrap();
+			assert!(json.len() < MAX_PEER_REPLY_BYTES, "{} bytes", json.len());
+			assert_eq!(reply.updates.len(), 1);
+			assert!(reply.more, "blocks above it remain");
+			let piece = &reply.updates[0];
+			assert_eq!(piece.height, 6);
+			assert_eq!(piece.filter_total, Some(FILTER_BYTES as u32));
+			assert_eq!(piece.filter_offset as usize, assembled.len());
+			assembled.extend(Vec::<u8>::from_hex(&piece.filter_hex).unwrap());
+			if assembled.len() == FILTER_BYTES {
+				break;
+			}
+			req.filter_offset = assembled.len() as u32;
+		}
+		assert_eq!(assembled, source.filter(6).content);
+		assert_eq!(source.calls("filters"), 1, "read once, from the bundle cache after that");
+
+		// An offset at or past the end is a confused asker, not a piece.
+		req.filter_offset = FILTER_BYTES as u32;
+		assert_eq!(server.serve_since(&req).await, Err(Error::ChainServeFailed));
+	}
+
+	/// The largest BIP158 filter consensus allows, which is why a real filter
+	/// never reaches the pieces, and why the raw `chain.filters` route — whose
+	/// reply is "at least one filter, whatever its size" — is safe with no
+	/// continuation of its own. A block is at most 4,000,000 weight; the output
+	/// with the smallest script worth a filter element that can still be unique
+	/// is 12 bytes (a 3-byte script: 256 and 65,536 scripts of 1 and 2 bytes
+	/// are too few to matter), or 48 weight.
+	#[test]
+	fn the_largest_filter_a_block_can_carry_fits_one_reply() {
+		use bitcoin::bip158::BlockFilter;
+		use bitcoin::blockdata::block::{Block, Version as BlockVersion};
+		use bitcoin::hashes::Hash;
+		use bitcoin::{absolute, transaction, Amount, CompactTarget, Transaction, TxMerkleNode, TxOut};
+
+		let outputs = 4_000_000 / 48;
+		let output: Vec<TxOut> = (0..outputs as u32)
+			.map(|i| TxOut {
+				value: Amount::ZERO,
+				script_pubkey: bitcoin::ScriptBuf::from_bytes(i.to_le_bytes()[..3].to_vec()),
+			})
+			.collect();
+		let tx = Transaction {
+			version: transaction::Version::TWO,
+			lock_time: absolute::LockTime::ZERO,
+			input: Vec::new(),
+			output,
+		};
+		let block = Block {
+			header: bitcoin::block::Header {
+				version: BlockVersion::TWO,
+				prev_blockhash: BlockHash::all_zeros(),
+				merkle_root: TxMerkleNode::all_zeros(),
+				time: 0,
+				bits: CompactTarget::from_consensus(0),
+				nonce: 0,
+			},
+			txdata: vec![tx],
+		};
+		let filter = BlockFilter::new_script_filter(
+			&block,
+			|outpoint: &bitcoin::OutPoint| -> Result<bitcoin::ScriptBuf, bitcoin::bip158::Error> {
+				Err(bitcoin::bip158::Error::UtxoMissing(*outpoint))
+			},
+		)
+		.unwrap();
+		let hex_bytes = filter.content.len() * 2;
+		assert!(filter.content.len() > 200 * 1024, "{} bytes", filter.content.len());
+		assert!(hex_bytes < SINCE_REPLY_BYTES, "{} bytes of hex", hex_bytes);
+		assert!(filter.content.len() < FILTER_BYTES_PER_REPLY);
+	}
+
+	#[tokio::test]
+	async fn since_without_the_time_to_read_more_sends_what_it_has() {
+		let mut slow = MockFilterSource::new(60, 10);
+		slow.delay = Some(Duration::from_millis(60));
+		let source = Arc::new(slow);
+		let limits = RawServeLimits {
+			since_timeout: Duration::from_secs(5),
+			since_read_budget: Duration::from_millis(100),
+			..RawServeLimits::default()
+		};
+		let server = RawChainServer::with_limits(
+			Arc::clone(&source) as Arc<dyn FilterSource>,
+			limits,
+			Arc::new(Logger::new_log_facade()),
+		);
+		// Tip, headers, then the first span's two reads: over the budget, so it ends there.
+		let reply = server.serve_since(&since_req(&source, 0, 144)).await.unwrap();
+		assert_eq!(reply.updates.len(), SINCE_READ_SPAN);
+		assert!(reply.more);
 	}
 }

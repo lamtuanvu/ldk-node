@@ -69,6 +69,10 @@ pub enum Error {
 	ChainServeUnsupported,
 	/// A request from another node for chain data could not be answered.
 	ChainServeFailed,
+	/// Another node asked for chain data from a block that is not on this
+	/// node's best chain: it is on a stale branch, and must find the fork
+	/// through the raw routes before asking again.
+	ChainServeNotOnBestChain,
 	/// A gossip updating operation failed.
 	GossipUpdateFailed,
 	/// A gossip updating operation timed out.
@@ -184,6 +188,9 @@ impl fmt::Display for Error {
 			},
 			Self::ChainServeFailed => {
 				write!(f, "Failed to answer another node's request for chain data.")
+			},
+			Self::ChainServeNotOnBestChain => {
+				write!(f, "The block another node asked from is not on this node's best chain.")
 			},
 			Self::GossipUpdateFailed => write!(f, "Failed to update gossip data."),
 			Self::GossipUpdateTimeout => write!(f, "Updating gossip data timed out."),
