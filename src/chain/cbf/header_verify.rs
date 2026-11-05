@@ -53,6 +53,19 @@ pub(crate) enum HeaderCheck {
 }
 
 impl HeaderCheck {
+	/// The height the check failed at.
+	pub(crate) fn height(&self) -> u32 {
+		match self {
+			Self::Link { height, .. }
+			| Self::ProofOfWork { height }
+			| Self::Difficulty { height, .. }
+			| Self::MedianTimePast { height, .. }
+			| Self::FutureTime { height, .. }
+			| Self::Timewarp { height }
+			| Self::MissingAncestor { height, .. } => *height,
+		}
+	}
+
 	/// The name of the check, for logs.
 	pub(crate) fn name(&self) -> &'static str {
 		match self {

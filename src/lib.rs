@@ -123,8 +123,17 @@ pub use crate::chain::provider as chain_provider;
 /// [`Node::chain_serve_headers`] and its siblings; an app implements the trait
 /// over its own transport to consume it. The per-block bundles' wire and their
 /// [`chain_filter_source::BundleTransport`] port are re-exported here too: a
-/// Pro node answers them with [`Node::chain_serve_since`].
+/// Pro node answers them with [`Node::chain_serve_since`], and builds pushes
+/// with [`Node::chain_serve_block_update`].
 pub use crate::chain::cbf::source as chain_filter_source;
+
+/// The provider session: which Pro node a chain host follows, swappable while it
+/// runs. See [`chain_session::ChainProviderSession`].
+pub use crate::chain::session as chain_session;
+
+/// Who a Pro node pushes blocks to. See
+/// [`chain_subscription::SubscriptionRegistry`].
+pub use crate::chain::subscription as chain_subscription;
 
 pub use crate::chain::adapters::bitcoind_raw::RawSourceStatus;
 
@@ -195,6 +204,8 @@ pub use fee_estimator::{FeerateQuote, SwapFeerateSource};
 /// `chain` module.
 #[cfg(feature = "swaps")]
 pub use chain::{ChainStatus, TxStatus};
+#[cfg(feature = "swaps")]
+pub use chain::SwapTxInBlock;
 
 /// Public types appearing in the swap-primitive signatures on [`Node`]
 /// (Peerswap native primitives, B-series). Re-exported so the consumer crate
@@ -250,7 +261,7 @@ pub use types::{ChannelDetails, CustomTlvRecord, PeerDetails, UserChannelId};
 
 #[cfg(tokio_unstable)]
 use logger::log_trace;
-use logger::{log_debug, log_error, log_info, LdkLogger, Logger};
+use logger::{log_debug, log_error, log_info, log_warn, LdkLogger, Logger};
 
 use lightning::chain::BestBlock;
 use lightning::events::bump_transaction::Wallet as LdkWallet;
@@ -1333,6 +1344,14 @@ impl Node {
 		Ok(status)
 	}
 
+	/// What the block at `height` on the chain this node verified itself says of `txid`, from the
+	/// block, checked against the header. A provider saying a transaction is gone can then be held
+	/// against the block it was seen in.
+	#[cfg(feature = "swaps")]
+	pub async fn swap_tx_in_block(&self, txid: bitcoin::Txid, height: u32) -> SwapTxInBlock {
+		self.chain_source.tx_in_our_block(txid, height).await
+	}
+
 	/// Builds a fully-signed swap funding (HTLC opening) transaction paying
 	/// `amount` to `output_script` (e.g. a P2WSH submarine-swap HTLC output) at
 	/// the feerate implied by `fee_target`, with the supplied `locktime`
@@ -1348,6 +1367,12 @@ impl Node {
 		fee_target: SwapFeeTarget, locktime: bitcoin::blockdata::locktime::absolute::LockTime,
 	) -> Result<bitcoin::Transaction, Error> {
 		self.wallet.create_swap_funding_tx(output_script, amount, fee_target.into(), locktime)
+	}
+
+	/// What a transaction from [`Node::create_swap_funding_tx`] pays in fees.
+	#[cfg(feature = "swaps")]
+	pub fn swap_tx_fee(&self, tx: &bitcoin::Transaction) -> Result<bitcoin::Amount, Error> {
+		self.wallet.swap_tx_fee(tx)
 	}
 
 	/// Lists the wallet's confirmed, unspent outputs as [`Utxo`]s for use as
@@ -1575,6 +1600,8 @@ impl Node {
 			return Err(Error::NotRunning);
 		}
 		let runtime = rt_lock.as_ref().unwrap();
+
+		self.check_chain_for_new_channel()?;
 
 		let peer_info = PeerInfo { node_id, address };
 
@@ -2178,6 +2205,78 @@ impl Node {
 		let chain_source = Arc::clone(&self.chain_source);
 		let req = req.clone();
 		runtime.block_on(async move { chain_source.serve_block_chunk(&req).await })
+	}
+
+	/// Serve one block's bundle to push to the nodes holding a lease: its
+	/// header, filter header and filter, with this node's own fee estimates
+	/// when it has them. Built from the raw source once and cached; see
+	/// [`Node::chain_serve_tip`].
+	pub fn chain_serve_block_update(
+		&self, height: u32,
+	) -> Result<chain_provider::WireBlockUpdate, Error> {
+		let rt_lock = self.runtime.read().unwrap();
+		let runtime = rt_lock.as_ref().ok_or(Error::NotRunning)?;
+
+		let chain_source = Arc::clone(&self.chain_source);
+		runtime.block_on(async move { chain_source.serve_block_update(height).await })
+	}
+
+	/// See [`ChainHost::chain_set_candidates`].
+	pub fn chain_set_candidates(&self, candidates: Vec<String>) -> Result<(), Error> {
+		self.chain_host.chain_set_candidates(candidates)
+	}
+
+	/// See [`ChainHost::chain_set_source`].
+	pub fn chain_set_source(&self, node_id: Option<String>) -> Result<(), Error> {
+		self.chain_host.chain_set_source(node_id)
+	}
+
+	/// Whether a new channel may be opened as far as the chain goes, for an app that wants to say
+	/// so before it does anything else. [`Error::ChainProviderUnavailable`] while no Pro answers:
+	/// a channel this node could not watch is a channel that can be stolen from. A node on its own
+	/// chain source has no provider to lack and is never refused. Only this, and only new channels
+	/// this node asks for: an inbound channel, an existing one, a close and an on-chain send do
+	/// not come here.
+	pub fn check_chain_for_new_channel(&self) -> Result<(), Error> {
+		match self.chain_host.chain_session_status() {
+			Some(status) if status.chain_stale => {
+				log_warn!(
+					self.logger,
+					"Refusing a new channel: no chain provider answers ({}).",
+					status.state.as_str()
+				);
+				Err(Error::ChainProviderUnavailable)
+			},
+			_ => Ok(()),
+		}
+	}
+
+	/// See [`ChainHost::chain_verify_tip_claim`]. Waits for the Pro's answer: not for a hot path.
+	pub fn chain_verify_tip_claim(
+		&self, node_id: &str, claim: chain_provider::WireBlockId,
+	) -> Result<chain_session::TipClaimCheck, Error> {
+		let rt_lock = self.runtime.read().unwrap();
+		let runtime = rt_lock.as_ref().ok_or(Error::NotRunning)?;
+		let host = Arc::clone(&self.chain_host);
+		let node_id = node_id.to_string();
+		runtime.block_on(async move { host.chain_verify_tip_claim(&node_id, claim).await })
+	}
+
+	/// See [`ChainHost::chain_session_status`].
+	pub fn chain_session_status(&self) -> Option<chain_session::ChainSessionStatus> {
+		self.chain_host.chain_session_status()
+	}
+
+	/// See [`ChainHost::chain_note_card_age`].
+	pub fn chain_note_card_age(&self, node_id: &str, age_secs: u64) {
+		self.chain_host.chain_note_card_age(node_id, age_secs)
+	}
+
+	/// See [`ChainHost::chain_receive_block_update`].
+	pub fn chain_receive_block_update(
+		&self, caller_node_id: &str, push: &chain_provider::WireBlockUpdates,
+	) -> Result<chain_provider::WireBlockUpdateAck, Error> {
+		self.chain_host.chain_receive_block_update(caller_node_id, push)
 	}
 
 	/// Serve the bundles of the blocks above `req.from` — header, filter

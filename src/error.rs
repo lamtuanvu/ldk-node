@@ -73,6 +73,9 @@ pub enum Error {
 	/// node's best chain: it is on a stale branch, and must find the fork
 	/// through the raw routes before asking again.
 	ChainServeNotOnBestChain,
+	/// A new channel was refused because no Pro node answers this node's chain questions, so it
+	/// could not watch the channel. Goes away when a chain source does.
+	ChainProviderUnavailable,
 	/// A gossip updating operation failed.
 	GossipUpdateFailed,
 	/// A gossip updating operation timed out.
@@ -185,6 +188,9 @@ impl fmt::Display for Error {
 			Self::TxSyncTimeout => write!(f, "Syncing transactions timed out."),
 			Self::ChainServeUnsupported => {
 				write!(f, "This node's chain source cannot serve chain data to other nodes.")
+			},
+			Self::ChainProviderUnavailable => {
+				write!(f, "No chain provider answers, so no new channel can be opened for now.")
 			},
 			Self::ChainServeFailed => {
 				write!(f, "Failed to answer another node's request for chain data.")

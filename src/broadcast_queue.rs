@@ -69,6 +69,12 @@ const RETRY_BACKOFF_CAP_SECS: u64 = 10 * 60;
 const SENT_MEMORY_SECS: u64 = 72 * 60 * 60;
 const SENT_MEMORY_CAP: usize = 512;
 
+/// How long, and how many, transactions this node queued and put on the network are remembered
+/// as queued, so one that later leaves the mempool goes back to the queue: bitcoind's default
+/// mempool expiry, two weeks, and a day.
+const RESENDABLE_MEMORY_SECS: u64 = 15 * 24 * 60 * 60;
+const RESENDABLE_MEMORY_CAP: usize = 512;
+
 /// How long, and how many, given-up transactions are remembered for the dead-funding reaper and
 /// for [`BroadcastQueue::list`].
 const ABANDONED_MEMORY_SECS: u64 = 30 * 24 * 60 * 60;
@@ -232,6 +238,32 @@ impl_writeable_tlv_based!(SentTx, {
 	(2, at, required),
 });
 
+/// A queued transaction this node put on the network; see [`BroadcastQueue::requeue_sent`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ResendableTx {
+	txid: Txid,
+	sent_at: u64,
+	/// The first time it left the mempool, `u64::MAX` until it does: its `max_age` runs from here,
+	/// however many times it goes back in and out.
+	first_left_at: u64,
+	/// The last time it left, 0 if not known: one that left long ago and stayed in since is not
+	/// coming and going, and starts its `max_age` over when it leaves again.
+	last_left_at: u64,
+}
+
+#[allow(clippy::drop_non_drop)]
+mod resendable_tx_ser {
+	use super::ResendableTx;
+	use lightning::impl_writeable_tlv_based;
+
+	impl_writeable_tlv_based!(ResendableTx, {
+		(0, txid, required),
+		(2, sent_at, required),
+		(4, first_left_at, (default_value, u64::MAX)),
+		(7, last_left_at, (default_value, 0)),
+	});
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct AbandonedTx {
 	txid: Txid,
@@ -253,6 +285,7 @@ impl_writeable_tlv_based!(AbandonedTx, {
 struct QueueState {
 	entries: HashMap<Txid, Entry>,
 	sent: HashMap<Txid, u64>,
+	resendable: HashMap<Txid, ResendableTx>,
 	abandoned: Vec<AbandonedTx>,
 	/// The policy an open asked for, by user channel id, until LDK asks for the funding.
 	/// In memory only: LDK does not persist a channel before it is funded.
@@ -267,6 +300,7 @@ struct QueueState {
 struct QueueSnapshot {
 	entries: Vec<Entry>,
 	sent: Vec<SentTx>,
+	resendable: Vec<ResendableTx>,
 	abandoned: Vec<AbandonedTx>,
 }
 
@@ -274,6 +308,8 @@ impl_writeable_tlv_based!(QueueSnapshot, {
 	(0, entries, required_vec),
 	(2, sent, required_vec),
 	(4, abandoned, required_vec),
+	// Odd: a node rolled back to a build without it reads the rest.
+	(5, resendable, optional_vec),
 });
 
 /// The broadcast policies registered per txid, the transactions held for a rebroadcast, and the
@@ -299,6 +335,8 @@ impl BroadcastQueue {
 				Ok(snapshot) => {
 					state.entries = snapshot.entries.into_iter().map(|e| (e.txid, e)).collect();
 					state.sent = snapshot.sent.into_iter().map(|s| (s.txid, s.at)).collect();
+					state.resendable =
+						snapshot.resendable.into_iter().map(|r| (r.txid, r)).collect();
 					state.abandoned = snapshot.abandoned;
 				},
 				Err(e) => {
@@ -331,7 +369,10 @@ impl BroadcastQueue {
 		let mut sent: Vec<SentTx> =
 			state.sent.iter().map(|(txid, at)| SentTx { txid: *txid, at: *at }).collect();
 		sent.sort_unstable_by_key(|s| s.txid);
-		let data = QueueSnapshot { entries, sent, abandoned: state.abandoned.clone() }.encode();
+		let mut resendable: Vec<ResendableTx> = state.resendable.values().cloned().collect();
+		resendable.sort_unstable_by_key(|r| r.txid);
+		let data =
+			QueueSnapshot { entries, sent, resendable, abandoned: state.abandoned.clone() }.encode();
 		self.kv_store
 			.write(
 				BROADCAST_QUEUE_PERSISTENCE_PRIMARY_NAMESPACE,
@@ -486,6 +527,18 @@ impl BroadcastQueue {
 		for txid in txids {
 			let registered = state.entries.remove(txid).is_some();
 			state.parents_known.remove(txid);
+			if registered {
+				state
+					.resendable
+					.entry(*txid)
+					.or_insert(ResendableTx {
+						txid: *txid,
+						sent_at: now,
+						first_left_at: u64::MAX,
+						last_left_at: 0,
+					})
+					.sent_at = now;
+			}
 			if registered || parents.contains(txid) {
 				state.sent.insert(*txid, now);
 				changed = true;
@@ -501,7 +554,47 @@ impl BroadcastQueue {
 			}
 		}
 		prune_sent(&mut state.sent, now);
+		prune_resendable(&mut state.resendable, now);
 		self.persist_logged(&state);
+	}
+
+	/// `txid` left the mempool. If it is one this queue held a policy for and sent, it goes back
+	/// under [`BroadcastPolicy::default`], for the caller to [`hold`](Self::hold): `true`. Its
+	/// `max_age` runs from the first time it left, so one that keeps coming and going ends. Any
+	/// other transaction — LDK's own, one registered [`BroadcastPolicy::DropOnReject`], one sent
+	/// before a build that remembers them — is not this queue's: `false`.
+	#[cfg_attr(not(feature = "cbf"), allow(dead_code))]
+	pub(crate) fn requeue_sent(&self, txid: &Txid, now: u64) -> bool {
+		let mut state = self.lock();
+		let Some(resendable) = state.resendable.get_mut(txid) else {
+			return false;
+		};
+		let last = if resendable.last_left_at == 0 {
+			resendable.first_left_at
+		} else {
+			resendable.last_left_at
+		};
+		if last != u64::MAX && now.saturating_sub(last) >= DEFAULT_BROADCAST_QUEUE_MAX_AGE_SECS {
+			// It left once, long ago, and was back: this leaving is news, not the end of that one.
+			resendable.first_left_at = now;
+		}
+		resendable.first_left_at = resendable.first_left_at.min(now);
+		resendable.last_left_at = now;
+		let registered_at = resendable.first_left_at;
+		let entry = Entry {
+			txid: *txid,
+			max_age_secs: DEFAULT_BROADCAST_QUEUE_MAX_AGE_SECS,
+			depends_on: Vec::new(),
+			registered_at,
+			tx: None,
+			attempts: 0,
+			next_attempt_at: now,
+			last_error: None,
+			last_was_verdict: false,
+		};
+		state.entries.entry(*txid).or_insert(entry);
+		self.persist_logged(&state);
+		true
 	}
 
 	/// The held transactions due for a rebroadcast at `now`, parents first: those whose backoff
@@ -674,6 +767,19 @@ fn prune_sent(sent: &mut HashMap<Txid, u64>, now: u64) {
 	}
 }
 
+fn prune_resendable(resendable: &mut HashMap<Txid, ResendableTx>, now: u64) {
+	resendable.retain(|_, r| now.saturating_sub(r.sent_at) <= RESENDABLE_MEMORY_SECS);
+	if resendable.len() > RESENDABLE_MEMORY_CAP {
+		let mut by_age: Vec<(u64, Txid)> =
+			resendable.values().map(|r| (r.sent_at, r.txid)).collect();
+		by_age.sort_unstable();
+		let excess = resendable.len() - RESENDABLE_MEMORY_CAP;
+		for (_, txid) in by_age.into_iter().take(excess) {
+			resendable.remove(&txid);
+		}
+	}
+}
+
 /// `txs` reordered so that every transaction comes after the ones of `txs` whose outputs it
 /// spends, otherwise keeping their order. A backend sends a package one transaction at a time,
 /// and a child sent before its parent is refused for a missing input. A dependency cycle cannot
@@ -756,6 +862,144 @@ mod tests {
 
 	fn store() -> Arc<DynStore> {
 		Arc::new(TestStore::new(false))
+	}
+
+	#[allow(clippy::drop_non_drop)]
+	mod older {
+		use super::{AbandonedTx, Entry, SentTx};
+		use lightning::impl_writeable_tlv_based;
+
+		/// What a build from before `resendable` persists and reads.
+		pub(super) struct OlderSnapshot {
+			pub(super) entries: Vec<Entry>,
+			pub(super) sent: Vec<SentTx>,
+			pub(super) abandoned: Vec<AbandonedTx>,
+		}
+
+		impl_writeable_tlv_based!(OlderSnapshot, {
+			(0, entries, required_vec),
+			(2, sent, required_vec),
+			(4, abandoned, required_vec),
+		});
+	}
+	use older::OlderSnapshot;
+
+	#[test]
+	fn the_resendable_memory_persists_and_either_build_reads_the_others_queue() {
+		let tx = spending(&[coin(1)], 1_000);
+		let txid = tx.compute_txid();
+		let kv_store = store();
+		let queue = queue_on(&kv_store);
+		queue.register(txid, BroadcastPolicy::default(), 1);
+		queue.mark_sent(&[txid], 1);
+
+		// A restart keeps it.
+		let queue = queue_on(&kv_store);
+		assert!(queue.requeue_sent(&txid, 2));
+		assert_eq!(queue.hold(&tx, "gone".to_string(), false, 2), Hold::Held {
+			attempts: 1,
+			next_attempt_at: 2 + RETRY_BACKOFF_BASE_SECS
+		});
+
+		// Rolled back: the older build reads what this one wrote.
+		let bytes = kv_store
+			.read(
+				BROADCAST_QUEUE_PERSISTENCE_PRIMARY_NAMESPACE,
+				BROADCAST_QUEUE_PERSISTENCE_SECONDARY_NAMESPACE,
+				BROADCAST_QUEUE_PERSISTENCE_KEY,
+			)
+			.unwrap();
+		let older = OlderSnapshot::read(&mut &bytes[..]).expect("an odd field is skipped");
+		assert_eq!(older.entries.len(), 1);
+		assert_eq!(older.sent.len(), 1);
+
+		// Upgraded: this one reads what the older build wrote, and it remembers nothing sent as
+		// queued, so such a transaction is evicted as it always was.
+		let data = OlderSnapshot { entries: Vec::new(), sent: older.sent, abandoned: older.abandoned };
+		let upgraded = store();
+		upgraded
+			.write(
+				BROADCAST_QUEUE_PERSISTENCE_PRIMARY_NAMESPACE,
+				BROADCAST_QUEUE_PERSISTENCE_SECONDARY_NAMESPACE,
+				BROADCAST_QUEUE_PERSISTENCE_KEY,
+				&data.encode(),
+			)
+			.unwrap();
+		assert!(!queue_on(&upgraded).requeue_sent(&txid, 3));
+	}
+
+	#[test]
+	fn a_transaction_that_keeps_leaving_the_mempool_ages_from_the_first_time() {
+		let tx = spending(&[coin(1)], 1_000);
+		let txid = tx.compute_txid();
+		let queue = queue_on(&store());
+		assert!(!queue.requeue_sent(&txid, 1), "never queued: not this queue's");
+		queue.register(txid, BroadcastPolicy::default(), 1);
+		assert!(!queue.requeue_sent(&txid, 1), "registered, not sent yet");
+		queue.mark_sent(&[txid], 1);
+
+		assert!(queue.requeue_sent(&txid, 100));
+		assert!(matches!(queue.hold(&tx, "gone".to_string(), false, 100), Hold::Held { .. }));
+		queue.mark_sent(&[txid], 200);
+
+		// Coming and going ends: its time runs from the first time it left.
+		let again = 100 + DEFAULT_BROADCAST_QUEUE_MAX_AGE_SECS / 2;
+		assert!(queue.requeue_sent(&txid, again));
+		let later = 100 + DEFAULT_BROADCAST_QUEUE_MAX_AGE_SECS;
+		assert_eq!(queue.hold(&tx, "gone".to_string(), false, later), Hold::Expired);
+	}
+
+	/// It left once, went back, and stayed for days: when it leaves again it gets its time, and is
+	/// not given up at once with other mempools likely still holding it.
+	#[test]
+	fn a_transaction_leaving_long_after_it_last_left_is_not_given_up_at_once() {
+		let tx = spending(&[coin(1)], 1_000);
+		let txid = tx.compute_txid();
+		let queue = queue_on(&store());
+		queue.register(txid, BroadcastPolicy::default(), 1);
+		queue.mark_sent(&[txid], 1);
+		assert!(queue.requeue_sent(&txid, 100));
+		assert!(matches!(queue.hold(&tx, "gone".to_string(), false, 100), Hold::Held { .. }));
+		queue.mark_sent(&[txid], 200);
+
+		let days_later = 100 + 2 * DEFAULT_BROADCAST_QUEUE_MAX_AGE_SECS;
+		assert!(queue.requeue_sent(&txid, days_later));
+		assert!(
+			matches!(queue.hold(&tx, "gone".to_string(), false, days_later), Hold::Held { .. }),
+			"it gets its time"
+		);
+	}
+
+	/// The field may be absent: a build on the LSP wrote it only once a transaction had left.
+	#[test]
+	fn a_resendable_entry_with_no_first_left_time_has_not_left() {
+		#[allow(clippy::drop_non_drop)]
+		mod earlier {
+			use lightning::impl_writeable_tlv_based;
+
+			pub(super) struct Earlier {
+				pub(super) txid: bitcoin::Txid,
+				pub(super) sent_at: u64,
+			}
+
+			impl_writeable_tlv_based!(Earlier, {
+				(0, txid, required),
+				(2, sent_at, required),
+			});
+		}
+		let txid = coin(1).txid;
+		let bytes = earlier::Earlier { txid, sent_at: 7 }.encode();
+		let read = ResendableTx::read(&mut &bytes[..]).expect("reads");
+		assert_eq!(read, ResendableTx { txid, sent_at: 7, first_left_at: u64::MAX, last_left_at: 0 });
+	}
+
+	#[test]
+	fn the_policy_drop_on_reject_is_not_remembered_as_queued() {
+		let txid = spending(&[coin(1)], 1_000).compute_txid();
+		let queue = queue_on(&store());
+		queue.register(txid, BroadcastPolicy::DropOnReject, 1);
+		queue.mark_sent(&[txid], 1);
+		assert!(!queue.requeue_sent(&txid, 2));
 	}
 
 	fn never_confirmed(_: &Txid) -> bool {

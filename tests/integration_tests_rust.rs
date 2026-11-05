@@ -587,6 +587,41 @@ fn onchain_send_all_retains_reserve() {
 		.contains(&node_a.list_balances().spendable_onchain_balance_sats));
 }
 
+/// A swap's opening reserves its inputs as it is built, so they are already gone from the unspent
+/// view when the app asks what it paid. Every swap-in failed on that, on every tick.
+#[cfg(feature = "swaps")]
+#[test]
+fn a_swap_funding_tells_its_fee_though_its_inputs_are_reserved() {
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let chain_source = TestChainSource::Esplora(&electrsd);
+	let node = setup_node(&chain_source, random_config(true), None);
+	let addr = node.onchain_payment().new_address().unwrap();
+	premine_and_distribute_funds(
+		&bitcoind.client,
+		&electrsd.client,
+		vec![addr],
+		Amount::from_sat(1_000_000),
+	);
+	node.sync_wallets().unwrap();
+
+	let script = node.onchain_payment().new_address().unwrap().script_pubkey();
+	let tx = node
+		.create_swap_funding_tx(
+			script,
+			Amount::from_sat(100_000),
+			ldk_node::SwapFeeTarget::Funding,
+			bitcoin::absolute::LockTime::ZERO,
+		)
+		.unwrap();
+	assert!(
+		node.swap_list_confirmed_utxos().unwrap().is_empty(),
+		"reserved as soon as it is built"
+	);
+	let out: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
+	assert_eq!(node.swap_tx_fee(&tx).unwrap().to_sat(), 1_000_000 - out);
+	node.stop().unwrap();
+}
+
 #[test]
 fn onchain_wallet_recovery() {
 	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();

@@ -38,6 +38,7 @@ use crate::chain::seam::{
 	FeeUpdate, MempoolAction, MempoolAnswer, MempoolQuery, PackageOutcomes, ScriptHistoryAction,
 	TxBroadcastOutcome, ADAPTER_BUDGET_MARGIN, MAX_BROADCAST_PACKAGE_TXS,
 };
+use crate::chain::session::FeeReference;
 use crate::chain::wire_convert::{
 	check_version, mempool_query_to_wire, tx_to_wire, wire_to_mempool_answer, wire_update_to_bdk,
 };
@@ -126,7 +127,7 @@ impl DependentChainAdapter {
 			ChainActionError::from(e)
 		})?;
 
-		fee_update_from_wire(&estimates, &self.logger)
+		fee_update_from_wire(&estimates, &self.provider.fee_reference(), &self.logger)
 	}
 }
 
@@ -142,19 +143,122 @@ pub(crate) const MAX_PROVIDER_FEE_SAT_PER_KWU: u64 = 250_000;
 /// [`OnchainFeeEstimator`]: crate::fee_estimator::OnchainFeeEstimator
 pub(crate) const MIN_PROVIDER_FEE_SAT_PER_KWU: u64 = FEERATE_FLOOR_SATS_PER_KW as u64;
 
-/// What a provider's rate, in bounds, sets `target` to. The two targets a peer's `update_fee` is
-/// held to are not the provider's to raise: below them LDK force-closes the channel, so one number
-/// from a lying provider would close every channel this node has. Whatever it says, they stay at
-/// the floor, which is also what a node with no estimate at all uses, so a peer's commitment fee
-/// is taken down to the relay floor. Anchors are what pays for a commitment that is too low then.
-fn provider_rate_for(target: ConfirmationTarget, bounded_sat_per_kwu: u64) -> u64 {
+/// 1 sat/vB in sat/kwu.
+const SAT_PER_VB: u64 = 250;
+
+/// What a provider can make this node pay on its own say, on what spends the wallet's coins: a
+/// channel open at this costs about 20,000 sat in fees where the outer bound costs about 200,000.
+/// An honest Pro in a spike above it costs a delay on something that can wait.
+pub(crate) const SPEND_CAP_ON_ITS_OWN_WORD_SAT_PER_KWU: u64 = 100 * SAT_PER_VB;
+
+/// With a reference for what fees are, a spend pays at most this many times it...
+pub(crate) const SPEND_CAP_RATIO: u64 = 4;
+/// ...and may always pay this, as a reference can sit low on a quiet stretch.
+pub(crate) const SPEND_CAP_LEAST_SAT_PER_KWU: u64 = 10 * SAT_PER_VB;
+
+/// An urgent claim is not capped as hard: paying too much to take what is at stake is the lesser
+/// loss, and a spike is when it matters. On a provider's own word, at most this...
+pub(crate) const URGENT_CAP_ON_ITS_OWN_WORD_SAT_PER_KWU: u64 = 250 * SAT_PER_VB;
+/// ...with a reference, up to this many times it.
+pub(crate) const URGENT_CAP_RATIO: u64 = 16;
+
+/// The least an urgent claim is built at when nothing says otherwise. A penalty costs about 2,500
+/// sat at this, and at the relay floor it would sit while what it races goes first. LDK raises a
+/// claim as blocks pass; this sets where it starts.
+pub(crate) const URGENT_FLOOR_ON_ITS_OWN_WORD_SAT_PER_KWU: u64 = 5 * SAT_PER_VB;
+/// With a reference, the urgent floor is half of it, if that is more...
+pub(crate) const URGENT_FLOOR_RATIO: u64 = 2;
+/// ...up to this, so a second stranger cannot set this node's claims high by itself.
+pub(crate) const URGENT_FLOOR_MOST_SAT_PER_KWU: u64 = 100 * SAT_PER_VB;
+
+/// What a second Pro says of `target`. A word: anyone on the list can say anything.
+fn witness_rate(target: ConfirmationTarget, reference: &FeeReference) -> Option<u64> {
+	reference.witness.as_ref().and_then(|fees| {
+		fees.targets
+			.iter()
+			.find(|entry| conf_target_from_wire_name(&entry.target) == Some(target))
+			.map(|entry| entry.sat_per_kwu)
+	})
+}
+
+/// The cap on what spends the wallet's coins and can wait. **Only blocks lift it above
+/// [`SPEND_CAP_ON_ITS_OWN_WORD_SAT_PER_KWU`]:** the rate of blocks this node read itself took real
+/// proof of work to move, while a witness is a word, and with the Pro in the seat it would be two
+/// free keys lifting a channel open to the outer bound. A witness can only hold the cap down, which
+/// costs a delay on something that can wait.
+fn spend_cap(witness: Option<u64>, local: Option<u64>) -> u64 {
+	let of = |rate: u64| rate.saturating_mul(SPEND_CAP_RATIO).max(SPEND_CAP_LEAST_SAT_PER_KWU);
+	let on_word = witness.map_or(SPEND_CAP_ON_ITS_OWN_WORD_SAT_PER_KWU, |rate| {
+		of(rate).min(SPEND_CAP_ON_ITS_OWN_WORD_SAT_PER_KWU)
+	});
+	local.map_or(on_word, |rate| of(rate).max(on_word.min(of(rate))))
+}
+
+/// The floor and the cap on an urgent claim. **The errors do not cost the same, so nothing here can
+/// be talked down:** a claim that does not confirm before its deadline can lose the whole channel,
+/// and a claim overpaid loses part of what it is rescuing, once, and only on a node that has a claim
+/// at all. So a reference moves the floor and the cap up only, never below what holds on the
+/// provider's word alone: a low witness cannot sink a penalty in a spike, with too few blocks read
+/// here for this node to know better. A high one costs at worst the outer bound, on a claim.
+fn urgent_bounds(seen: Option<u64>) -> (u64, u64) {
+	let floor = seen.map_or(URGENT_FLOOR_ON_ITS_OWN_WORD_SAT_PER_KWU, |rate| {
+		(rate / URGENT_FLOOR_RATIO)
+			.clamp(URGENT_FLOOR_ON_ITS_OWN_WORD_SAT_PER_KWU, URGENT_FLOOR_MOST_SAT_PER_KWU)
+	});
+	let cap = seen.map_or(URGENT_CAP_ON_ITS_OWN_WORD_SAT_PER_KWU, |rate| {
+		rate.saturating_mul(URGENT_CAP_RATIO).max(URGENT_CAP_ON_ITS_OWN_WORD_SAT_PER_KWU)
+	});
+	(floor, cap)
+}
+
+/// What a provider's rate, in bounds, sets `target` to.
+///
+/// The two targets a peer's `update_fee` is held to are not the provider's to raise: below them LDK
+/// force-closes the channel, so one number from a lying provider would close every channel this
+/// node has. Whatever it says, they stay at the floor, which is also what a node with no estimate
+/// at all uses, so a peer's commitment fee is taken down to the relay floor. Anchors are what pays
+/// for a commitment that is too low then.
+///
+/// The rest is the provider's word within what it cannot abuse. An out-of-bounds number has already
+/// refused the whole answer: this is about numbers that pass. Everything that spends is capped, so
+/// a stranger cannot burn funds on an open; an urgent claim also has a floor, so a stranger cannot
+/// leave a penalty at 1 sat/vB. [`FeeReference`] tightens both. With no reference, as on a Dependent
+/// node, the fixed bounds are all there is.
+pub(crate) fn provider_rate_for(
+	target: ConfirmationTarget, bounded_sat_per_kwu: u64, reference: &FeeReference,
+) -> u64 {
+	let witness = witness_rate(target, reference);
+	let local = reference.local_sat_per_kwu;
 	match target {
 		ConfirmationTarget::Lightning(
 			LdkConfirmationTarget::MinAllowedAnchorChannelRemoteFee
 			| LdkConfirmationTarget::MinAllowedNonAnchorChannelRemoteFee,
 		) => FEERATE_FLOOR_SATS_PER_KW as u64,
-		_ => bounded_sat_per_kwu,
+		ConfirmationTarget::Lightning(LdkConfirmationTarget::MaximumFeeEstimate) => {
+			bounded_sat_per_kwu
+		},
+		ConfirmationTarget::Lightning(LdkConfirmationTarget::UrgentOnChainSweep) => {
+			let (floor, cap) = urgent_bounds(witness.max(local));
+			bounded_sat_per_kwu.clamp(floor.min(cap), cap)
+		},
+		_ => bounded_sat_per_kwu.min(spend_cap(witness, local)),
 	}
+}
+
+/// The rates for which [`fee_update_from_wire`] would refuse `estimates`, for telling of it. A
+/// target this build does not know is skipped there, so it is not named here.
+pub(crate) fn fees_out_of_bounds(estimates: &WireFeeEstimates) -> Option<String> {
+	let outside: Vec<String> = estimates
+		.targets
+		.iter()
+		.filter(|entry| {
+			conf_target_from_wire_name(&entry.target).is_some()
+				&& !(MIN_PROVIDER_FEE_SAT_PER_KWU..=MAX_PROVIDER_FEE_SAT_PER_KWU)
+					.contains(&entry.sat_per_kwu)
+		})
+		.map(|entry| format!("{} {}", entry.target, entry.sat_per_kwu))
+		.collect();
+	(!outside.is_empty()).then(|| outside.join(", "))
 }
 
 /// A provider's fee estimates as a fee-cache update: checked, and re-floored
@@ -162,7 +266,7 @@ fn provider_rate_for(target: ConfirmationTarget, bounded_sat_per_kwu: u64) -> u6
 /// for, or carried by a block bundle. One known target out of bounds refuses the whole answer, so
 /// nothing of it is applied and the fee chain falls through to its next adapter.
 pub(crate) fn fee_update_from_wire(
-	estimates: &WireFeeEstimates, logger: &Logger,
+	estimates: &WireFeeEstimates, reference: &FeeReference, logger: &Logger,
 ) -> ActionResult<FeeUpdate> {
 	check_version(estimates.version).map_err(|e| {
 		log_error!(logger, "Rejecting fee rate estimates from provider: {}", e);
@@ -200,7 +304,8 @@ pub(crate) fn fee_update_from_wire(
 		// The serving node has already applied its own per-target policy;
 		// the post-estimation adjustments are this node's own floors and
 		// caps, so they still belong here.
-		let fee_rate = FeeRate::from_sat_per_kwu(provider_rate_for(target, entry.sat_per_kwu));
+		let fee_rate =
+			FeeRate::from_sat_per_kwu(provider_rate_for(target, entry.sat_per_kwu, reference));
 		new_fee_rate_cache.insert(target, apply_post_estimation_adjustments(target, fee_rate));
 	}
 
@@ -240,6 +345,12 @@ impl BroadcastAction for DependentChainAdapter {
 
 	fn budget(&self) -> Option<Duration> {
 		Some(DEPENDENT_BROADCAST_BUDGET)
+	}
+
+	/// Not with nobody to ask: what the drain holds waits in the queue, where a provider arriving
+	/// later finds it.
+	async fn ready(&self) -> bool {
+		self.provider.can_broadcast()
 	}
 
 	/// One request per transaction, since the wire carries one.
@@ -443,6 +554,10 @@ impl MempoolAction for DependentChainAdapter {
 		})?;
 		Ok(Anchored { value: answer, tip: Some(tip) })
 	}
+
+	async fn second_opinion(&self, txs: &[Transaction]) -> Option<std::collections::HashSet<bitcoin::Txid>> {
+		self.provider.second_opinion_on_own_txs(txs).await.map(|opinion| opinion.held)
+	}
 }
 
 /// The wide scan, run on the provider: the same route the Dependent engine's
@@ -517,7 +632,7 @@ mod tests {
 	}
 
 	fn fee_update(entries: &[(&str, u64)]) -> ActionResult<FeeUpdate> {
-		fee_update_from_wire(&wire_fees(entries), &Logger::new_log_facade())
+		fee_update_from_wire(&wire_fees(entries), &Default::default(), &Logger::new_log_facade())
 	}
 
 	fn applied(entries: &[(&str, u64)]) -> HashMap<ConfirmationTarget, FeeRate> {
@@ -548,10 +663,113 @@ mod tests {
 	}
 
 	#[test]
-	fn a_provider_fee_at_the_bounds_is_taken_as_it_is() {
+	fn a_provider_fee_at_the_bounds_is_not_refused_and_does_not_get_to_burn_funds() {
 		let cache = applied(&[("onchain_payment", 253), ("channel_funding", 250_000)]);
 		assert_eq!(cache[&ConfirmationTarget::OnchainPayment].to_sat_per_kwu(), 253);
-		assert_eq!(cache[&ConfirmationTarget::ChannelFunding].to_sat_per_kwu(), 250_000);
+		assert_eq!(
+			cache[&ConfirmationTarget::ChannelFunding].to_sat_per_kwu(),
+			SPEND_CAP_ON_ITS_OWN_WORD_SAT_PER_KWU
+		);
+	}
+
+	fn urgent() -> ConfirmationTarget {
+		ConfirmationTarget::Lightning(LdkConfirmationTarget::UrgentOnChainSweep)
+	}
+
+	fn funding() -> ConfirmationTarget {
+		ConfirmationTarget::ChannelFunding
+	}
+
+	fn witness_says(sat_per_kwu: u64) -> FeeReference {
+		let names = ["channel_funding", "ldk.urgent_onchain_sweep"];
+		let entries: Vec<(&str, u64)> = names.iter().map(|name| (*name, sat_per_kwu)).collect();
+		FeeReference { witness: Some(wire_fees(&entries)), local_sat_per_kwu: None }
+	}
+
+	/// H4: a channel open costs about 200 vB. On a stranger's word alone, at most 100 sat/vB.
+	#[test]
+	fn on_its_own_word_a_provider_burns_tens_of_thousands_at_most_not_hundreds() {
+		let none = FeeReference::default();
+		let open_vb: u64 = 200;
+		let burn = provider_rate_for(funding(), 250_000, &none) / SAT_PER_VB * open_vb;
+		assert_eq!(burn, 20_000);
+		// Whatever is under the cap it may say.
+		assert_eq!(provider_rate_for(funding(), 1_000, &none), 1_000);
+		assert_eq!(provider_rate_for(ConfirmationTarget::OnchainPayment, 250_000, &none), 25_000);
+	}
+
+	/// H4: at 1 sat/vB a penalty sits while what it races goes first.
+	#[test]
+	fn on_its_own_word_a_provider_cannot_leave_an_urgent_claim_at_the_relay_floor() {
+		let none = FeeReference::default();
+		assert_eq!(provider_rate_for(urgent(), 253, &none), 5 * SAT_PER_VB);
+		assert_eq!(provider_rate_for(urgent(), 10_000, &none), 10_000);
+		assert_eq!(provider_rate_for(urgent(), 250_000, &none), 250 * SAT_PER_VB);
+		let cache = applied(&[("ldk.urgent_onchain_sweep", 253)]);
+		assert_eq!(cache[&urgent()].to_sat_per_kwu(), 5 * SAT_PER_VB);
+	}
+
+	#[test]
+	fn a_reference_holds_both_ends_to_what_fees_are_now() {
+		// A quiet market, 4 sat/vB.
+		let quiet = witness_says(1_000);
+		assert_eq!(provider_rate_for(funding(), 250_000, &quiet), 10 * SAT_PER_VB + 1_500);
+		assert_eq!(provider_rate_for(urgent(), 253, &quiet), URGENT_FLOOR_ON_ITS_OWN_WORD_SAT_PER_KWU);
+		// A spike a witness speaks of, 300 sat/vB: urgent follows it. Spending does not on a word.
+		let spike = witness_says(75_000);
+		assert_eq!(provider_rate_for(urgent(), 250_000, &spike), 250_000);
+		assert_eq!(provider_rate_for(funding(), 250_000, &spike), SPEND_CAP_ON_ITS_OWN_WORD_SAT_PER_KWU);
+		// Blocks this node read itself saying so, it does.
+		let blocks = FeeReference { witness: None, local_sat_per_kwu: Some(75_000) };
+		assert_eq!(provider_rate_for(funding(), 250_000, &blocks), 250_000);
+		// Below, the provider's number stands: a cap and a floor, no more.
+		assert_eq!(provider_rate_for(funding(), 2_000, &quiet), 2_000);
+	}
+
+	#[test]
+	fn the_blocks_this_node_read_itself_count_and_the_higher_word_wins() {
+		let local = FeeReference { witness: None, local_sat_per_kwu: Some(2_000) };
+		assert_eq!(provider_rate_for(funding(), 250_000, &local), 8_000);
+		assert_eq!(provider_rate_for(urgent(), 253, &local), URGENT_FLOOR_ON_ITS_OWN_WORD_SAT_PER_KWU);
+		let both = FeeReference { local_sat_per_kwu: Some(2_000), ..witness_says(1_000) };
+		assert_eq!(provider_rate_for(funding(), 250_000, &both), 8_000);
+	}
+
+	/// The reference may be a stranger too: it can move these, within limits of their own.
+	#[test]
+	fn a_lying_reference_cannot_set_a_claim_high_or_a_spend_below_a_working_rate() {
+		let high = witness_says(250_000);
+		assert_eq!(provider_rate_for(urgent(), 253, &high), URGENT_FLOOR_MOST_SAT_PER_KWU);
+		let low = witness_says(253);
+		assert_eq!(provider_rate_for(funding(), 10_000, &low), SPEND_CAP_LEAST_SAT_PER_KWU);
+	}
+
+	/// H4. The Pro in the seat and one sybil witness saying 62,500 sat/kwu must not lift a channel
+	/// open to the outer bound: on words alone it stays at what one word gets.
+	#[test]
+	fn a_witness_cannot_lift_the_spend_cap() {
+		let high = witness_says(250_000);
+		assert_eq!(provider_rate_for(funding(), 250_000, &high), SPEND_CAP_ON_ITS_OWN_WORD_SAT_PER_KWU);
+		let exactly = witness_says(62_500);
+		assert_eq!(provider_rate_for(funding(), 250_000, &exactly), SPEND_CAP_ON_ITS_OWN_WORD_SAT_PER_KWU);
+	}
+
+	/// H4, the other way. A low witness and a low Pro, in a spike, with no blocks read here: an urgent
+	/// claim does not go below what holds on no reference at all, at either end.
+	#[test]
+	fn a_low_witness_cannot_sink_an_urgent_claim() {
+		let low = witness_says(253);
+		assert_eq!(provider_rate_for(urgent(), 253, &low), URGENT_FLOOR_ON_ITS_OWN_WORD_SAT_PER_KWU);
+		assert_eq!(provider_rate_for(urgent(), 62_500, &low), URGENT_CAP_ON_ITS_OWN_WORD_SAT_PER_KWU);
+	}
+
+	/// The fix for the force-close route holds whatever a reference says.
+	#[test]
+	fn no_reference_raises_what_this_node_demands_of_its_peers() {
+		let anchors = ConfirmationTarget::Lightning(
+			LdkConfirmationTarget::MinAllowedAnchorChannelRemoteFee,
+		);
+		assert_eq!(provider_rate_for(anchors, 250_000, &witness_says(250_000)), 253);
 	}
 
 	/// A peer's `update_fee` below these is a force close (`check_remote_fee`), so a provider's
@@ -572,6 +790,27 @@ mod tests {
 	fn an_unknown_target_out_of_bounds_costs_nothing() {
 		let cache = applied(&[("onchain_payment", 1_000), ("from_the_future", u64::MAX)]);
 		assert_eq!(cache.len(), 1);
+	}
+
+	/// What the session tells of and what the update refuses are one judgement: a told rejection
+	/// that nothing rejected would blame a newer Pro for a target this build does not know.
+	#[test]
+	fn what_is_told_as_rejected_is_exactly_what_the_update_rejects() {
+		let answers: [&[(&str, u64)]; 6] = [
+			&[("onchain_payment", 1_000)],
+			&[("onchain_payment", 253), ("channel_funding", 250_000)],
+			&[("onchain_payment", 252)],
+			&[("onchain_payment", 1_000), ("ldk.urgent_onchain_sweep", 250_001)],
+			&[("onchain_payment", 1_000), ("from_the_future", u64::MAX)],
+			&[("ldk.min_allowed_anchor_channel_remote_fee", u64::MAX)],
+		];
+		for answer in answers {
+			assert_eq!(
+				fees_out_of_bounds(&wire_fees(answer)).is_some(),
+				fee_update(answer).is_err(),
+				"{answer:?}"
+			);
+		}
 	}
 
 	/// A provider built against the port as it shipped: it implements the

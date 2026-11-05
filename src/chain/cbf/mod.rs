@@ -479,6 +479,17 @@ impl WatchLedger {
 		});
 	}
 
+	/// A block read again below the tip: what it holds of the watched is confirmed there, and the
+	/// tip stays where it is.
+	pub(crate) fn note_scanned(&self, block: BlockId, txids: impl IntoIterator<Item = Txid>) {
+		let mut inner = self.lock();
+		for txid in txids {
+			if inner.is_watched(&txid) {
+				inner.confirmed.insert(txid, block);
+			}
+		}
+	}
+
 	/// The applicator disconnected the block `header` at `height`: nothing seen at or above
 	/// `height` is confirmed any more, and if the applied tip had reached `height` it is the
 	/// header's parent now.

@@ -5,7 +5,8 @@
 // http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
 // accordance with one or both of these licenses.
 
-//! A hybrid node's [`FilterSource`] that pulls one bundle per new block from its Pro node.
+//! A hybrid node's [`FilterSource`] that takes one bundle per new block from its Pro node,
+//! pushed under a lease or pulled.
 //!
 //! Over the raw routes alone, a new block costs the Pro node three questions after the tip
 //! poll that noticed it: its headers, filter headers and filters. A `chain.since` answers all
@@ -14,7 +15,8 @@
 //! ```text
 //!   Pro node                                    this node
 //!   ────────                                    ─────────
-//!   chain.tip     ◄──────────────────────────── tip(): every poll, unchanged
+//!   chain.tip     ◄──────────────────────────── tip(): every poll, on delivery pull
+//!   chain.block_update ───────────────────────► ingest(): on delivery push; wakes the loop
 //!   chain.since   ◄──────────────────────────── headers(): the block above the verified chain
 //!                                               is not held, so pull from the verified tip
 //!                 ──── bundles, `more`, fee ──► held until the filters are served
@@ -27,7 +29,22 @@
 //! verified exactly as raw data is. The Pro keeps nothing per node; the node's verified chain
 //! is the only cursor.
 //!
-//! * `tip()`: always the inner source. The poll interval is the sync loop's.
+//! The Pro can push the same bundles ([`BundleFilterSource::ingest`]); the provider session
+//! ([`crate::chain::session`]) decides that from who holds a lease, and says whether what was
+//! pushed may be trusted:
+//!
+//! * **Delivery pull:** `tip()` is always the inner source, on the sync loop's 30 s poll. That
+//!   poll is 96% of what a follower costs its Pro.
+//! * **Delivery push, session active:** `tip()` is answered from memory and goes on no wire. The
+//!   tip poll stops being what drives the loop; a push wakes it. The liveness check is the
+//!   session's probe after 10 min with no push, and a reply to that refreshes what is known. If
+//!   the driver stopped refreshing, [`BUNDLE_PUSHED_TIP_MAX_AGE`] ends the trust by itself, and
+//!   the loop polls again.
+//! * **Push, session suspect or worse:** as pull, so an outage shows as a stalled sync at once.
+//!
+//! Everything else below is the same on both:
+//!
+//! * `tip()`: as above.
 //! * `headers()`: what is held, a prefix of the span when that is all there is. Not held, and
 //!   the span continues the verified chain: one `since` from the verified tip. A reply that
 //!   stopped short (`more`) needs no bookkeeping: once its bundles are used, the next block is
@@ -53,19 +70,28 @@
 //! `the_largest_filter_a_block_can_carry_fits_one_reply` in `raw_serve`. Pieces exist so a
 //! bound changing — a smaller transport cap, say — slows a node down instead of stopping it.
 
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 
 use bdk_chain::BlockId;
 
-use bitcoin::bip158::BlockFilter;
+use bitcoin::bip158::{BlockFilter, FilterHeader};
 use bitcoin::block::Header;
-use bitcoin::{Block, BlockHash};
+use bitcoin::{Block, BlockHash, ScriptBuf};
+
+use tokio::sync::Notify;
 
 use crate::chain::cbf::source::{FilterHeaders, FilterSource, IndexedFilter, SourceError};
-use crate::chain::cbf::source_sync::{lock_headers, SharedHeaderChain};
+use crate::chain::cbf::fee::BlockFeeCache;
+use crate::chain::cbf::source_sync::{
+	lock_headers, verify_block, SharedHeaderChain, SyncObserver, WatchedScripts,
+};
+use crate::chain::session::cross_check::{HeldChain, HeldFilters};
+use crate::chain::session::{PushSink, NOT_ON_BEST_CHAIN};
 use crate::chain::provider::{
 	BundleTransport, ChainProviderError, WireBlockUpdates, WireFeeEstimates, WireSinceRequest,
 	CHAIN_WIRE_VERSION, FEE_ESTIMATES_MAX_AGE_SECS, MAX_UPDATES_PER_SINCE,
@@ -88,16 +114,17 @@ pub(crate) const BUNDLE_UNSUPPORTED_RETRY_AFTER: Duration = Duration::from_secs(
 /// Fee estimates a bundle carried older than this are not used.
 pub(crate) const BUNDLE_FEE_MAX_AGE: Duration = Duration::from_secs(FEE_ESTIMATES_MAX_AGE_SECS);
 
+/// With delivery push, a tip heard no later than this ago is answered from memory. Just over the
+/// session's 10 min probe, whose answer refreshes it: this only comes into play if the driver
+/// stopped, and then the node falls back to asking rather than trust silence.
+pub(crate) const BUNDLE_PUSHED_TIP_MAX_AGE: Duration = Duration::from_secs(11 * 60);
+
 /// Bound on a `since`: above the app's 45 s serve timeout.
 const SINCE_TIMEOUT: Duration = Duration::from_secs(50);
 
 /// The largest filter a pull assembles from pieces: well past what any block can carry, so a
 /// Pro cannot make this node hold more by naming a larger total.
 const MAX_ASSEMBLED_FILTER_BYTES: u32 = 8 * 1024 * 1024;
-
-/// The reason a Pro gives for a `from` off its best chain. Not a failure: the reorg handling
-/// over the raw routes takes it from there, and the next pull continues from the fork.
-const NOT_ON_BEST_CHAIN: &str = "not on best chain";
 
 /// The knobs of a [`BundleFilterSource`]; shortened in the tests.
 #[derive(Clone, Debug)]
@@ -106,6 +133,7 @@ pub(crate) struct BundleTuning {
 	pub(crate) unsupported_retry_after: Duration,
 	pub(crate) since_timeout: Duration,
 	pub(crate) fee_max_age: Duration,
+	pub(crate) pushed_tip_max_age: Duration,
 }
 
 impl Default for BundleTuning {
@@ -115,6 +143,7 @@ impl Default for BundleTuning {
 			unsupported_retry_after: BUNDLE_UNSUPPORTED_RETRY_AFTER,
 			since_timeout: SINCE_TIMEOUT,
 			fee_max_age: BUNDLE_FEE_MAX_AGE,
+			pushed_tip_max_age: BUNDLE_PUSHED_TIP_MAX_AGE,
 		}
 	}
 }
@@ -129,12 +158,60 @@ struct BundleState {
 	retry_at: Option<Instant>,
 	/// The newest fee estimates a bundle carried, and when.
 	fee: Option<(WireFeeEstimates, Instant)>,
+	/// The Pro's best block, as it last said in a push, a grant or a probe's answer; and when.
+	heard_tip: Option<(BlockId, Instant)>,
 }
 
 impl BundleState {
 	fn get(&self, height: u32) -> Option<&Arc<BlockBundle>> {
 		let base = self.held.first()?.height;
 		self.held.get(height.checked_sub(base)? as usize)
+	}
+
+	/// Fits a pushed `run` — consecutive, linked, non-empty — onto what is held. One that leaves
+	/// a gap replaces it: the next pull fills from the verified tip. One on another branch clears
+	/// it: the sync loop's reorg handling over the inner source decides.
+	fn merge_pushed(&mut self, run: Vec<Arc<BlockBundle>>) {
+		let (Some(first), Some(last)) = (run.first(), run.last()) else {
+			return;
+		};
+		let (Some(base), Some(top)) = (self.held.first(), self.held.last()) else {
+			self.held = run;
+			self.trim();
+			return;
+		};
+		let (lo, hi) = (base.height, top.height);
+		if first.height > hi + 1 || last.height + 1 < lo {
+			self.held = run;
+			self.trim();
+			return;
+		}
+		let agrees = run.iter().all(|b| self.get(b.height).map_or(true, |held| held.hash == b.hash))
+			&& (first.height != hi + 1 || first.header.prev_blockhash == top.hash)
+			&& (last.height + 1 != lo || base.header.prev_blockhash == last.hash);
+		if !agrees {
+			self.held.clear();
+			return;
+		}
+		let new_lo = lo.min(first.height);
+		let new_hi = hi.max(last.height);
+		let mut joined = Vec::with_capacity((new_hi - new_lo + 1) as usize);
+		for height in new_lo..=new_hi {
+			let bundle = match self.get(height) {
+				Some(held) => Arc::clone(held),
+				None => Arc::clone(&run[(height - first.height) as usize]),
+			};
+			joined.push(bundle);
+		}
+		self.held = joined;
+		self.trim();
+	}
+
+	/// Keeps the newest day of blocks: what one reply may carry, unlike pushes, which arrive one
+	/// by one with nothing to stop them piling up while the loop is busy.
+	fn trim(&mut self) {
+		let excess = self.held.len().saturating_sub(MAX_UPDATES_PER_SINCE as usize);
+		self.held.drain(..excess);
 	}
 }
 
@@ -144,21 +221,76 @@ pub(crate) struct BundleFilterSource {
 	transport: Arc<dyn BundleTransport>,
 	/// The sync loop's verified header chain: where the node is.
 	chain: SharedHeaderChain,
+	/// Cuts the sync loop's waits short: a push, or a new provider.
+	wake: Arc<Notify>,
 	state: Mutex<BundleState>,
+	/// Whether the session says delivery is push and the Pro is healthy; see the module docs.
+	push_trusted: AtomicBool,
 	tuning: BundleTuning,
 	logger: Arc<Logger>,
+	/// Who hears how the sync loop fares; handed to it at launch.
+	observer: Mutex<Option<Weak<dyn SyncObserver>>>,
+	/// The blocks handed over to be read again, newest last, so none is read twice.
+	scanned: Mutex<VecDeque<BlockHash>>,
+	/// The fee rates of the blocks this node read itself.
+	block_fees: Mutex<Option<BlockFeeCache>>,
+	/// What this node watches, for a cross-check to match against; handed over at launch.
+	watched: Mutex<Option<Arc<dyn WatchedScripts>>>,
 }
+
+/// How many read blocks are remembered: more than a window of them per check.
+const SCANNED_REMEMBERED: usize = 512;
+
+/// How many read blocks may wait for the sync loop at once: a small device holds few whole blocks,
+/// and a check that finds no room goes on next time.
+const SCANS_WAITING_AT_MOST: usize = 2;
+
+/// How few samples of its own the node takes for a rate worth holding a provider to.
+const LOCAL_FEE_MIN_SAMPLES: usize = 6;
 
 impl BundleFilterSource {
 	pub(crate) fn new(
 		inner: Arc<dyn FilterSource>, transport: Arc<dyn BundleTransport>,
-		chain: SharedHeaderChain, tuning: BundleTuning, logger: Arc<Logger>,
+		chain: SharedHeaderChain, wake: Arc<Notify>, tuning: BundleTuning, logger: Arc<Logger>,
 	) -> Self {
-		Self { inner, transport, chain, state: Mutex::new(BundleState::default()), tuning, logger }
+		Self {
+			inner,
+			transport,
+			chain,
+			wake,
+			state: Mutex::new(BundleState::default()),
+			push_trusted: AtomicBool::new(false),
+			tuning,
+			logger,
+			observer: Mutex::new(None),
+			scanned: Mutex::new(VecDeque::new()),
+			block_fees: Mutex::new(None),
+			watched: Mutex::new(None),
+		}
+	}
+
+	/// Who hears how the sync loop fares, while they are around.
+	pub(crate) fn sync_observer(&self) -> Option<Arc<dyn SyncObserver>> {
+		self.observer.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(Weak::upgrade)
+	}
+
+	/// What this node watches.
+	pub(crate) fn set_watched(&self, watched: Arc<dyn WatchedScripts>) {
+		*self.watched.lock().unwrap_or_else(|e| e.into_inner()) = Some(watched);
+	}
+
+	/// Where the fee rates of the blocks this node read itself are kept.
+	pub(crate) fn set_block_fees(&self, cache: BlockFeeCache) {
+		*self.block_fees.lock().unwrap_or_else(|e| e.into_inner()) = Some(cache);
 	}
 
 	fn state(&self) -> MutexGuard<'_, BundleState> {
 		self.state.lock().unwrap_or_else(|e| e.into_inner())
+	}
+
+	/// What a provider's fees can be held against now.
+	pub(crate) fn fee_reference(&self) -> crate::chain::session::FeeReference {
+		self.transport.fee_reference()
 	}
 
 	/// The newest fee estimates a bundle carried, while they are fresh.
@@ -166,6 +298,17 @@ impl BundleFilterSource {
 		let state = self.state();
 		let (fee, at) = state.fee.as_ref()?;
 		(at.elapsed() < self.tuning.fee_max_age).then(|| fee.clone())
+	}
+
+	/// The tip to answer without asking: only on delivery push, with the session active, and
+	/// recently heard. See the module docs.
+	fn pushed_tip(&self) -> Option<BlockId> {
+		if !self.push_trusted.load(Ordering::Acquire) {
+			return None;
+		}
+		let state = self.state();
+		let (tip, heard) = state.heard_tip?;
+		(heard.elapsed() < self.tuning.pushed_tip_max_age).then_some(tip)
 	}
 
 	/// Whether `since` may be asked now.
@@ -304,6 +447,7 @@ impl BundleFilterSource {
 		if !self.may_ask() {
 			return None;
 		}
+		let epoch = self.epoch();
 		let pulled = match self.fetch(from).await {
 			Ok(pulled) => pulled,
 			Err(e) => {
@@ -311,6 +455,11 @@ impl BundleFilterSource {
 				return None;
 			},
 		};
+		// The node moved while this was on its way. Taken now, the old Pro's word would count as
+		// the new one's, which a liar could arrange on purpose.
+		if self.epoch() != epoch {
+			return None;
+		}
 		let count = pulled.run.len();
 		let mut state = self.state();
 		state.held.retain(|b| b.height <= from.height);
@@ -441,13 +590,22 @@ impl FilterSource for BundleFilterSource {
 		"bundles"
 	}
 
+	fn epoch(&self) -> u64 {
+		self.inner.epoch()
+	}
+
 	/// See [`FilterSource::headers_come_with_filters`]: one reply holds both.
 	fn headers_come_with_filters(&self) -> bool {
 		true
 	}
 
+	/// The one question delivery changes: on healthy push this goes on no wire. See the module
+	/// docs.
 	async fn tip(&self) -> Result<BlockId, SourceError> {
-		self.inner.tip().await
+		match self.pushed_tip() {
+			Some(tip) => Ok(tip),
+			None => self.inner.tip().await,
+		}
 	}
 
 	async fn headers(&self, from_height: u32, count: u32) -> Result<Vec<Header>, SourceError> {
@@ -507,6 +665,128 @@ impl FilterSource for BundleFilterSource {
 	}
 }
 
+impl HeldFilters for BundleFilterSource {
+	fn check_point(&self, bury: u32) -> Option<(BlockId, FilterHeader)> {
+		lock_headers(&self.chain).check_point(bury)
+	}
+
+	fn held_chain(&self, through: u32) -> Option<HeldChain> {
+		lock_headers(&self.chain).held_chain(through)
+	}
+
+	fn block_is_valid(&self, block: &Block, height: u32, header: &Header) -> bool {
+		verify_block(block, height, header).is_ok()
+	}
+
+	fn scan_block(&self, height: u32, block: Block) {
+		let hash = block.block_hash();
+		lock_headers(&self.chain).request_scan(height, block);
+		let mut scanned = self.scanned.lock().unwrap_or_else(|e| e.into_inner());
+		scanned.push_back(hash);
+		while scanned.len() > SCANNED_REMEMBERED {
+			scanned.pop_front();
+		}
+		drop(scanned);
+		self.wake.notify_one();
+	}
+
+	fn scanned_already(&self, hash: &BlockHash) -> bool {
+		self.scanned.lock().unwrap_or_else(|e| e.into_inner()).contains(hash)
+	}
+
+	fn watched_scripts(&self) -> Vec<ScriptBuf> {
+		let watched = self.watched.lock().unwrap_or_else(|e| e.into_inner()).clone();
+		watched.map_or_else(Vec::new, |watched| watched.scripts())
+	}
+
+	fn room_to_scan(&self) -> bool {
+		lock_headers(&self.chain).scans_waiting() < SCANS_WAITING_AT_MOST
+	}
+}
+
+impl PushSink for BundleFilterSource {
+	/// Fits pushed blocks onto what is held, notes the Pro's tip and fee estimates, and wakes the
+	/// sync loop, which verifies them as it verifies anything. A filter that came as a first piece
+	/// is not kept: the loop pulls it, in as many calls as it takes.
+	fn ingest(&self, push: &WireBlockUpdates) -> Result<Option<BlockId>, ChainProviderError> {
+		let pulled = decode_reply(push)?;
+		let held = {
+			let mut state = self.state();
+			state.merge_pushed(pulled.run);
+			state.heard_tip = Some((pulled.tip, Instant::now()));
+			if let Some(fee) = pulled.fee {
+				state.fee = Some((fee, Instant::now()));
+			}
+			state.held.last().map(|b| BlockId { height: b.height, hash: b.hash })
+		};
+		self.wake.notify_one();
+		Ok(held.or_else(|| lock_headers(&self.chain).tip()))
+	}
+
+	fn verified_tip(&self) -> Option<BlockId> {
+		lock_headers(&self.chain).tip()
+	}
+
+	fn note_tip(&self, tip: BlockId) {
+		let moved = {
+			let mut state = self.state();
+			let moved = state.heard_tip.map_or(true, |(known, _)| known != tip);
+			state.heard_tip = Some((tip, Instant::now()));
+			moved
+		};
+		if moved {
+			self.wake.notify_one();
+		}
+	}
+
+	fn forget_tip(&self) {
+		self.state().heard_tip = None;
+		self.wake.notify_one();
+	}
+
+	fn target_changed(&self) {
+		*self.state() = BundleState::default();
+		self.push_trusted.store(false, Ordering::Release);
+		self.wake.notify_one();
+	}
+
+	fn set_push_trusted(&self, trusted: bool) {
+		self.push_trusted.store(trusted, Ordering::Release);
+	}
+
+	fn rewind_filters(&self, from: BlockId) {
+		lock_headers(&self.chain).request_rewind(from);
+		self.state().held.clear();
+		self.wake.notify_one();
+	}
+
+	fn verified_chain(&self) -> SharedHeaderChain {
+		Arc::clone(&self.chain)
+	}
+
+	fn set_sync_observer(&self, observer: Weak<dyn SyncObserver>) {
+		*self.observer.lock().unwrap_or_else(|e| e.into_inner()) = Some(observer);
+	}
+
+	/// The median of the blocks read whose hash is still the one on the chain.
+	fn local_fee_rate(&self) -> Option<u64> {
+		let cache = self.block_fees.lock().unwrap_or_else(|e| e.into_inner()).clone()?;
+		let cached = cache.lock().unwrap_or_else(|e| e.into_inner()).clone();
+		let chain = lock_headers(&self.chain);
+		let mut rates: Vec<u64> = cached
+			.iter()
+			.filter(|(height, (hash, _))| chain.hash(**height) == Some(*hash))
+			.map(|(_, (_, rate))| rate.to_sat_per_kwu())
+			.collect();
+		drop(chain);
+		if rates.len() < LOCAL_FEE_MIN_SAMPLES {
+			return None;
+		}
+		rates.sort_unstable();
+		rates.get(rates.len() / 2).copied()
+	}
+}
+
 #[cfg(test)]
 pub(crate) mod test_support {
 	//! A Pro node for a [`BundleFilterSource`] to talk to: a [`RawChainServer`] over a filter
@@ -515,8 +795,17 @@ pub(crate) mod test_support {
 	use std::collections::HashMap;
 
 	use super::*;
+	use crate::chain::provider::{WireSubscribeRequest, WireSubscribeResponse};
 	use crate::chain::raw_serve::{RawChainServer, RawServeLimits};
+	use crate::chain::subscription::SubscriptionRegistry;
 	use crate::Error;
+
+	pub(crate) fn now_unix() -> u64 {
+		std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.map(|d| d.as_secs())
+			.unwrap_or(0)
+	}
 
 	pub(crate) struct ServerTransport {
 		pub(crate) server: RawChainServer,
@@ -525,6 +814,9 @@ pub(crate) mod test_support {
 		calls: Mutex<HashMap<&'static str, usize>>,
 		/// The biggest JSON reply, in bytes.
 		pub(crate) largest_reply: Mutex<usize>,
+		/// Serves `subscribe` from this, as if the caller were this node. Otherwise an older Pro,
+		/// which does not know the route.
+		pub(crate) registry: Mutex<Option<(Arc<SubscriptionRegistry>, String)>>,
 	}
 
 	impl ServerTransport {
@@ -542,6 +834,7 @@ pub(crate) mod test_support {
 				refuse: Mutex::new(None),
 				calls: Mutex::new(HashMap::new()),
 				largest_reply: Mutex::new(0),
+				registry: Mutex::new(None),
 			}
 		}
 
@@ -551,6 +844,22 @@ pub(crate) mod test_support {
 
 		pub(crate) fn refuse_with(&self, e: Option<ChainProviderError>) {
 			*self.refuse.lock().unwrap() = e;
+		}
+
+		/// What the Pro would push for the blocks at `heights`.
+		pub(crate) async fn push(&self, heights: std::ops::RangeInclusive<u32>) -> WireBlockUpdates {
+			let mut updates = Vec::new();
+			for height in heights {
+				updates.push(self.server.serve_block_update(height).await.expect("a bundle"));
+			}
+			let tip = self.server.serve_tip().await.expect("a tip").tip;
+			WireBlockUpdates {
+				version: CHAIN_WIRE_VERSION,
+				tip,
+				updates,
+				more: false,
+				lease_until: None,
+			}
 		}
 
 		fn enter(&self, method: &'static str) -> Result<(), ChainProviderError> {
@@ -575,6 +884,18 @@ pub(crate) mod test_support {
 	impl BundleTransport for ServerTransport {
 		fn name(&self) -> String {
 			"test-pro".into()
+		}
+
+		async fn subscribe(
+			&self, req: WireSubscribeRequest,
+		) -> Result<WireSubscribeResponse, ChainProviderError> {
+			self.enter("subscribe")?;
+			let registry = self.registry.lock().unwrap().clone();
+			let Some((registry, caller)) = registry else {
+				return Err(ChainProviderError::Refused("unsupported: no such route".into()));
+			};
+			registry.set_tip(self.server.serve_tip().await.map_err(wire_error)?.tip);
+			Ok(registry.subscribe(&caller, &req, now_unix()))
 		}
 
 		async fn since(
@@ -627,6 +948,7 @@ mod tests {
 			Arc::clone(&node) as Arc<dyn FilterSource>,
 			transport as Arc<dyn BundleTransport>,
 			chain,
+			Arc::new(Notify::new()),
 			tuning,
 			Arc::new(Logger::new_log_facade()),
 		);
@@ -640,6 +962,53 @@ mod tests {
 	/// Headers the setup read itself, before the source existed.
 	const SETUP_HEADER_READS: usize = 1;
 
+	/// Review 3's stale pull. A `since` on its way when the node moves must not land under the next
+	/// Pro's name: a liar could keep one on its way on purpose, and frame whoever comes next.
+	#[tokio::test]
+	async fn a_pull_on_its_way_when_the_node_moves_is_not_taken() {
+		struct MovesWhileAsked(Arc<ServerTransport>, Arc<FakeSource>);
+		#[async_trait]
+		impl BundleTransport for MovesWhileAsked {
+			fn name(&self) -> String {
+				"moves".into()
+			}
+			async fn subscribe(
+				&self, req: crate::chain::provider::WireSubscribeRequest,
+			) -> Result<crate::chain::provider::WireSubscribeResponse, ChainProviderError> {
+				self.0.subscribe(req).await
+			}
+			async fn since(
+				&self, req: WireSinceRequest,
+			) -> Result<WireBlockUpdates, ChainProviderError> {
+				let reply = self.0.since(req).await;
+				self.1.next_epoch();
+				reply
+			}
+		}
+		let pro = Arc::new(FakeSource::new(30, &[]));
+		let inner = Arc::new(ServerTransport::new(Arc::clone(&pro) as Arc<dyn FilterSource>));
+		let node = Arc::new(FakeSource::new(30, &[]));
+		let chain = new_shared_header_chain();
+		let headers = node.headers(0, 21).await.unwrap();
+		{
+			let mut held = lock_headers(&chain);
+			for header in headers {
+				held.push_for_test(header);
+			}
+		}
+		let source = BundleFilterSource::new(
+			Arc::clone(&node) as Arc<dyn FilterSource>,
+			Arc::new(MovesWhileAsked(inner, Arc::clone(&node))),
+			chain,
+			Arc::new(Notify::new()),
+			BundleTuning::default(),
+			Arc::new(Logger::new_log_facade()),
+		);
+		let from = BlockId { height: 20, hash: node.block_at(20).block_hash() };
+		assert_eq!(source.pull(from).await, None, "the answer is thrown away");
+		assert!(source.state().held.is_empty());
+	}
+
 	#[tokio::test]
 	async fn the_tip_is_always_polled_and_never_pulls() {
 		let (source, node, transport) = setup(BundleTuning::default()).await;
@@ -648,6 +1017,115 @@ mod tests {
 		}
 		assert_eq!(node.calls("tip"), 5);
 		assert_eq!(transport.calls("since"), 0);
+	}
+
+	#[tokio::test]
+	async fn the_tip_goes_unasked_only_while_pushes_are_trusted_and_recently_heard() {
+		let tuning = BundleTuning { pushed_tip_max_age: Duration::from_millis(40), ..Default::default() };
+		let (source, node, transport) = setup(tuning).await;
+		let heard = BlockId { height: 25, hash: node.block_at(25).block_hash() };
+
+		// Heard, but delivery is pull.
+		source.note_tip(heard);
+		assert_eq!(source.tip().await.unwrap(), node.tip_id());
+		assert_eq!(node.calls("tip"), 1);
+
+		// Trusted: from memory, nothing on the wire.
+		source.set_push_trusted(true);
+		assert_eq!(source.tip().await.unwrap(), heard);
+		assert_eq!(node.calls("tip"), 1);
+		assert_eq!(transport.calls("since"), 0);
+
+		// Trusted, with silence past the bound: the driver must have stopped, so ask.
+		tokio::time::sleep(Duration::from_millis(50)).await;
+		assert_eq!(source.tip().await.unwrap(), node.tip_id());
+		assert_eq!(node.calls("tip"), 2);
+
+		// Trusted, but nothing known.
+		source.forget_tip();
+		assert_eq!(source.tip().await.unwrap(), node.tip_id());
+		assert_eq!(node.calls("tip"), 3);
+
+		// Heard again, then the session goes suspect: the wire again, so an outage shows at once.
+		source.note_tip(heard);
+		assert_eq!(source.tip().await.unwrap(), heard);
+		source.set_push_trusted(false);
+		assert_eq!(source.tip().await.unwrap(), node.tip_id());
+	}
+
+	#[test]
+	fn the_pushed_tip_outlives_the_ten_minute_probe_but_not_by_much() {
+		assert_eq!(BUNDLE_PUSHED_TIP_MAX_AGE.as_secs(), 11 * 60);
+		assert!(BUNDLE_PUSHED_TIP_MAX_AGE > crate::chain::session::machine::NO_SIGNAL_PROBE_AFTER);
+	}
+
+	#[tokio::test]
+	async fn a_push_is_held_and_answers_every_question_with_no_call() {
+		let (source, node, transport) = setup(BundleTuning::default()).await;
+		let push = transport.push(21..=22).await;
+		let held = source.ingest(&push).unwrap();
+		assert_eq!(held.map(|b| b.height), Some(22), "the ack's applied tip");
+		let headers = source.headers(21, 2).await.unwrap();
+		assert_eq!(headers.len(), 2);
+		assert_eq!(headers[0].block_hash(), node.block_at(21).block_hash());
+		assert_eq!(transport.calls("since"), 0);
+		assert_eq!(raw_calls(&node), [0, 0]);
+	}
+
+	#[tokio::test]
+	async fn pushes_join_up_a_gap_starts_again_and_another_branch_clears() {
+		let (source, _node, transport) = setup(BundleTuning::default()).await;
+		source.ingest(&transport.push(21..=21).await).unwrap();
+		source.ingest(&transport.push(22..=23).await).unwrap();
+		source.ingest(&transport.push(23..=23).await).unwrap();
+		assert_eq!(
+			source.state().held.iter().map(|b| b.height).collect::<Vec<_>>(),
+			vec![21, 22, 23],
+			"a repeat changes nothing"
+		);
+		// A gap: what is held no longer links up.
+		source.ingest(&transport.push(26..=26).await).unwrap();
+		assert_eq!(source.state().held.iter().map(|b| b.height).collect::<Vec<_>>(), vec![26]);
+
+		// Another block at a height held.
+		let other = Arc::new(FakeSource::new(27, &[]));
+		other.reorg(1, 1);
+		let other_transport = ServerTransport::new(other as Arc<dyn FilterSource>);
+		let applied = source.ingest(&other_transport.push(26..=26).await).unwrap();
+		assert!(source.state().held.is_empty());
+		assert_eq!(
+			applied.map(|b| b.height),
+			Some(20),
+			"nothing held: the verified tip, for the ack"
+		);
+	}
+
+	#[tokio::test]
+	async fn a_push_is_never_applied_before_it_is_verified_and_garbage_is_refused() {
+		let (source, _node, transport) = setup(BundleTuning::default()).await;
+		let mut bad = transport.push(21..=22).await;
+		bad.updates.swap(0, 1);
+		assert!(matches!(source.ingest(&bad), Err(ChainProviderError::Malformed(_))));
+		assert!(source.state().held.is_empty());
+		let mut other_version = transport.push(21..=21).await;
+		other_version.version += 1;
+		assert!(source.ingest(&other_version).is_err());
+	}
+
+	#[tokio::test]
+	async fn a_new_target_forgets_everything_the_old_one_said() {
+		let (source, node, transport) = setup(BundleTuning::default()).await;
+		source.ingest(&transport.push(21..=21).await).unwrap();
+		source.set_push_trusted(true);
+		source.state().retry_at = Some(Instant::now() + Duration::from_secs(3600));
+		source.target_changed();
+		{
+			let state = source.state();
+			assert!(state.held.is_empty());
+			assert!(state.heard_tip.is_none());
+			assert!(state.retry_at.is_none(), "the new Pro owes nothing for the old one's failures");
+		}
+		assert_eq!(source.tip().await.unwrap(), node.tip_id(), "and trust starts over");
 	}
 
 	#[tokio::test]
@@ -873,6 +1351,7 @@ mod tests {
 			node as Arc<dyn FilterSource>,
 			Arc::clone(&transport) as Arc<dyn BundleTransport>,
 			Arc::clone(&chain),
+			Arc::new(Notify::new()),
 			BundleTuning::default(),
 			Arc::new(Logger::new_log_facade()),
 		);

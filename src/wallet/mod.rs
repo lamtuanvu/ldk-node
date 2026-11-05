@@ -13,7 +13,7 @@ use crate::dead_funding::{find_dead_fundings, DeadFundingProof};
 use crate::logger::{log_debug, log_error, log_info, log_trace, LdkLogger};
 
 use crate::fee_estimator::{ConfirmationTarget, FeeEstimator};
-use crate::payment::store::ConfirmationStatus;
+use crate::payment::store::{ConfirmationStatus, PaymentDetailsUpdate};
 use crate::payment::{PaymentDetails, PaymentDirection, PaymentStatus};
 use crate::types::PaymentStore;
 use crate::Error;
@@ -100,9 +100,6 @@ where
 	/// The broadcast policy of every transaction this wallet builds, and the ones held for a
 	/// rebroadcast, whose inputs stay reserved; see [`crate::broadcast_queue`].
 	broadcast_queue: Arc<BroadcastQueue>,
-	/// When a receive address was last handed out. In memory: a restart forgets it, and an
-	/// incoming payment then shows at its first confirmation, as outside the window.
-	last_address_reveal: Mutex<Option<std::time::Instant>>,
 	fee_estimator: E,
 	payment_store: Arc<PaymentStore>,
 	config: Arc<Config>,
@@ -129,7 +126,6 @@ where
 			persister,
 			broadcaster,
 			broadcast_queue,
-			last_address_reveal: Mutex::new(None),
 			fee_estimator,
 			payment_store,
 			config,
@@ -222,6 +218,12 @@ where
 	}
 
 	/// Whether the wallet's graph holds a transaction with `txid`.
+	/// The transaction `txid`, when this wallet's graph holds it.
+	#[cfg(feature = "cbf")]
+	pub(crate) fn known_tx(&self, txid: &Txid) -> Option<Transaction> {
+		self.inner.lock().unwrap().tx_graph().get_tx(*txid).map(|tx| (*tx).clone())
+	}
+
 	pub(crate) fn knows_tx(&self, txid: &Txid) -> bool {
 		self.inner.lock().unwrap().tx_graph().get_tx(*txid).is_some()
 	}
@@ -344,6 +346,71 @@ where
 		})?;
 
 		Ok(())
+	}
+
+	/// [`Self::apply_mempool_txs`] for an engine with no mempool poll, whose blocks are the only
+	/// other thing that writes the payments list: what it now knows to be unconfirmed gets its
+	/// pending row, as it would have at its block, and what left the mempool does not stay
+	/// pending.
+	pub(crate) fn apply_own_view(
+		&self, unconfirmed_txs: Vec<(Transaction, u64)>, evicted_txids: Vec<(Txid, u64)>,
+	) -> Result<(), Error> {
+		let gone: Vec<Txid> = evicted_txids
+			.iter()
+			.map(|(txid, _)| *txid)
+			.filter(|txid| !self.broadcast_queue.is_held(txid))
+			.collect();
+		self.apply_mempool_txs(unconfirmed_txs, evicted_txids)?;
+		let mut locked_wallet = self.inner.lock().unwrap();
+		self.update_payment_store(&mut locked_wallet)?;
+		self.fail_payments_of(&gone)
+	}
+
+	/// Marks the pending rows of `txids` failed: they left the network as far as this node can tell,
+	/// and their inputs are back in the balance. **This is not final:** another mempool may hold one,
+	/// and a later block that confirms it writes the row again. So what shows this row must not tell
+	/// an owner to send again with other coins, which could pay twice. Sending from the same coins
+	/// cannot.
+	fn fail_payments_of(&self, txids: &[Txid]) -> Result<(), Error> {
+		for txid in txids {
+			let id = PaymentId(txid.to_byte_array());
+			let pending = self
+				.payment_store
+				.get(&id)
+				.map_or(false, |payment| payment.status == PaymentStatus::Pending);
+			if pending {
+				let mut update = PaymentDetailsUpdate::new(id);
+				update.status = Some(PaymentStatus::Failed);
+				self.payment_store.update(&update)?;
+			}
+		}
+		Ok(())
+	}
+
+	/// Marks failed the pending rows of transactions this wallet holds that lost out: replaced,
+	/// or built on one that was, as LDK's sweeper does to a sweep it bumps. No eviction says so,
+	/// as they leave the wallet's unconfirmed list by themselves, and nothing else would ever
+	/// write those rows again. Their inputs are back in the balance already. A block that
+	/// confirms one after all writes it again.
+	#[cfg_attr(not(feature = "cbf"), allow(dead_code))]
+	pub(crate) fn fail_replaced_payments(&self) -> Result<(), Error> {
+		let replaced: Vec<Txid> = {
+			let locked_wallet = self.inner.lock().unwrap();
+			let canonical: HashSet<Txid> =
+				locked_wallet.transactions().map(|t| t.tx_node.txid).collect();
+			self.payment_store
+				.list_filter(|p| p.status == PaymentStatus::Pending)
+				.into_iter()
+				.filter_map(|p| match p.kind {
+					crate::payment::PaymentKind::Onchain { txid, .. } => Some(txid),
+					_ => None,
+				})
+				.filter(|txid| {
+					!canonical.contains(txid) && locked_wallet.tx_graph().get_tx(*txid).is_some()
+				})
+				.collect()
+		};
+		self.fail_payments_of(&replaced)
 	}
 
 	fn update_payment_store<'a>(
@@ -576,6 +643,7 @@ where
 			log_error!(self.logger, "Failed to persist wallet: {}", e);
 			Error::PersistenceFailed
 		})?;
+		self.fail_payments_of(&given_up)?;
 		Ok(given_up)
 	}
 
@@ -646,6 +714,16 @@ where
 		Ok(tx)
 	}
 
+	/// What `tx`, built by this wallet, pays in fees. Its inputs are spent in the wallet's view from
+	/// the moment it is built, as they are reserved, so this reads them from the wallet's graph.
+	#[cfg(feature = "swaps")]
+	pub(crate) fn swap_tx_fee(&self, tx: &Transaction) -> Result<Amount, Error> {
+		self.inner.lock().unwrap().calculate_fee(tx).map_err(|e| {
+			log_error!(self.logger, "Failed to calculate a swap transaction's fee: {}", e);
+			Error::WalletOperationFailed
+		})
+	}
+
 	/// Lists the wallet's confirmed, unspent outputs as [`Utxo`]s.
 	///
 	/// This is a thin swaps-gated inherent wrapper over the [`WalletSource::list_confirmed_utxos`]
@@ -667,8 +745,7 @@ where
 		WalletSource::sign_psbt(self, psbt).map_err(|()| Error::WalletOperationFailed)
 	}
 
-	/// A new external address for this node's own use: LDK's destination and shutdown scripts.
-	/// One to give to someone is [`Self::get_new_receive_address`].
+	/// A new external address: to give to someone, or for LDK's destination and shutdown scripts.
 	pub(crate) fn get_new_address(&self) -> Result<bitcoin::Address, Error> {
 		let mut locked_wallet = self.inner.lock().unwrap();
 		let mut locked_persister = self.persister.lock().unwrap();
@@ -679,21 +756,6 @@ where
 			Error::PersistenceFailed
 		})?;
 		Ok(address_info.address)
-	}
-
-	/// A new address to give to someone, who may pay it now; see
-	/// [`Self::address_revealed_within`].
-	pub(crate) fn get_new_receive_address(&self) -> Result<bitcoin::Address, Error> {
-		let address = self.get_new_address()?;
-		*self.last_address_reveal.lock().unwrap() = Some(std::time::Instant::now());
-		Ok(address)
-	}
-
-	/// Whether a receive address was handed out within `window`: someone may be paying it now.
-	// Called by the filter-driven sync engine only.
-	#[cfg_attr(not(feature = "cbf"), allow(dead_code))]
-	pub(crate) fn address_revealed_within(&self, window: std::time::Duration) -> bool {
-		self.last_address_reveal.lock().unwrap().map_or(false, |at| at.elapsed() < window)
 	}
 
 	fn get_new_internal_address(&self) -> Result<bitcoin::Address, Error> {
@@ -1845,6 +1907,103 @@ mod chain_listen_tests {
 		assert_eq!(
 			found.get(&second.compute_txid()),
 			Some(&DeadFundingProof::DeadParent { parent_txid: first.compute_txid() })
+		);
+	}
+
+	/// What a filter node knows to be unconfirmed has its pending row at once, on the wallet it
+	/// spends from and the wallet it pays. Once it left the network with its inputs back, the row
+	/// is failed, not pending for good; a block that confirms it after all writes it again.
+	#[test]
+	fn the_payments_list_follows_an_own_view() {
+		use crate::payment::PaymentStatus;
+		use lightning::ln::channelmanager::PaymentId;
+
+		let (wallet, _store, _coin) = wallet_with_one_confirmed_coin();
+		let tx = fund_channel(&wallet, 1, 12_000).expect("built");
+		let txid = tx.compute_txid();
+		let id = PaymentId(txid.to_byte_array());
+		let status = |wallet: &Wallet| wallet.payment_store.get(&id).map(|p| p.status);
+
+		wallet.apply_own_view(vec![(tx.clone(), unix_now_secs())], Vec::new()).expect("applies");
+		assert_eq!(status(&wallet), Some(PaymentStatus::Pending));
+
+		wallet.apply_own_view(Vec::new(), vec![(txid, unix_now_secs() + 5)]).expect("applies");
+		assert_eq!(status(&wallet), Some(PaymentStatus::Failed));
+
+		// Sent again and seen again.
+		wallet.apply_own_view(vec![(tx.clone(), unix_now_secs() + 10)], Vec::new()).expect("applies");
+		assert_eq!(status(&wallet), Some(PaymentStatus::Pending));
+
+		// Held: pending stays pending, whatever the view says.
+		let queue = wallet.broadcast_queue();
+		queue.register(txid, BroadcastPolicy::default(), 1);
+		queue.hold(&tx, "gone".to_string(), false, 1);
+		wallet.apply_own_view(Vec::new(), vec![(txid, unix_now_secs() + 15)]).expect("applies");
+		assert_eq!(status(&wallet), Some(PaymentStatus::Pending));
+
+		// Given up: failed, and the inputs are back.
+		wallet.give_up_transaction(txid, "for the test".to_string(), false).expect("gives up");
+		assert_eq!(status(&wallet), Some(PaymentStatus::Failed));
+	}
+
+	/// Seen on a harness: a sweep bumped by LDK replaced the coin a send had spent. Neither row
+	/// was evicted, both stayed pending for good. Now they go failed, and the replacement and a
+	/// row whose transaction this wallet does not hold are left alone.
+	#[test]
+	fn a_replaced_transaction_and_its_child_do_not_stay_pending() {
+		use crate::payment::store::ConfirmationStatus;
+		use crate::payment::{PaymentDetails, PaymentDirection, PaymentKind, PaymentStatus};
+		use lightning::ln::channelmanager::PaymentId;
+
+		let (wallet, _store, coin) = wallet_with_one_confirmed_coin();
+		let spend_to = |previous: bitcoin::OutPoint, sats: u64| Transaction {
+			version: transaction::Version::TWO,
+			lock_time: absolute::LockTime::ZERO,
+			input: vec![TxIn {
+				previous_output: previous,
+				script_sig: ScriptBuf::new(),
+				sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+				witness: Witness::new(),
+			}],
+			output: vec![TxOut {
+				value: Amount::from_sat(sats),
+				script_pubkey: wallet.get_new_address().unwrap().script_pubkey(),
+			}],
+		};
+		let first = spend_to(coin, 40_000);
+		let child =
+			spend_to(bitcoin::OutPoint { txid: first.compute_txid(), vout: 0 }, 30_000);
+		let replacement = spend_to(coin, 39_000);
+		let now = unix_now_secs();
+		wallet.apply_own_view(vec![(first.clone(), now), (child.clone(), now)], Vec::new()).unwrap();
+		let status = |tx: &Transaction| {
+			wallet.payment_store.get(&PaymentId(tx.compute_txid().to_byte_array())).map(|p| p.status)
+		};
+		assert_eq!(status(&first), Some(PaymentStatus::Pending));
+		assert_eq!(status(&child), Some(PaymentStatus::Pending));
+
+		wallet.apply_own_view(vec![(replacement.clone(), now + 5)], Vec::new()).unwrap();
+		let unknown = bitcoin::Txid::from_byte_array([0x77; 32]);
+		wallet
+			.payment_store
+			.insert_or_update(PaymentDetails::new(
+				PaymentId(unknown.to_byte_array()),
+				PaymentKind::Onchain { txid: unknown, status: ConfirmationStatus::Unconfirmed },
+				None,
+				None,
+				PaymentDirection::Inbound,
+				PaymentStatus::Pending,
+			))
+			.unwrap();
+		wallet.fail_replaced_payments().unwrap();
+
+		assert_eq!(status(&first), Some(PaymentStatus::Failed));
+		assert_eq!(status(&child), Some(PaymentStatus::Failed));
+		assert_eq!(status(&replacement), Some(PaymentStatus::Pending));
+		assert_eq!(
+			wallet.payment_store.get(&PaymentId(unknown.to_byte_array())).map(|p| p.status),
+			Some(PaymentStatus::Pending),
+			"not in this wallet's graph: nothing known about it"
 		);
 	}
 

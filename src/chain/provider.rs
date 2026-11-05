@@ -77,6 +77,9 @@ pub enum ChainProviderError {
 	/// The provider was reached and declined to answer — not serving this
 	/// ability, not permitted, or out of budget.
 	Refused(String),
+	/// This node's own host refused the call and nothing left the node. Says nothing about the
+	/// provider or the chain: the same call a moment later may well work.
+	NotSent(String),
 	/// A reply arrived but could not be understood.
 	Malformed(String),
 	/// A reply arrived stamped with a wire version this build cannot honour.
@@ -93,6 +96,7 @@ impl fmt::Display for ChainProviderError {
 		match self {
 			Self::Unreachable(e) => write!(f, "chain provider unreachable: {}", e),
 			Self::Refused(e) => write!(f, "chain provider refused: {}", e),
+			Self::NotSent(e) => write!(f, "chain call not sent: {}", e),
 			Self::Malformed(e) => write!(f, "chain provider reply malformed: {}", e),
 			Self::VersionMismatch { expected, got } => {
 				write!(f, "chain wire version mismatch: expected {}, got {}", expected, got)
@@ -647,11 +651,133 @@ pub struct WireBlockChunk {
 // block instead of three: `WireSinceRequest` answers with a `WireBlockUpdate`
 // per block. Each is the raw data the node would otherwise ask for — header,
 // filter header and filter — so the node verifies it exactly as it verifies the
-// raw routes. The node owns its cursor; the Pro keeps nothing per node. The
+// raw routes. The node owns its cursor; the Pro keeps no per-node height. The
 // consuming side is `BundleTransport`.
+//
+// That much is pull. A node can also subscribe: `WireSubscribeRequest` asks for a
+// lease, and while it lives the Pro pushes one `WireBlockUpdates` per new block,
+// answered with a `WireBlockUpdateAck`. The same updates, verified the same way;
+// only who speaks first changes. See `crate::chain::subscription` for the Pro's
+// side and `crate::chain::session` for the node's.
 
 /// Most updates one [`WireSinceRequest`] may ask for: a day of blocks.
 pub const MAX_UPDATES_PER_SINCE: u32 = 144;
+
+/// What a [`WireSubscribeRequest`] asks to have pushed: each new block's update.
+pub const SUBSCRIBE_WANT_BLOCKS: &str = "blocks";
+
+/// "Push me every new block, from `from` on."
+///
+/// `lease_secs: 0` is a release: the asker is leaving, and the serving node
+/// drops its lease at once.
+///
+/// No `deny_unknown_fields`: the host adds its own fields (the caller's node
+/// id) to the payload it hands the serving app.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireSubscribeRequest {
+	/// Wire contract version; see [`CHAIN_WIRE_VERSION`].
+	pub version: u16,
+	/// The asking node's own tip.
+	pub from: WireBlockId,
+	/// How long the asking node would like the lease to last; the serving node
+	/// may grant less. Zero releases.
+	pub lease_secs: u32,
+	/// What to push: today only [`SUBSCRIBE_WANT_BLOCKS`].
+	#[serde(default)]
+	pub want: Vec<String>,
+}
+
+/// A lease granted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireSubscribeGranted {
+	/// Wire contract version; see [`CHAIN_WIRE_VERSION`].
+	pub version: u16,
+	/// The serving node's name for this lease. A renewal keeps it.
+	pub lease_id: String,
+	/// When the lease ends unless an acknowledged push renews it, in seconds
+	/// since the UNIX epoch.
+	pub lease_until: u64,
+	/// The serving node's best block.
+	pub tip: WireBlockId,
+}
+
+/// Why a serving node will not push to the asker. The asker keeps it as its
+/// provider and pulls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WireRefusalCode {
+	/// No room. Not used by default: a Pro has no slot limit today.
+	Full,
+	/// The serving node's conditions are not met.
+	Policy,
+	/// A lease costs something the asker has not paid.
+	PaymentRequired,
+	/// The serving node is going away, or not ready to push yet.
+	Draining,
+	/// A code from a newer serving node.
+	#[serde(other)]
+	Unknown,
+}
+
+/// A lease refused.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireSubscribeRefused {
+	/// Wire contract version; see [`CHAIN_WIRE_VERSION`].
+	pub version: u16,
+	/// Why.
+	pub code: WireRefusalCode,
+	/// When to ask again, in seconds.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub retry_after: Option<u64>,
+	/// Other Pro nodes the asker might try, as node ids.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub alternatives: Vec<String>,
+}
+
+/// A release done.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireSubscribeReleased {
+	/// Wire contract version; see [`CHAIN_WIRE_VERSION`].
+	pub version: u16,
+	/// Whether there was a lease to drop.
+	pub released: bool,
+}
+
+/// The answer to a [`WireSubscribeRequest`]. Told apart by its fields, so each
+/// reads on the wire as the contract writes it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum WireSubscribeResponse {
+	/// `{lease_id, lease_until, tip}`.
+	Granted(WireSubscribeGranted),
+	/// `{code, retry_after, alternatives}`.
+	Refused(WireSubscribeRefused),
+	/// `{released}`.
+	Released(WireSubscribeReleased),
+}
+
+/// What became of a push.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WireAckStatus {
+	/// Taken. The lease is renewed.
+	Applied,
+	/// This node does not follow the pusher: its release was lost, or it never
+	/// asked. The pusher drops the lease at once.
+	NotSubscribed,
+}
+
+/// The answer to a pushed [`WireBlockUpdates`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireBlockUpdateAck {
+	/// Wire contract version; see [`CHAIN_WIRE_VERSION`].
+	pub version: u16,
+	/// What became of it.
+	pub status: WireAckStatus,
+	/// The newest block this node now holds, when it took the push.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub applied_tip: Option<WireBlockId>,
+}
 
 /// "Give me the updates of every block above `from`."
 ///
@@ -680,7 +806,7 @@ fn is_zero(value: &u32) -> bool {
 	*value == 0
 }
 
-/// One block's raw BIP157/158 data, as a `since` reply carries it.
+/// One block's raw BIP157/158 data, as a push or a `since` reply carries it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WireBlockUpdate {
 	/// Wire contract version; see [`CHAIN_WIRE_VERSION`].
@@ -712,7 +838,7 @@ pub struct WireBlockUpdate {
 	pub fee_estimates: Option<WireFeeEstimates>,
 }
 
-/// A run of block updates: a `since` reply.
+/// A run of block updates: a `since` reply, or a push.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WireBlockUpdates {
 	/// Wire contract version; see [`CHAIN_WIRE_VERSION`].
@@ -725,6 +851,10 @@ pub struct WireBlockUpdates {
 	/// `true` when the serving node stopped before its tip — at the reply
 	/// size, or at the count asked; the asker continues from the last update.
 	pub more: bool,
+	/// On a push: when the lease will end, once this push is acknowledged, in
+	/// seconds since the UNIX epoch.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub lease_until: Option<u64>,
 }
 
 // ── THE PORT ─────────────────────────────────────────────────────────────────
@@ -747,6 +877,33 @@ pub struct WireBlockUpdates {
 pub trait ChainDataProvider: Send + Sync {
 	/// Identifies the provider in logs — conventionally the serving node's id.
 	fn name(&self) -> String;
+
+	/// Whether there is anyone to ask right now. `false` is a provider that knows every call
+	/// would fail: a broadcast then waits in the queue rather than use up its chain. A provider
+	/// that is merely down does not know that, and says `true`.
+	fn is_available(&self) -> bool {
+		true
+	}
+
+	/// Whether a transaction handed over now reaches anybody: more than [`Self::is_available`] for
+	/// a provider that knows others who can be told. See [`crate::chain::session`].
+	fn can_broadcast(&self) -> bool {
+		self.is_available()
+	}
+
+	/// What someone other than the node this provider answers through says of this node's own
+	/// unconfirmed transactions, handing over what it does not hold. `None` when there is nobody
+	/// else to ask or nobody answered: nothing is known then.
+	async fn second_opinion_on_own_txs(
+		&self, _txs: &[bitcoin::Transaction],
+	) -> Option<crate::chain::session::OwnTxOpinion> {
+		None
+	}
+
+	/// What this provider's fees can be held against: nothing, for one that knows of nobody else.
+	fn fee_reference(&self) -> crate::chain::session::FeeReference {
+		Default::default()
+	}
 
 	/// The serving node's current fee-rate cache.
 	async fn fee_estimates(&self) -> Result<WireFeeEstimates, ChainProviderError>;
@@ -798,6 +955,21 @@ pub trait BundleTransport: Send + Sync {
 	/// Identifies the transport in logs.
 	fn name(&self) -> String;
 
+	/// What this provider's fees can be held against: nothing, for one that knows of nobody else.
+	fn fee_reference(&self) -> crate::chain::session::FeeReference {
+		Default::default()
+	}
+
 	/// The updates of the blocks above `req.from`.
 	async fn since(&self, req: WireSinceRequest) -> Result<WireBlockUpdates, ChainProviderError>;
+
+	/// Asks for a lease, or with `lease_secs: 0` gives one up.
+	///
+	/// Has a body like [`ChainDataProvider::mempool`]: an implementation with no
+	/// such route refuses, and the node pulls.
+	async fn subscribe(
+		&self, _req: WireSubscribeRequest,
+	) -> Result<WireSubscribeResponse, ChainProviderError> {
+		Err(ChainProviderError::Refused("unsupported".into()))
+	}
 }

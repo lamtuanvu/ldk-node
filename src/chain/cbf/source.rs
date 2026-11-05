@@ -145,7 +145,9 @@ impl std::error::Error for SourceError {}
 impl From<ChainProviderError> for SourceError {
 	fn from(e: ChainProviderError) -> Self {
 		match e {
-			ChainProviderError::Unreachable(reason) => SourceError::unavailable(reason),
+			ChainProviderError::Unreachable(reason) | ChainProviderError::NotSent(reason) => {
+				SourceError::unavailable(reason)
+			},
 			ChainProviderError::Refused(reason) => {
 				SourceError::unavailable(format!("refused: {}", reason))
 			},
@@ -189,6 +191,12 @@ pub trait FilterSource: Send + Sync {
 	/// whose every question is a separate cost, where the loop reads headers ahead.
 	fn headers_come_with_filters(&self) -> bool {
 		false
+	}
+
+	/// Which provider this source reads now: moves when it starts reading another one, so what
+	/// one said is not held against the next. Constant for a source that never moves.
+	fn epoch(&self) -> u64 {
+		0
 	}
 
 	/// The source's best block.

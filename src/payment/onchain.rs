@@ -59,7 +59,7 @@ impl OnchainPayment {
 
 	/// Retrieve a new on-chain/funding address.
 	pub fn new_address(&self) -> Result<Address, Error> {
-		let funding_address = self.wallet.get_new_receive_address()?;
+		let funding_address = self.wallet.get_new_address()?;
 		log_info!(self.logger, "Generated new funding address: {}", funding_address);
 		Ok(funding_address)
 	}

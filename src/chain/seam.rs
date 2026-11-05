@@ -149,6 +149,10 @@ pub(crate) enum FeeUpdate {
 
 /// Default budget for a FEE adapter that declares none of its own.
 pub(crate) const FEE_BUDGET: Duration = Duration::from_secs(5);
+/// The name of the TX_STATUS adapter that answers from blocks this node read itself.
+#[cfg(feature = "swaps")]
+pub(crate) const CBF_WATCH_ADAPTER: &str = "cbf_watch";
+
 /// Default budget for a BROADCAST adapter that declares none of its own.
 pub(crate) const BROADCAST_BUDGET: Duration = Duration::from_secs(15);
 /// Default budget for a TX_STATUS adapter that declares none of its own.
@@ -191,6 +195,11 @@ pub(crate) const PER_TX_BROADCAST_BUDGET: Duration = Duration::from_secs(
 /// decode in milliseconds and index in well under a megabyte, which nothing
 /// on a small node notices.
 pub(crate) const MAX_MEMPOOL_QUERY_ITEMS: usize = 10_000;
+
+/// The most txids one question with no script may carry. Answered one RPC per txid, so unlike a
+/// question with scripts its cost is its length; and a node has a few own transactions unconfirmed,
+/// not hundreds. A node with more asks in several questions.
+pub(crate) const MAX_KNOWN_ONLY_QUERY_ITEMS: usize = 256;
 
 /// Why an adapter did not produce an accepted answer.
 ///
@@ -592,6 +601,13 @@ pub(crate) trait MempoolAction: Send + Sync {
 	/// Answer `query` in the scope it asks for, [`Anchored`] to the tip the
 	/// answer was taken at when the adapter knows one.
 	async fn mempool(&self, query: &MempoolQuery) -> ActionResult<Anchored<MempoolAnswer>>;
+
+	/// Which of `txs`, this node's own unconfirmed transactions, a node other than the one answering
+	/// [`Self::mempool`] holds, having handed it the others. `None` with nobody else to ask or no
+	/// answer: an adapter whose mempool is the node's own has nobody to ask.
+	async fn second_opinion(&self, _txs: &[Transaction]) -> Option<HashSet<Txid>> {
+		None
+	}
 }
 
 /// SCRIPT_HISTORY — the wide wallet scan, phrased on the wire type because

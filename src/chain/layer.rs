@@ -42,20 +42,26 @@ use crate::chain::engine::bitcoind::{BitcoindSyncEngine, DependentScanServer};
 use crate::chain::engine::dependent::DependentSyncEngine;
 use crate::chain::engine::electrum::ElectrumSyncEngine;
 use crate::chain::engine::esplora::EsploraSyncEngine;
+#[cfg(feature = "swaps")]
+use crate::chain::engine::ProviderConfirmation;
+#[cfg(feature = "swaps")]
+use crate::chain::SwapTxInBlock;
 use crate::chain::engine::SyncEngine;
 use crate::chain::provider::{
-	ChainDataProvider, WireBlockChunk, WireBlockRequest, WireBlockUpdates, WireChainTip, WireFeeEstimates, WireFeeTarget, WireFilterHeaders, WireFilterHeadersRequest,
+	ChainDataProvider, WireBlockChunk, WireBlockRequest, WireBlockUpdate, WireBlockUpdates, WireChainTip, WireFeeEstimates, WireFeeTarget, WireFilterHeaders, WireFilterHeadersRequest,
 	WireFilters, WireFiltersRequest, WireHeaders, WireHeadersRequest, WireLightningSyncRequest,
 	WireLightningSyncResponse, WireMempoolRequest, WireMempoolResponse, WireSinceRequest,
 	WireSyncRequest, WireUpdate, CHAIN_WIRE_VERSION, FEE_ESTIMATES_MAX_AGE_SECS,
 };
 use crate::chain::raw_serve::RawChainServer;
 use crate::chain::target::{SyncTarget, SyncTargetSpec, TargetId, TargetRegistry};
+use crate::chain::session::PushSink;
 use crate::chain::seam::{
 	accepted_txids, package_result, ActionChain, ActionResult, Anchored, Answered, BroadcastAction,
 	BroadcastRejection, ChainActionError, FeeAction, FeeUpdate, MempoolAction, MempoolAnswer,
 	MempoolQuery, MempoolScope, ScriptHistoryAction, SlotAdapter, UtxoCapability, UtxoVerification,
-	BROADCAST_BUDGET, FEE_BUDGET, MAX_MEMPOOL_QUERY_ITEMS, MEMPOOL_BUDGET, SCRIPT_HISTORY_BUDGET,
+	BROADCAST_BUDGET, FEE_BUDGET, MAX_KNOWN_ONLY_QUERY_ITEMS, MAX_MEMPOOL_QUERY_ITEMS, MEMPOOL_BUDGET,
+	SCRIPT_HISTORY_BUDGET,
 };
 use crate::chain::wire_convert::{mempool_answer_to_wire, wire_to_mempool_query};
 use crate::chain::{
@@ -77,6 +83,8 @@ use crate::chain::adapters::cbf::CbfWatchTxStatus;
 #[cfg(feature = "cbf")]
 use crate::chain::adapters::cbf::{CbfBundleFee, CbfDerivedFee, CbfP2pBroadcast, CbfUtxoSource};
 #[cfg(feature = "cbf")]
+use crate::chain::cbf::bundle_source::BundleFilterSource;
+#[cfg(feature = "cbf")]
 use crate::chain::cbf::fee_sampler::FeeSampleDemand;
 #[cfg(feature = "cbf")]
 use crate::chain::engine::cbf::{CbfSyncEngine, ExternalElectrum};
@@ -88,7 +96,7 @@ use crate::config::{CbfConfig, CbfExternalFee};
 #[cfg(feature = "swaps")]
 use crate::chain::provider::WireTxStatusResponse;
 #[cfg(feature = "swaps")]
-use crate::chain::seam::{TxStatusAction, TX_STATUS_BUDGET};
+use crate::chain::seam::{TxStatusAction, CBF_WATCH_ADAPTER, TX_STATUS_BUDGET};
 #[cfg(feature = "swaps")]
 use crate::chain::RawTxObservation;
 #[cfg(feature = "swaps")]
@@ -157,41 +165,24 @@ pub(crate) struct ChainSlots {
 type Unconfirmed = Vec<(Transaction, u64)>;
 type Evicted = Vec<(Txid, u64)>;
 
-/// The questions one borrow asks: every script and known transaction once, in as few
-/// questions as the serving node's bound of `max_items` per question allows. A transaction
-/// spending a known one is answered by the question that names the parent, and the answers are
-/// merged, so where a split falls does not change what the pass learns.
+/// The questions one borrow asks: every known transaction once, and no script, in as few
+/// questions as the serving node's bound of `max_items` per question allows. Nothing known,
+/// nothing asked. The answers are merged, so where a split falls does not change what the pass
+/// learns.
 #[cfg(feature = "cbf")]
 fn mempool_questions(
-	scripts: impl Iterator<Item = ScriptBuf>, known: impl Iterator<Item = Txid>,
-	best_processed_height: u32, max_items: usize,
+	known: impl Iterator<Item = Txid>, best_processed_height: u32, max_items: usize,
 ) -> Vec<MempoolQuery> {
-	let scripts: HashSet<ScriptBuf> = scripts.collect();
 	let known: HashSet<Txid> = known.collect();
-	let mut questions = Vec::new();
-	let mut question = MempoolQuery {
-		scripts: Vec::new(),
-		known_unconfirmed: Vec::new(),
-		scope: MempoolScope::Incremental { best_processed_height },
-	};
-	let empty = question.clone();
-	let full = |q: &MempoolQuery| q.scripts.len() + q.known_unconfirmed.len() >= max_items.max(1);
-	for txid in known {
-		question.known_unconfirmed.push(txid);
-		if full(&question) {
-			questions.push(std::mem::replace(&mut question, empty.clone()));
-		}
-	}
-	for script in scripts {
-		question.scripts.push(script);
-		if full(&question) {
-			questions.push(std::mem::replace(&mut question, empty.clone()));
-		}
-	}
-	if question != empty {
-		questions.push(question);
-	}
-	questions
+	let known: Vec<Txid> = known.into_iter().collect();
+	known
+		.chunks(max_items.max(1))
+		.map(|chunk| MempoolQuery {
+			scripts: Vec::new(),
+			known_unconfirmed: chunk.to_vec(),
+			scope: MempoolScope::Incremental { best_processed_height },
+		})
+		.collect()
 }
 
 /// Each wallet's share of one merged mempool answer, by wallet index, so a wallet sees exactly
@@ -199,11 +190,8 @@ fn mempool_questions(
 ///
 /// * a transaction goes to the wallets it concerns: it pays or spends what the wallet owns
 ///   (`claims`), it is one the wallet holds unconfirmed, or it spends one of those;
-/// * a transaction no wallet claims reaches nobody. That is what becomes of one that pays only a
-///   script LDK registered, as it always was: the wallet takes only transactions relevant to
-///   it, so such a transaction never entered its graph even when its own question asked. Those
-///   scripts stay in the question for the transaction that also spends a wallet's coin — a
-///   funding, say — which that wallet then claims;
+/// * a transaction no wallet claims reaches nobody. A Pro that still answers with transactions
+///   (one older than the known-only question) returns only what spends or is a known one;
 /// * an eviction goes only to the wallets holding that transaction.
 #[cfg(feature = "cbf")]
 fn split_mempool_answer(
@@ -242,23 +230,6 @@ pub(crate) struct BorrowedMempool {
 	pub(crate) by: &'static str,
 	pub(crate) unconfirmed: usize,
 	pub(crate) evicted: usize,
-}
-
-/// Whether [`ChainLayer::borrow_mempool`] applies the evictions in a borrowed
-/// answer, or only its unconfirmed transactions.
-#[cfg(feature = "cbf")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MempoolEvictions {
-	/// Apply both halves: the wallet has every block up to the tip applied.
-	Apply,
-	/// Apply the unconfirmed transactions and drop the evictions: the wallet
-	/// is behind the tip. A known unconfirmed transaction missing from the
-	/// provider's mempool may have confirmed in a block this node has not
-	/// applied yet, and evicting it would hand its inputs back to the wallet
-	/// as spendable — until that block arrives — and drop the payment from the
-	/// balance. An unconfirmed transaction needs no block of ours to be
-	/// right, so that half is safe at any height.
-	Withhold,
 }
 
 /// A borrowed mempool answer, every time in it replaced by `now` on this
@@ -331,6 +302,15 @@ pub(crate) const OWN_BROADCAST_EVICTION_GRACE: Duration = Duration::from_secs(10
 /// its parent.
 const BROADCAST_RETRY_TICK: Duration = Duration::from_secs(1);
 
+/// How many mempool questions with no script this node answers at once: a Pro's own wallet passes do
+/// not ask them, and each customer asks once per block while it has something pending.
+const MAX_KNOWN_ONLY_QUESTIONS_AT_ONCE: usize = 4;
+
+/// How many mempool questions with a script this node answers at once. Each walks the whole mempool,
+/// seconds on a full one, and only a Dependent node has reason to ask one. Apart from those with no
+/// script, so a stranger filling these costs a filter node nothing.
+const MAX_SCRIPTED_QUESTIONS_AT_ONCE: usize = 4;
+
 /// Bound on the transactions [`RecentOwnBroadcasts`] remembers. Own broadcasts
 /// are rare — a channel open, a sweep, a payment — so the bound is never
 /// reached in practice; it exists so nothing can grow the memory without limit.
@@ -369,13 +349,6 @@ impl RecentOwnBroadcasts {
 		self.sent_at.contains_key(txid)
 	}
 
-	/// Whether this node put anything on the network within the grace period before `now`.
-	#[cfg(feature = "cbf")]
-	fn any(&mut self, now: Instant) -> bool {
-		self.prune(now);
-		!self.sent_at.is_empty()
-	}
-
 	fn prune(&mut self, now: Instant) {
 		self.sent_at
 			.retain(|_, at| now.saturating_duration_since(*at) <= OWN_BROADCAST_EVICTION_GRACE);
@@ -398,6 +371,10 @@ pub(crate) struct ChainLayer {
 	/// What the BROADCAST tail put on the network recently, for the MEMPOOL
 	/// tail; see [`OWN_BROADCAST_EVICTION_GRACE`].
 	recent_own_broadcasts: Mutex<RecentOwnBroadcasts>,
+	/// See [`MAX_KNOWN_ONLY_QUESTIONS_AT_ONCE`].
+	known_only_questions: tokio::sync::Semaphore,
+	/// See [`MAX_SCRIPTED_QUESTIONS_AT_ONCE`].
+	scripted_questions: tokio::sync::Semaphore,
 	/// The last provider tip the engine could not place on its chain, so
 	/// accepting an unverifiable answer is logged once per tip rather than
 	/// once per pass.
@@ -415,6 +392,9 @@ pub(crate) struct ChainLayer {
 	/// last refresh, whose own metrics would otherwise say "never" about a cache that is
 	/// fresh.
 	fee_cache_updated_at: RwLock<Option<u64>>,
+	/// What reads a Pro's pushed blocks on a hybrid node, for its provider session.
+	#[cfg(feature = "cbf")]
+	bundles: Option<Arc<BundleFilterSource>>,
 }
 
 impl ChainLayer {
@@ -427,12 +407,28 @@ impl ChainLayer {
 			engine,
 			shared: SharedChainCtx { fee_estimator, tx_broadcaster, logger },
 			recent_own_broadcasts: Mutex::new(RecentOwnBroadcasts::default()),
+			known_only_questions: tokio::sync::Semaphore::new(MAX_KNOWN_ONLY_QUESTIONS_AT_ONCE),
+			scripted_questions: tokio::sync::Semaphore::new(MAX_SCRIPTED_QUESTIONS_AT_ONCE),
 			last_unverifiable_tip: Mutex::new(None),
 			raw: None,
 			raw_health: None,
 			targets,
 			fee_cache_updated_at: RwLock::new(None),
+			#[cfg(feature = "cbf")]
+			bundles: None,
 		}
+	}
+
+	/// What a provider session hands pushes to, on a node whose sync reads bundles.
+	#[cfg(feature = "cbf")]
+	pub(crate) fn push_sink(&self) -> Option<Arc<dyn PushSink>> {
+		self.bundles.as_ref().map(|bundles| Arc::clone(bundles) as Arc<dyn PushSink>)
+	}
+
+	/// What a provider session hands pushes to: nothing in a build with no filter sync.
+	#[cfg(not(feature = "cbf"))]
+	pub(crate) fn push_sink(&self) -> Option<Arc<dyn PushSink>> {
+		None
 	}
 
 	/// The nodes this layer keeps in step.
@@ -989,7 +985,8 @@ impl ChainLayer {
 			engine = engine.with_bundles(transport);
 		}
 		let engine = Arc::new(engine);
-		if let Some(bundles) = engine.bundles() {
+		let bundles = engine.bundles().cloned();
+		if let Some(bundles) = &bundles {
 			fee.push(Arc::new(CbfBundleFee::new(Arc::clone(bundles), Arc::clone(&logger))));
 		}
 
@@ -1048,7 +1045,9 @@ impl ChainLayer {
 			utxo,
 		};
 
-		Ok(Self::new(slots, engine, fee_estimator, tx_broadcaster, logger, targets))
+		let mut layer = Self::new(slots, engine, fee_estimator, tx_broadcaster, logger, targets);
+		layer.bundles = bundles;
+		Ok(layer)
 	}
 
 	/// Which adapters currently occupy each slot. For logs and diagnostics;
@@ -1108,6 +1107,11 @@ impl ChainLayer {
 	/// the chain by filters. See [`crate::Node::cbf_sync_status`].
 	pub(crate) fn cbf_sync_status(&self) -> Option<CbfSyncStatus> {
 		self.engine.cbf_sync_status()
+	}
+
+	#[cfg(test)]
+	pub(crate) fn halt_the_applicator_for_test(&self, why: &str) {
+		self.engine.halt_the_applicator_for_test(why)
 	}
 
 	/// Start any runtime-dependent part of the layer (currently Electrum only).
@@ -1556,9 +1560,12 @@ impl ChainLayer {
 		let recipients: Vec<&Arc<SyncTarget>> =
 			if owners.is_empty() { targets.iter().collect() } else { owners };
 		for target in recipients {
-			if let Err(e) =
+			let applied = if echo_own {
+				target.onchain_wallet.apply_own_view(unconfirmed.clone(), evicted.clone())
+			} else {
 				target.onchain_wallet.apply_mempool_txs(unconfirmed.clone(), evicted.clone())
-			{
+			};
+			if let Err(e) = applied {
 				log_error!(
 					self.shared.logger,
 					"Failed to record a broadcast package in the on-chain wallet of {}: {}",
@@ -1824,64 +1831,55 @@ impl ChainLayer {
 		Ok(answered)
 	}
 
-	/// Whether a borrowed mempool view could tell any wallet something it needs.
+	/// Ask about the unconfirmed transactions of every wallet in `targets`, and apply the answer:
+	/// one question per pass, whatever the number of wallets, split into several only over the
+	/// server's bound ([`mempool_questions`]), with no script in any of them. Nothing unconfirmed,
+	/// nothing asked. What the wallets send and receive from each other they already show from
+	/// the BROADCAST tail; what comes from outside shows at its first confirmation. A wallet's
+	/// share is [`split_mempool_answer`]'s.
 	///
-	/// A filter-driven node learns of every confirmation from its filters; the mempool adds only
-	/// what is not confirmed yet, and only three things make that matter: a wallet holds an
-	/// unconfirmed transaction whose fate is open, this node has a transaction of its own on its
-	/// way (held for a rebroadcast, or sent within [`OWN_BROADCAST_EVICTION_GRACE`]), or someone
-	/// was given a receive address within `receive_window` and may be paying it now. Otherwise
-	/// nothing is asked; an incoming payment outside the window shows at its first confirmation.
-	#[cfg(feature = "cbf")]
-	pub(crate) fn mempool_wanted(&self, receive_window: Duration) -> bool {
-		if self.recent_own_broadcasts.lock().unwrap_or_else(|e| e.into_inner()).any(Instant::now())
-		{
-			return true;
-		}
-		self.targets.snapshot().iter().any(|t| {
-			let wallet = &t.onchain_wallet;
-			wallet.address_revealed_within(receive_window)
-				|| wallet.broadcast_queue().has_held()
-				|| !wallet.get_unconfirmed_txids().is_empty()
-		})
-	}
-
-	/// Borrow one mempool view for every wallet in `targets`, and apply it: one question per
-	/// pass, whatever the number of wallets, split into several only over the server's bound
-	/// ([`mempool_questions`]). The share each wallet gets is [`split_mempool_answer`]'s.
-	///
-	/// For an engine with no mempool view of its own: the filter-following engine asks on its
-	/// own cadence and on every foreground pass, when [`Self::mempool_wanted`]. Each answer goes
-	/// through [`ChainLayer::mempool`] — refused if anchored off this node's chain, with fresh
-	/// own broadcasts shielded from eviction — and is then stamped on this node's clock
+	/// For an engine with no mempool view of its own. Each answer goes through
+	/// [`ChainLayer::mempool`] — refused if anchored off this node's chain, with fresh own
+	/// broadcasts shielded from eviction — and is then stamped on this node's clock
 	/// ([`stamp_locally`]) before a wallet sees it. A question that cannot be answered fails the
 	/// pass with nothing applied: half a view would read as evictions. An empty chain is
-	/// `Unavailable`; the engine checks [`ChainLayer::has_mempool_chain`] before asking. With
-	/// [`MempoolEvictions::Withhold`] only the unconfirmed half is applied, and the result counts
-	/// no evictions.
+	/// `Unavailable`; the engine checks [`ChainLayer::has_mempool_chain`] before asking.
+	///
+	/// The evictions of an answer anchored above `best_processed_height` are withheld: a known
+	/// transaction missing from that view may have confirmed in a block not applied here. A
+	/// transaction this node's wallet queued goes back to its queue rather than being evicted
+	/// ([`ChainLayer::requeue_evicted`]): nothing else would ever send it again, as no block can
+	/// show a transaction that left every mempool.
 	#[cfg(feature = "cbf")]
 	pub(crate) async fn borrow_mempool(
-		&self, targets: &[Arc<SyncTarget>], registered: &HashSet<ScriptBuf>,
-		best_processed_height: u32, evictions: MempoolEvictions,
+		&self, targets: &[Arc<SyncTarget>], best_processed_height: u32,
 	) -> ActionResult<BorrowedMempool> {
+		for target in targets {
+			if let Err(e) = target.onchain_wallet.fail_replaced_payments() {
+				log_error!(
+					self.shared.logger,
+					"Failed to update the replaced payments of {}: {}",
+					target.label,
+					e
+				);
+			}
+		}
 		let known_by_wallet: Vec<HashSet<Txid>> = targets
 			.iter()
 			.map(|t| t.onchain_wallet.get_unconfirmed_txids().into_iter().collect())
 			.collect();
-		let scripts = targets
-			.iter()
-			.flat_map(|t| t.onchain_wallet.list_watched_scripts())
-			.chain(registered.iter().cloned());
+		let held_elsewhere = self.second_opinion_on_own_txs(targets, &known_by_wallet).await;
 		let known = known_by_wallet.iter().flatten().copied();
-		let questions =
-			mempool_questions(scripts, known, best_processed_height, MAX_MEMPOOL_QUERY_ITEMS);
+		let questions = mempool_questions(known, best_processed_height, MAX_KNOWN_ONLY_QUERY_ITEMS);
 
 		let mut by = "none";
 		let mut merged = MempoolAnswer { unconfirmed: Vec::new(), evicted: Vec::new() };
 		let mut seen = HashSet::new();
+		let mut ahead_of_us = false;
 		for question in &questions {
 			let answered = self.mempool(question).await?;
 			by = answered.by;
+			ahead_of_us |= answered.value.tip.map_or(false, |t| t.height > best_processed_height);
 			let answer = answered.value.value;
 			for (tx, seen_at) in answer.unconfirmed {
 				if seen.insert(tx.compute_txid()) {
@@ -1892,15 +1890,17 @@ impl ChainLayer {
 		}
 		// One question's "gone" must not beat another's "still there".
 		merged.evicted.retain(|(txid, _)| !seen.contains(txid));
+		// Nor does the word of the Pro answering, against a second node's that it holds it.
+		merged.evicted.retain(|(txid, _)| !held_elsewhere.contains(txid));
 		merged.evicted.sort_unstable();
 		merged.evicted.dedup_by_key(|(txid, _)| *txid);
 
 		let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
 		let (unconfirmed, mut evicted) = stamp_locally(merged, now);
-		if evictions == MempoolEvictions::Withhold && !evicted.is_empty() {
+		if ahead_of_us && !evicted.is_empty() {
 			log_debug!(
 				self.shared.logger,
-				"Withholding {} evictions from {}'s mempool view: this node is still catching up to the tip",
+				"Withholding {} evictions from {}'s mempool view: it is ahead of this node's tip",
 				evicted.len(),
 				by
 			);
@@ -1914,12 +1914,24 @@ impl ChainLayer {
 			&known_by_wallet,
 			|i, tx| targets[i].onchain_wallet.is_relevant_tx(tx),
 		);
+		let shares: Vec<(Unconfirmed, Evicted)> = targets
+			.iter()
+			.zip(shares)
+			.map(|(target, (unconfirmed, evicted))| {
+				(unconfirmed, self.requeue_evicted(&target.onchain_wallet, evicted, now))
+			})
+			.collect();
 		let mut failure = None;
-		for (target, (unconfirmed, evicted)) in targets.iter().zip(shares) {
+		for (target, (unconfirmed, mut evicted)) in targets.iter().zip(shares) {
+			// One wallet of this device sending it again is enough for the wallet it pays to go
+			// on showing it: the money is on its way, not gone from both.
+			evicted.retain(|(txid, _)| {
+				!targets.iter().any(|t| t.onchain_wallet.broadcast_queue().is_held(txid))
+			});
 			if unconfirmed.is_empty() && evicted.is_empty() {
 				continue;
 			}
-			if let Err(e) = target.onchain_wallet.apply_mempool_txs(unconfirmed, evicted) {
+			if let Err(e) = target.onchain_wallet.apply_own_view(unconfirmed, evicted) {
 				log_error!(
 					self.shared.logger,
 					"Failed to apply a borrowed mempool view to the wallet of {}: {}",
@@ -1936,6 +1948,67 @@ impl ChainLayer {
 			Some(e) => Err(e),
 			None => Ok(borrowed),
 		}
+	}
+
+	/// What a node other than the one answering the mempool question says of these transactions: the
+	/// Pro in the seat can say it holds what it dropped, so that word is not the only one. Costs one
+	/// question per pass while something own is pending, naming only txids that node was handed
+	/// anyway. What it lacks it is handed, which is how a transaction the Pro swallowed gets out when
+	/// the witnesses were away when it was sent. Only what the wallets know of: an LDK claim no wallet
+	/// holds gets out by LDK sending it again, every 30 s, to the next witnesses in turn.
+	#[cfg(feature = "cbf")]
+	async fn second_opinion_on_own_txs(
+		&self, targets: &[Arc<SyncTarget>], known_by_wallet: &[HashSet<Txid>],
+	) -> HashSet<Txid> {
+		let mut seen = HashSet::new();
+		let txs: Vec<Transaction> = targets
+			.iter()
+			.zip(known_by_wallet)
+			.flat_map(|(target, known)| {
+				known.iter().filter_map(|txid| target.onchain_wallet.known_tx(txid))
+			})
+			.filter(|tx| seen.insert(tx.compute_txid()))
+			.take(MAX_KNOWN_ONLY_QUERY_ITEMS)
+			.collect();
+		if txs.is_empty() {
+			return HashSet::new();
+		}
+		for adapter in self.slots.mempool.adapters() {
+			if let Some(held) = adapter.second_opinion(&txs).await {
+				return held;
+			}
+		}
+		HashSet::new()
+	}
+
+	/// What is left of `evicted` once the transactions this wallet queued and sent have gone back
+	/// to its broadcast queue: held, inputs reserved, sent again on the backoff, and given up by
+	/// the queue's own rules ([`ChainLayer::hold_queued`]). The rest is evicted as ever, which
+	/// hands its inputs back.
+	#[cfg(feature = "cbf")]
+	fn requeue_evicted(&self, wallet: &Arc<Wallet>, evicted: Evicted, now: u64) -> Evicted {
+		evicted
+			.into_iter()
+			.filter(|(txid, _)| {
+				// Held already: its reason and its backoff stay what its last try made them.
+				if wallet.broadcast_queue().is_held(txid) {
+					return false;
+				}
+				let Some(tx) = wallet.known_tx(txid) else {
+					return true;
+				};
+				if !wallet.broadcast_queue().requeue_sent(txid, now) {
+					return true;
+				}
+				log_info!(
+					self.shared.logger,
+					"Transaction {} left the mempool of the node that answers for this one; queueing it to send it again",
+					txid
+				);
+				let reason = "it left the mempool of the node that answers for this one".to_string();
+				!self.hold_queued(wallet, &tx, reason, false, now).contains(txid)
+			})
+			.collect()
 	}
 
 	/// Drop from `evicted` every transaction this node itself broadcast within
@@ -2008,12 +2081,62 @@ impl ChainLayer {
 			.tx_status
 			.run_checked(
 				|a| async move { a.tx_status(txid, script_pubkey).await },
-				|by, answer| self.anchored_on_our_chain("tx_status", by, answer),
+				|by, answer| async move {
+					let answer = self.anchored_on_our_chain("tx_status", by, answer).await?;
+					self.confirmed_on_our_chain(txid, by, answer).await
+				},
 			)
 			.await
 		{
 			Ok(answered) => answered.value,
 			Err(_) => Anchored { value: RawTxObservation::Unreachable, tip: None },
+		}
+	}
+
+	/// N6: a provider's word that a transaction confirmed is what a swap taker pays on, and a provider
+	/// can be a stranger. Where this node follows the chain itself it takes that only with the block
+	/// ([`SyncEngine::check_provider_confirmation`]). Refused, the chain advances and comes up
+	/// empty, which reads as no chain source: nothing is paid and nothing armed. What a provider says
+	/// of a transaction not confirming costs a delay; see `swap_engine`, which holds a confirmation
+	/// it already armed against the same block.
+	#[cfg(feature = "swaps")]
+	async fn confirmed_on_our_chain(
+		&self, txid: Txid, by: &'static str, answer: Anchored<RawTxObservation>,
+	) -> ActionResult<Anchored<RawTxObservation>> {
+		let RawTxObservation::Confirmed { height, .. } = answer.value else {
+			return Ok(answer);
+		};
+		if by == CBF_WATCH_ADAPTER {
+			return Ok(answer);
+		}
+		match self.engine.check_provider_confirmation(txid, height).await {
+			ProviderConfirmation::CannotTell => Ok(answer),
+			ProviderConfirmation::Shown { height, confirmations, tip } => Ok(Anchored {
+				value: RawTxObservation::Confirmed { height: Some(height), confirmations },
+				tip: Some(tip),
+			}),
+			ProviderConfirmation::NotShown | ProviderConfirmation::NoBlock => {
+				log_info!(
+					self.shared.logger,
+					"slot=tx_status adapter={} said {} confirmed at {:?}, and no block shows it; refusing the answer",
+					by,
+					txid,
+					height
+				);
+				Err(ChainActionError::unavailable("a confirmation the block does not show"))
+			},
+		}
+	}
+
+	/// What the block this node's own chain holds at `height` says of `txid`. See
+	/// [`ChainLayer::confirmed_on_our_chain`].
+	#[cfg(feature = "swaps")]
+	pub(crate) async fn tx_in_our_block(&self, txid: Txid, height: u32) -> SwapTxInBlock {
+		match self.engine.check_provider_confirmation(txid, Some(height)).await {
+			ProviderConfirmation::CannotTell => SwapTxInBlock::NoChainOfItsOwn,
+			ProviderConfirmation::Shown { .. } => SwapTxInBlock::Holds,
+			ProviderConfirmation::NotShown => SwapTxInBlock::Lacks,
+			ProviderConfirmation::NoBlock => SwapTxInBlock::NoBlock,
 		}
 	}
 
@@ -2207,6 +2330,28 @@ impl ChainLayer {
 			return Err(Error::ChainServeFailed);
 		}
 
+		// With no script it is answered one RPC per txid, so its cost is its length; with one, by a
+		// walk of the whole mempool. Only a few of each at once, and those not waited for, so a
+		// stranger's questions cannot fill this node's bitcoind and cost it its own readiness. A
+		// per-peer budget is the rate limit guard's.
+		if req.known_unconfirmed.len() > MAX_KNOWN_ONLY_QUERY_ITEMS {
+			log_info!(
+				self.shared.logger,
+				"Refusing a mempool question of {} known txids: more than the {} this node answers",
+				req.known_unconfirmed.len(),
+				MAX_KNOWN_ONLY_QUERY_ITEMS
+			);
+			return Err(Error::ChainServeFailed);
+		}
+		let few = if req.spks.is_empty() { &self.known_only_questions } else { &self.scripted_questions };
+		let Ok(_one_of_few) = few.try_acquire() else {
+			log_debug!(
+				self.shared.logger,
+				"Refusing a mempool question: as many of its kind are being answered as this node answers at once"
+			);
+			return Err(Error::ChainServeFailed);
+		};
+
 		let query = wire_to_mempool_query(req).map_err(|e| {
 			log_error!(self.shared.logger, "Refusing a malformed mempool request: {}", e);
 			Error::ChainServeFailed
@@ -2305,6 +2450,14 @@ impl ChainLayer {
 		&self, req: &WireBlockRequest,
 	) -> Result<WireBlockChunk, Error> {
 		self.raw_server()?.serve_block_chunk(req).await
+	}
+
+	/// One block's bundle to push, with this node's own fee estimates when it
+	/// has them; see [`Self::serve_fee_estimates`].
+	pub(crate) async fn serve_block_update(&self, height: u32) -> Result<WireBlockUpdate, Error> {
+		let mut update = self.raw_server()?.serve_block_update(height).await?;
+		update.fee_estimates = self.serve_fee_estimates().ok();
+		Ok(update)
 	}
 
 	/// The bundles above a block, for a node pulling them. Only the newest
@@ -2499,6 +2652,10 @@ mod tests {
 	struct FakeMempool {
 		name: &'static str,
 		behaviour: MempoolBehaviour,
+		/// What a second node says it holds, when one was asked.
+		second: Mutex<Option<HashSet<Txid>>>,
+		/// Answers wait while this is held.
+		gate: tokio::sync::RwLock<()>,
 		/// Every query the adapter was asked, so a test can check what
 		/// reached it.
 		queries: Mutex<Vec<MempoolQuery>>,
@@ -2506,7 +2663,13 @@ mod tests {
 
 	impl FakeMempool {
 		fn new(name: &'static str, behaviour: MempoolBehaviour) -> Arc<Self> {
-			Arc::new(Self { name, behaviour, queries: Mutex::new(Vec::new()) })
+			Arc::new(Self {
+				name,
+				behaviour,
+				second: Mutex::new(None),
+				gate: tokio::sync::RwLock::new(()),
+				queries: Mutex::new(Vec::new()),
+			})
 		}
 
 		fn queries(&self) -> Vec<MempoolQuery> {
@@ -2520,8 +2683,13 @@ mod tests {
 			self.name
 		}
 
+		async fn second_opinion(&self, _txs: &[Transaction]) -> Option<HashSet<Txid>> {
+			self.second.lock().unwrap().clone()
+		}
+
 		async fn mempool(&self, query: &MempoolQuery) -> ActionResult<Anchored<MempoolAnswer>> {
 			self.queries.lock().unwrap().push(query.clone());
+			let _open = self.gate.read().await;
 			match &self.behaviour {
 				MempoolBehaviour::Answer { unconfirmed, tip } => Ok(Anchored {
 					value: MempoolAnswer {
@@ -2615,6 +2783,8 @@ mod tests {
 		/// The blocks this engine can place on its chain, and whether they are
 		/// on it. A block not listed is one it cannot tell about.
 		known_blocks: HashMap<BlockId, bool>,
+		#[cfg(feature = "swaps")]
+		provider_confirmation: ProviderConfirmation,
 	}
 
 	#[async_trait]
@@ -2637,6 +2807,13 @@ mod tests {
 
 		async fn is_on_chain(&self, block: &BlockId) -> Option<bool> {
 			self.known_blocks.get(block).copied()
+		}
+
+		#[cfg(feature = "swaps")]
+		async fn check_provider_confirmation(
+			&self, _txid: Txid, _height: Option<u32>,
+		) -> ProviderConfirmation {
+			self.provider_confirmation
 		}
 
 		async fn sync_once(
@@ -2677,6 +2854,8 @@ mod tests {
 		/// against a node that may serve at all.
 		serves_peers: bool,
 		known_blocks: HashMap<BlockId, bool>,
+		#[cfg(feature = "swaps")]
+		provider_confirmation: ProviderConfirmation,
 		/// An existing wallet to build over, so a test can fund a wallet
 		/// once and then run different chains against it.
 		wallet: Option<Arc<Wallet>>,
@@ -2694,6 +2873,8 @@ mod tests {
 				serves_mempool: false,
 				serves_peers: true,
 				known_blocks: HashMap::new(),
+				#[cfg(feature = "swaps")]
+				provider_confirmation: ProviderConfirmation::CannotTell,
 				wallet: None,
 			}
 		}
@@ -2721,6 +2902,8 @@ mod tests {
 			serves_mempool: spec.serves_mempool,
 			serves_peers: spec.serves_peers,
 			known_blocks: spec.known_blocks,
+			#[cfg(feature = "swaps")]
+			provider_confirmation: spec.provider_confirmation,
 		});
 		let slots = ChainSlots {
 			fee: ActionChain::new("fee", FEE_BUDGET, Vec::new(), Arc::clone(&logger)),
@@ -3536,6 +3719,162 @@ mod tests {
 			Err(Error::ChainServeFailed)
 		));
 		assert_eq!(local.queries().len(), 1);
+	}
+
+	/// N7: a question with no script costs one RPC per txid, so its length is capped far below a
+	/// question with scripts, and only a few run at once: the next is refused, not queued.
+	#[tokio::test]
+	async fn a_question_with_no_script_is_short_and_few_run_at_once() {
+		let local = FakeMempool::new(
+			"local",
+			MempoolBehaviour::Answer {
+				unconfirmed: Vec::new(),
+				tip: Some(BlockId { height: 1, hash: BlockHash::all_zeros() }),
+			},
+		);
+		let h = Arc::new(build(HarnessSpec {
+			mempool: as_mempool(&[Arc::clone(&local)]),
+			serves_mempool: true,
+			serves_peers: true,
+			..HarnessSpec::default()
+		}));
+		let question = |count: usize| WireMempoolRequest {
+			version: CHAIN_WIRE_VERSION,
+			spks: Vec::new(),
+			known_unconfirmed: vec![Txid::all_zeros().to_string(); count],
+		};
+		assert!(matches!(
+			h.layer.serve_mempool(&question(MAX_KNOWN_ONLY_QUERY_ITEMS + 1)).await,
+			Err(Error::ChainServeFailed)
+		));
+		assert!(local.queries().is_empty(), "refused before the adapter is asked");
+
+		let held = local.gate.write().await;
+		let mut asking = Vec::new();
+		for _ in 0..MAX_KNOWN_ONLY_QUESTIONS_AT_ONCE {
+			let h = Arc::clone(&h);
+			let question = question(MAX_KNOWN_ONLY_QUERY_ITEMS);
+			asking.push(tokio::spawn(async move { h.layer.serve_mempool(&question).await.is_ok() }));
+		}
+		while local.queries().len() < MAX_KNOWN_ONLY_QUESTIONS_AT_ONCE {
+			tokio::task::yield_now().await;
+		}
+		assert!(matches!(h.layer.serve_mempool(&question(1)).await, Err(Error::ChainServeFailed)));
+		drop(held);
+		for one in asking {
+			assert!(one.await.unwrap());
+		}
+		assert!(h.layer.serve_mempool(&question(1)).await.is_ok(), "and it is free again");
+
+		// One script in the question is no way round any of it.
+		let scripted = |count: usize| WireMempoolRequest {
+			version: CHAIN_WIRE_VERSION,
+			spks: vec!["0014aa".to_string()],
+			known_unconfirmed: vec![Txid::all_zeros().to_string(); count],
+		};
+		assert!(matches!(
+			h.layer.serve_mempool(&scripted(MAX_KNOWN_ONLY_QUERY_ITEMS + 1)).await,
+			Err(Error::ChainServeFailed)
+		));
+		let asked_before = local.queries().len();
+		let held = local.gate.write().await;
+		let mut asking = Vec::new();
+		for _ in 0..MAX_SCRIPTED_QUESTIONS_AT_ONCE {
+			let h = Arc::clone(&h);
+			let question = scripted(1);
+			asking.push(tokio::spawn(async move { h.layer.serve_mempool(&question).await.is_ok() }));
+		}
+		while local.queries().len() < asked_before + MAX_SCRIPTED_QUESTIONS_AT_ONCE {
+			tokio::task::yield_now().await;
+		}
+		assert!(matches!(h.layer.serve_mempool(&scripted(1)).await, Err(Error::ChainServeFailed)));
+		assert_eq!(
+			local.queries().len(),
+			asked_before + MAX_SCRIPTED_QUESTIONS_AT_ONCE,
+			"refused before the adapter is asked"
+		);
+		// A filter node's question, with none, is not kept out by those.
+		let known_only = {
+			let h = Arc::clone(&h);
+			let question = question(1);
+			tokio::spawn(async move { h.layer.serve_mempool(&question).await.is_ok() })
+		};
+		while local.queries().len() < asked_before + MAX_SCRIPTED_QUESTIONS_AT_ONCE + 1 {
+			tokio::task::yield_now().await;
+		}
+		drop(held);
+		assert!(known_only.await.unwrap());
+		for one in asking {
+			assert!(one.await.unwrap());
+		}
+	}
+
+	/// N1: the word of the Pro answering that a transaction left does not stand against a second
+	/// node's that it holds it: that is how a lying eviction would hand the coins back.
+	#[cfg(feature = "cbf")]
+	#[tokio::test]
+	async fn an_eviction_does_not_stand_against_a_witness_holding_the_transaction() {
+		let logger = Arc::new(Logger::new_log_facade());
+		let kv_store: Arc<DynStore> = Arc::new(TestStore::new(false));
+		let broadcaster = Arc::new(TransactionBroadcaster::new(Arc::clone(&logger)));
+		let fee_estimator = Arc::new(OnchainFeeEstimator::new());
+		let wallet = fresh_wallet(&kv_store, &broadcaster, &fee_estimator, &logger);
+		let pending = deposit(&wallet, 2);
+		unconfirmed(&wallet, &[&pending]);
+		let tip = tip_at(7, 0x07);
+		let provider = FakeMempool::new(
+			"provider",
+			MempoolBehaviour::Answer { unconfirmed: Vec::new(), tip: Some(tip) },
+		);
+		*provider.second.lock().unwrap() = Some([pending.compute_txid()].into());
+		let h = build(HarnessSpec {
+			mempool: as_mempool(&[Arc::clone(&provider)]),
+			tracks_own_broadcasts: true,
+			known_blocks: [(tip, true)].into(),
+			wallet: Some(Arc::clone(&wallet)),
+			..HarnessSpec::default()
+		});
+		let borrowed = h.layer.borrow_mempool(&[h.target()], 7).await.unwrap();
+		assert_eq!(borrowed.evicted, 0);
+		assert!(unconfirmed_txids(&wallet).contains(&pending.compute_txid()));
+
+		// With nobody saying otherwise, the same answer takes it out.
+		*provider.second.lock().unwrap() = None;
+		let borrowed = h.layer.borrow_mempool(&[h.target()], 7).await.unwrap();
+		assert_eq!(borrowed.evicted, 1);
+	}
+
+	/// N6. A provider's Confirmed on a node with a chain of its own stands only with the block.
+	#[cfg(feature = "swaps")]
+	#[tokio::test]
+	async fn a_providers_confirmation_stands_only_with_the_block() {
+		let txid = Txid::all_zeros();
+		let tip = BlockId { height: 100, hash: BlockHash::all_zeros() };
+		let says = RawTxObservation::Confirmed { height: Some(90), confirmations: 3 };
+		for (check, expected) in [
+			(ProviderConfirmation::NotShown, RawTxObservation::Unreachable),
+			(
+				ProviderConfirmation::Shown { height: 90, confirmations: 11, tip },
+				RawTxObservation::Confirmed { height: Some(90), confirmations: 11 },
+			),
+			(ProviderConfirmation::CannotTell, says),
+		] {
+			let provider = FakeTxStatus::new("dependent", says, None);
+			let h = build(HarnessSpec {
+				tx_status: vec![provider as Arc<dyn TxStatusAction>],
+				provider_confirmation: check,
+				..HarnessSpec::default()
+			});
+			assert_eq!(h.layer.swap_query_tx(txid, None).await, expected, "{:?}", check);
+		}
+		// What this node read itself needs no such check.
+		let own = FakeTxStatus::new(CBF_WATCH_ADAPTER, says, None);
+		let h = build(HarnessSpec {
+			tx_status: vec![own as Arc<dyn TxStatusAction>],
+			provider_confirmation: ProviderConfirmation::NotShown,
+			..HarnessSpec::default()
+		});
+		assert_eq!(h.layer.swap_query_tx(txid, None).await, says);
 	}
 
 	/// A provider that answers nothing, for a preset whose shape — not whose
@@ -4365,6 +4704,10 @@ mod tests {
 		wallet.apply_mempool_txs(Vec::new(), vec![(incoming.compute_txid(), now - 90)]).unwrap();
 		assert!(!unconfirmed_txids(&wallet).contains(&incoming.compute_txid()));
 
+		// Something else is pending, so there is a question to ask.
+		let pending = deposit(&wallet, 2);
+		unconfirmed(&wallet, &[&pending]);
+
 		// The provider sees it again, and stamps it `1` on its own clock.
 		let provider = FakeMempool::new(
 			"provider",
@@ -4379,10 +4722,10 @@ mod tests {
 		});
 		let borrowed = h
 			.layer
-			.borrow_mempool(&[h.target()], &HashSet::new(), 7, MempoolEvictions::Apply)
+			.borrow_mempool(&[h.target()], 7)
 			.await
 			.unwrap();
-		assert_eq!(borrowed, BorrowedMempool { by: "provider", unconfirmed: 1, evicted: 0 });
+		assert_eq!(borrowed, BorrowedMempool { by: "provider", unconfirmed: 1, evicted: 1 });
 		assert!(
 			unconfirmed_txids(&wallet).contains(&incoming.compute_txid()),
 			"back in the mempool: the sighting is later than the eviction on one clock"
@@ -4396,19 +4739,18 @@ mod tests {
 		});
 		assert!(h
 			.layer
-			.borrow_mempool(&[h.target()], &HashSet::new(), 7, MempoolEvictions::Apply)
+			.borrow_mempool(&[h.target()], 7)
 			.await
 			.is_err());
 	}
 
-	/// A node still catching up borrows the unconfirmed half of the view and
-	/// withholds the evictions: a known transaction missing from the
-	/// provider's mempool may have confirmed in a block not yet applied here.
-	/// Once caught up, the same answer evicts it.
+	/// A view anchored above this node's applied tip keeps its evictions to itself: a known
+	/// transaction missing from it may have confirmed in a block not applied here. At the tip,
+	/// the same answer evicts it.
 	#[cfg(feature = "cbf")]
 	#[tokio::test]
-	async fn a_node_still_catching_up_borrows_unconfirmed_but_withholds_evictions() {
-		let tip = tip_at(7, 0x07);
+	async fn an_answer_ahead_of_the_applied_tip_withholds_its_evictions() {
+		let tip = tip_at(8, 0x08);
 		let logger = Arc::new(Logger::new_log_facade());
 		let kv_store: Arc<DynStore> = Arc::new(TestStore::new(false));
 		let broadcaster = Arc::new(TransactionBroadcaster::new(Arc::clone(&logger)));
@@ -4416,13 +4758,11 @@ mod tests {
 		let wallet = fresh_wallet(&kv_store, &broadcaster, &fee_estimator, &logger);
 		let known = deposit(&wallet, 1);
 		unconfirmed(&wallet, &[&known]);
-		let incoming = deposit(&wallet, 2);
 
-		// The provider has `incoming` and no longer has `known`: the fake
-		// evicts every known unconfirmed transaction it is asked about.
+		// The fake evicts every known unconfirmed transaction it is asked about.
 		let provider = FakeMempool::new(
 			"provider",
-			MempoolBehaviour::Answer { unconfirmed: vec![incoming.clone()], tip: Some(tip) },
+			MempoolBehaviour::Answer { unconfirmed: Vec::new(), tip: Some(tip) },
 		);
 		let h = build(HarnessSpec {
 			mempool: as_mempool(&[Arc::clone(&provider)]),
@@ -4432,21 +4772,152 @@ mod tests {
 			..HarnessSpec::default()
 		});
 		let targets = [h.target()];
-		let none = HashSet::new();
 
-		let borrowed = h.layer.borrow_mempool(&targets, &none, 7, MempoolEvictions::Withhold).await.unwrap();
-		assert_eq!(borrowed, BorrowedMempool { by: "provider", unconfirmed: 1, evicted: 0 });
-		let mut both = vec![known.compute_txid(), incoming.compute_txid()];
-		both.sort();
-		assert_eq!(
-			unconfirmed_txids(&wallet),
-			both,
-			"the new payment is seen; the missing one is kept until our blocks say otherwise"
+		let borrowed = h.layer.borrow_mempool(&targets, 7).await.unwrap();
+		assert_eq!(borrowed, BorrowedMempool { by: "provider", unconfirmed: 0, evicted: 0 });
+		assert_eq!(unconfirmed_txids(&wallet), vec![known.compute_txid()], "ours is a block behind");
+
+		let borrowed = h.layer.borrow_mempool(&targets, 8).await.unwrap();
+		assert_eq!(borrowed, BorrowedMempool { by: "provider", unconfirmed: 0, evicted: 1 });
+		assert!(unconfirmed_txids(&wallet).is_empty());
+	}
+
+	/// A transaction this wallet queued and sent, gone from the mempool, goes back to the queue:
+	/// its inputs stay reserved and the queue sends it again. One the queue never held is evicted
+	/// as ever, its inputs back in the balance: never counted as lost either way.
+	#[cfg(feature = "cbf")]
+	#[tokio::test]
+	async fn an_evicted_transaction_the_queue_sent_goes_back_to_the_queue() {
+		let tip = tip_at(7, 0x07);
+		let logger = Arc::new(Logger::new_log_facade());
+		let kv_store: Arc<DynStore> = Arc::new(TestStore::new(false));
+		let broadcaster = Arc::new(TransactionBroadcaster::new(Arc::clone(&logger)));
+		let fee_estimator = Arc::new(OnchainFeeEstimator::new());
+		let wallet = fresh_wallet(&kv_store, &broadcaster, &fee_estimator, &logger);
+		let first = deposit(&wallet, 1);
+		let second = deposit(&wallet, 2);
+		let queued = spend_of(&first);
+		let unqueued = spend_of(&second);
+		unconfirmed(&wallet, &[&first, &second, &queued, &unqueued]);
+		let total = total_sats(&wallet);
+		let queue = wallet.broadcast_queue();
+		queue.register(queued.compute_txid(), BroadcastPolicy::default(), 1);
+		queue.mark_sent(&[queued.compute_txid()], 1);
+		assert!(!queue.has_held());
+
+		let provider = FakeMempool::new(
+			"provider",
+			MempoolBehaviour::Answer { unconfirmed: Vec::new(), tip: Some(tip) },
 		);
+		let h = build(HarnessSpec {
+			mempool: as_mempool(&[Arc::clone(&provider)]),
+			tracks_own_broadcasts: true,
+			known_blocks: [(tip, true)].into(),
+			wallet: Some(Arc::clone(&wallet)),
+			..HarnessSpec::default()
+		});
+		h.layer.borrow_mempool(&[h.target()], 7).await.unwrap();
 
-		let borrowed = h.layer.borrow_mempool(&targets, &none, 7, MempoolEvictions::Apply).await.unwrap();
-		assert_eq!(borrowed, BorrowedMempool { by: "provider", unconfirmed: 1, evicted: 1 });
-		assert_eq!(unconfirmed_txids(&wallet), vec![incoming.compute_txid()]);
+		assert!(queue.is_held(&queued.compute_txid()), "the queue has it");
+		let entry = queue
+			.list(|_| false)
+			.into_iter()
+			.find(|e| e.txid == queued.compute_txid())
+			.expect("listed");
+		assert_eq!(entry.state, BroadcastQueueState::Waiting);
+		assert!(entry.last_error.unwrap().contains("left the mempool"), "and says why");
+		let unconfirmed_now = unconfirmed_txids(&wallet);
+		assert!(unconfirmed_now.contains(&queued.compute_txid()), "inputs reserved");
+		assert!(!unconfirmed_now.contains(&unqueued.compute_txid()), "the other evicted as ever");
+		assert!(total_sats(&wallet) >= total, "no sat counted lost");
+		assert!(!queue.is_abandoned(&queued.compute_txid()));
+
+		// The next block's question finds it still absent: the queue's own state stands.
+		h.layer.borrow_mempool(&[h.target()], 7).await.unwrap();
+		let again = queue
+			.list(|_| false)
+			.into_iter()
+			.find(|e| e.txid == queued.compute_txid())
+			.expect("listed");
+		assert_eq!(again.attempts, 1, "a question is not a try: the backoff is the queue's");
+	}
+
+	/// The wallet a transaction pays goes on showing it while the sibling that sent it holds it
+	/// for sending again: the device's money is not counted as gone from both.
+	#[cfg(feature = "cbf")]
+	#[tokio::test]
+	async fn the_sibling_it_pays_goes_on_showing_a_transaction_back_in_the_queue() {
+		let tip = tip_at(7, 0x07);
+		let provider = FakeMempool::new(
+			"provider",
+			MempoolBehaviour::Answer { unconfirmed: Vec::new(), tip: Some(tip) },
+		);
+		let (h, sibling) = two_wallets(&provider, tip);
+		let coin = deposit(&h.wallet, 1);
+		let script = sibling.get_new_address().unwrap().script_pubkey();
+		let payment = tx_paying(
+			OutPoint { txid: coin.compute_txid(), vout: 0 },
+			FUNDING_SATS - 1_000,
+			script,
+		);
+		unconfirmed(&h.wallet, &[&coin, &payment]);
+		unconfirmed(&sibling, &[&payment]);
+		let sibling_total = total_sats(&sibling);
+		assert!(sibling_total > 0);
+		let queue = h.wallet.broadcast_queue();
+		queue.register(payment.compute_txid(), BroadcastPolicy::default(), 1);
+		queue.mark_sent(&[payment.compute_txid()], 1);
+
+		let targets = h.layer.targets().snapshot();
+		h.layer.borrow_mempool(&targets, 7).await.unwrap();
+
+		assert!(queue.is_held(&payment.compute_txid()));
+		assert_eq!(unconfirmed_txids(&sibling), vec![payment.compute_txid()]);
+		assert_eq!(total_sats(&sibling), sibling_total);
+	}
+
+	/// Back in the queue, the transaction is given up by the queue's own rule, once: `max_age`
+	/// from the first time it left the mempool. Then the inputs come back.
+	#[cfg(feature = "cbf")]
+	#[tokio::test]
+	async fn an_evicted_transaction_past_its_max_age_is_given_up_and_its_inputs_come_back() {
+		let tip = tip_at(7, 0x07);
+		let logger = Arc::new(Logger::new_log_facade());
+		let kv_store: Arc<DynStore> = Arc::new(TestStore::new(false));
+		let broadcaster = Arc::new(TransactionBroadcaster::new(Arc::clone(&logger)));
+		let fee_estimator = Arc::new(OnchainFeeEstimator::new());
+		let wallet = fresh_wallet(&kv_store, &broadcaster, &fee_estimator, &logger);
+		let coin = deposit(&wallet, 1);
+		let spend = spend_of(&coin);
+		unconfirmed(&wallet, &[&coin, &spend]);
+		let queue = wallet.broadcast_queue();
+		queue.register(spend.compute_txid(), BroadcastPolicy::default(), 1);
+		queue.mark_sent(&[spend.compute_txid()], 1);
+		// It keeps coming and going: first long ago, then since, and this is the third time.
+		let max_age = crate::broadcast_queue::DEFAULT_BROADCAST_QUEUE_MAX_AGE_SECS;
+		let long_ago = unix_now_secs() - max_age - 1;
+		assert!(queue.requeue_sent(&spend.compute_txid(), long_ago));
+		queue.mark_sent(&[spend.compute_txid()], long_ago + 1);
+		assert!(queue.requeue_sent(&spend.compute_txid(), long_ago + max_age / 2));
+		queue.mark_sent(&[spend.compute_txid()], long_ago + max_age / 2 + 1);
+
+		let provider = FakeMempool::new(
+			"provider",
+			MempoolBehaviour::Answer { unconfirmed: Vec::new(), tip: Some(tip) },
+		);
+		let h = build(HarnessSpec {
+			mempool: as_mempool(&[Arc::clone(&provider)]),
+			tracks_own_broadcasts: true,
+			known_blocks: [(tip, true)].into(),
+			wallet: Some(Arc::clone(&wallet)),
+			..HarnessSpec::default()
+		});
+		h.layer.borrow_mempool(&[h.target()], 7).await.unwrap();
+
+		assert!(queue.is_abandoned(&spend.compute_txid()));
+		assert!(!queue.is_held(&spend.compute_txid()));
+		assert!(queue.definitively_abandoned().is_empty(), "nothing proved it dead");
+		assert!(!unconfirmed_txids(&wallet).contains(&spend.compute_txid()), "inputs back");
 	}
 
 	/// Two wallets over one provider, with separate keys and stores.
@@ -4481,77 +4952,50 @@ mod tests {
 		(h, other)
 	}
 
-	/// Two wallets ask one question, and each gets only its own share: a deposit lands in the
-	/// wallet it pays and moves no other balance, and a child of a wallet's unconfirmed
-	/// transaction lands in that wallet.
+	/// Two wallets ask one question, about what they hold and nothing else: no script of theirs,
+	/// no script of LDK's. An older Pro still answers with transactions, and each wallet gets only
+	/// its own share: a child of a wallet's unconfirmed transaction lands in that wallet, and in
+	/// no other.
 	#[cfg(feature = "cbf")]
 	#[tokio::test]
-	async fn two_wallets_ask_one_question_and_each_gets_only_its_own_share() {
+	async fn two_wallets_ask_one_question_with_no_script_and_each_gets_only_its_own_share() {
 		let tip = tip_at(7, 0x07);
-		let provider = FakeMempool::new(
+		let probe = FakeMempool::new(
 			"provider",
 			MempoolBehaviour::Answer { unconfirmed: Vec::new(), tip: Some(tip) },
 		);
-		let (h, other) = two_wallets(&provider, tip);
+		let (h, other) = two_wallets(&probe, tip);
 		let mine = deposit(&h.wallet, 1);
 		let theirs = deposit(&other, 2);
+		unconfirmed(&h.wallet, &[&mine]);
+		unconfirmed(&other, &[&theirs]);
 		let spend = spend_of(&theirs);
 		let answering = FakeMempool::new(
-			"provider",
-			MempoolBehaviour::Answer {
-				unconfirmed: vec![mine.clone(), theirs.clone()],
-				tip: Some(tip),
-			},
-		);
-		let h2 = {
-			let (h2, other2) = two_wallets_over(&answering, tip, &h.wallet, &other);
-			assert!(Arc::ptr_eq(&other2, &other));
-			h2
-		};
-
-		let targets = h2.layer.targets().snapshot();
-		let registered = HashSet::from([someone_elses_script()]);
-		let borrowed = h2
-			.layer
-			.borrow_mempool(&targets, &registered, 7, MempoolEvictions::Apply)
-			.await
-			.unwrap();
-		assert_eq!(borrowed, BorrowedMempool { by: "provider", unconfirmed: 2, evicted: 0 });
-
-		let asked = answering.queries();
-		assert_eq!(asked.len(), 1, "one question for both wallets");
-		assert!(asked[0].scripts.contains(&mine.output[0].script_pubkey));
-		assert!(asked[0].scripts.contains(&theirs.output[0].script_pubkey));
-		assert!(asked[0].scripts.contains(&someone_elses_script()), "and LDK's scripts");
-		assert_eq!(asked[0].scope, MempoolScope::Incremental { best_processed_height: 7 });
-
-		assert_eq!(unconfirmed_txids(&h.wallet), vec![mine.compute_txid()]);
-		assert_eq!(unconfirmed_txids(&other), vec![theirs.compute_txid()]);
-		assert!(!h.wallet.knows_tx(&theirs.compute_txid()), "never in the other wallet's graph");
-		assert!(!other.knows_tx(&mine.compute_txid()));
-		assert_eq!(total_sats(&h.wallet), FUNDING_SATS);
-		assert_eq!(total_sats(&other), FUNDING_SATS);
-
-		// The pass after that names what each holds; a spend of the other's lands with it.
-		let spending = FakeMempool::new(
 			"provider",
 			MempoolBehaviour::Answer {
 				unconfirmed: vec![mine.clone(), theirs.clone(), spend.clone()],
 				tip: Some(tip),
 			},
 		);
-		let (h3, _) = two_wallets_over(&spending, tip, &h.wallet, &other);
-		let targets = h3.layer.targets().snapshot();
-		h3.layer.borrow_mempool(&targets, &registered, 7, MempoolEvictions::Apply).await.unwrap();
-		let asked = spending.queries();
-		assert_eq!(asked.len(), 1);
+		let (h2, _) = two_wallets_over(&answering, tip, &h.wallet, &other);
+		let targets = h2.layer.targets().snapshot();
+		let borrowed = h2.layer.borrow_mempool(&targets, 7).await.unwrap();
+		assert_eq!(borrowed, BorrowedMempool { by: "provider", unconfirmed: 3, evicted: 0 });
+
+		let asked = answering.queries();
+		assert_eq!(asked.len(), 1, "one question for both wallets");
+		assert!(asked[0].scripts.is_empty(), "no script, whoever's: {:?}", asked[0].scripts);
 		let mut both = vec![mine.compute_txid(), theirs.compute_txid()];
 		both.sort();
 		let mut known = asked[0].known_unconfirmed.clone();
 		known.sort();
 		assert_eq!(known, both, "the union of what the wallets hold");
+		assert_eq!(asked[0].scope, MempoolScope::Incremental { best_processed_height: 7 });
+
 		assert!(other.knows_tx(&spend.compute_txid()));
 		assert!(!h.wallet.knows_tx(&spend.compute_txid()));
+		assert!(!h.wallet.knows_tx(&theirs.compute_txid()), "never in the other wallet's graph");
+		assert!(!other.knows_tx(&mine.compute_txid()));
 		assert_eq!(total_sats(&h.wallet), FUNDING_SATS);
 	}
 
@@ -4621,66 +5065,23 @@ mod tests {
 		assert_eq!(shares[1].1, vec![(held_by_second, 6), (held_by_both, 6)]);
 	}
 
-	/// LDK's registered scripts stay in the question. A transaction only they match enters no
-	/// wallet — as before the merge, when each wallet's own question carried them — so no balance
-	/// moves and nothing keeps the gate open. One that also spends a wallet's coin, a funding
-	/// say, lands in that wallet alone.
-	#[cfg(feature = "cbf")]
-	#[tokio::test]
-	async fn ldks_scripts_stay_in_the_question_and_move_no_balance() {
-		let tip = tip_at(7, 0x07);
-		let probe = FakeMempool::new(
-			"provider",
-			MempoolBehaviour::Answer { unconfirmed: Vec::new(), tip: Some(tip) },
-		);
-		let (h, other) = two_wallets(&probe, tip);
-		let coin = deposit(&h.wallet, 1);
-		unconfirmed(&h.wallet, &[&coin]);
-		let funding = spend_of(&coin);
-		let commitment = unrelated(5);
-		let registered = HashSet::from([someone_elses_script()]);
-
-		let provider = FakeMempool::new(
-			"provider",
-			MempoolBehaviour::Answer {
-				unconfirmed: vec![coin.clone(), funding.clone(), commitment.clone()],
-				tip: Some(tip),
-			},
-		);
-		let (h2, _) = two_wallets_over(&provider, tip, &h.wallet, &other);
-		let targets = h2.layer.targets().snapshot();
-		h2.layer.borrow_mempool(&targets, &registered, 7, MempoolEvictions::Apply).await.unwrap();
-
-		assert!(provider.queries()[0].scripts.contains(&someone_elses_script()));
-		for wallet in [&h.wallet, &other] {
-			assert!(!wallet.knows_tx(&commitment.compute_txid()));
-		}
-		assert!(h.wallet.knows_tx(&funding.compute_txid()));
-		assert!(!other.knows_tx(&funding.compute_txid()));
-		assert_eq!(total_sats(&other), 0);
-		assert!(other.get_unconfirmed_txids().is_empty());
-	}
-
 	#[cfg(feature = "cbf")]
 	#[test]
 	fn a_pass_over_the_servers_bound_splits_and_covers_everything_once() {
-		let scripts: Vec<ScriptBuf> =
-			(0..25u8).map(|i| ScriptBuf::new_p2wpkh(&WPubkeyHash::hash(&[i; 33]))).collect();
-		let known: Vec<Txid> = (0..7u8).map(|i| Txid::from_byte_array([i; 32])).collect();
-		// Duplicates: the registered scripts used to travel once per wallet.
-		let doubled = scripts.iter().chain(scripts.iter()).cloned();
-		let questions = mempool_questions(doubled, known.iter().copied(), 9, 10);
-		assert_eq!(questions.len(), 4, "32 items at 10 a question");
-		assert!(questions.iter().all(|q| q.scripts.len() + q.known_unconfirmed.len() <= 10));
-		let asked: HashSet<ScriptBuf> =
-			questions.iter().flat_map(|q| q.scripts.iter().cloned()).collect();
+		let known: Vec<Txid> = (0..25u8).map(|i| Txid::from_byte_array([i; 32])).collect();
+		// Duplicates: two wallets can hold one transaction.
+		let doubled = known.iter().chain(known.iter()).copied();
+		let questions = mempool_questions(doubled, 9, 10);
+		assert_eq!(questions.len(), 3, "25 items at 10 a question");
+		assert!(questions.iter().all(|q| q.known_unconfirmed.len() <= 10));
+		assert!(questions.iter().all(|q| q.scripts.is_empty()));
+		let asked: HashSet<Txid> =
+			questions.iter().flat_map(|q| q.known_unconfirmed.iter().copied()).collect();
 		assert_eq!(asked.len(), 25);
-		assert_eq!(questions.iter().map(|q| q.scripts.len()).sum::<usize>(), 25);
-		assert_eq!(questions.iter().map(|q| q.known_unconfirmed.len()).sum::<usize>(), 7);
+		assert_eq!(questions.iter().map(|q| q.known_unconfirmed.len()).sum::<usize>(), 25);
 
-		let one = mempool_questions(scripts.iter().cloned(), known.iter().copied(), 9, 10_000);
-		assert_eq!(one.len(), 1);
-		assert_eq!(mempool_questions(Vec::new().into_iter(), Vec::new().into_iter(), 9, 10), vec![]);
+		assert_eq!(mempool_questions(known.iter().copied(), 9, 10_000).len(), 1);
+		assert_eq!(mempool_questions(Vec::new().into_iter(), 9, 10), vec![]);
 	}
 
 	/// Over the bound, the answers merge: a transaction two questions both return is applied
@@ -4710,50 +5111,44 @@ mod tests {
 		});
 		let borrowed = h
 			.layer
-			.borrow_mempool(&[h.target()], &HashSet::new(), 7, MempoolEvictions::Apply)
+			.borrow_mempool(&[h.target()], 7)
 			.await
 			.unwrap();
 		assert_eq!(borrowed, BorrowedMempool { by: "provider", unconfirmed: 1, evicted: 0 });
 		assert_eq!(unconfirmed_txids(&wallet), vec![known.compute_txid()]);
 	}
 
-	/// The gate: nothing is wanted from an idle node; an address given out, an unconfirmed
-	/// transaction, a held one and a fresh own broadcast each want a view, the first only while
-	/// the window lasts, and an address on either wallet counts.
+	/// Nothing unconfirmed, nothing asked: an address given out is no reason to ask, on either
+	/// wallet. One unconfirmed transaction is, until it is resolved. It may be one an older build
+	/// took from a Pro's mempool answer and stored: it is asked about like any other.
 	#[cfg(feature = "cbf")]
 	#[tokio::test]
-	async fn the_mempool_is_wanted_only_when_it_could_tell_a_wallet_something() {
+	async fn the_mempool_is_asked_about_nothing_but_what_a_wallet_holds_unconfirmed() {
 		let tip = tip_at(7, 0x07);
 		let provider = FakeMempool::new(
 			"provider",
 			MempoolBehaviour::Answer { unconfirmed: Vec::new(), tip: Some(tip) },
 		);
 		let (h, other) = two_wallets(&provider, tip);
-		let window = Duration::from_secs(3600);
-		assert!(!h.layer.mempool_wanted(window), "idle");
+		let targets = h.layer.targets().snapshot();
 
-		// An address on the second wallet opens the window; a closed window asks nothing.
-		// LDK's own scripts come from the same keychain and pay this node, not a stranger: a
-		// channel open or close is no reason to watch the mempool for two hours.
 		other.get_new_address().unwrap();
-		assert!(!h.layer.mempool_wanted(window), "an address nobody was given");
-		other.get_new_receive_address().unwrap();
-		assert!(h.layer.mempool_wanted(window));
-		assert!(!h.layer.mempool_wanted(Duration::ZERO));
+		h.wallet.get_new_address().unwrap();
+		let borrowed = h.layer.borrow_mempool(&targets, 7).await.unwrap();
+		assert_eq!(borrowed, BorrowedMempool { by: "none", unconfirmed: 0, evicted: 0 });
+		assert!(provider.queries().is_empty(), "idle, addresses or none");
 
-		// An unconfirmed transaction wants it, window or no window, until it is resolved.
-		let incoming = deposit(&h.wallet, 1);
-		unconfirmed(&h.wallet, &[&incoming]);
-		assert!(h.layer.mempool_wanted(Duration::ZERO));
-		h.wallet.apply_mempool_txs(Vec::new(), vec![(incoming.compute_txid(), u64::MAX)]).unwrap();
-		assert!(!h.layer.mempool_wanted(Duration::ZERO), "evicted: nothing left to learn");
+		let stored_by_an_older_build = deposit(&h.wallet, 1);
+		unconfirmed(&h.wallet, &[&stored_by_an_older_build]);
+		h.layer.borrow_mempool(&targets, 7).await.unwrap();
+		let asked = provider.queries();
+		assert_eq!(asked.len(), 1);
+		assert_eq!(asked[0].known_unconfirmed, vec![stored_by_an_older_build.compute_txid()]);
+		assert!(asked[0].scripts.is_empty());
 
-		// So does a transaction this node just put on the network.
-		let sent = Instant::now();
-		h.layer.recent_own_broadcasts.lock().unwrap().record(incoming.compute_txid(), sent);
-		assert!(h.layer.mempool_wanted(Duration::ZERO));
-		h.layer.recent_own_broadcasts.lock().unwrap().sent_at.clear();
-		assert!(!h.layer.mempool_wanted(Duration::ZERO));
+		assert!(unconfirmed_txids(&h.wallet).is_empty(), "the fake evicts what it is asked about");
+		h.layer.borrow_mempool(&targets, 7).await.unwrap();
+		assert_eq!(provider.queries().len(), 1, "evicted: nothing left to ask");
 	}
 
 	/// The own-broadcast memory forgets by age and caps by count, oldest
@@ -5053,6 +5448,7 @@ mod tests {
 		let reply = layer.serve_since(&since).await.unwrap();
 		let fees: Vec<bool> = reply.updates.iter().map(|u| u.fee_estimates.is_some()).collect();
 		assert_eq!(fees, vec![false, false, true]);
+		assert!(layer.serve_block_update(10).await.unwrap().fee_estimates.is_some(), "a push too");
 
 		// One whose fees are borrowed sends none, but still serves the raw data.
 		let mut layer = dependent_preset();
@@ -5063,6 +5459,7 @@ mod tests {
 
 		// Without a raw source there is nothing to bundle.
 		assert_eq!(esplora_preset().serve_since(&since).await, Err(Error::ChainServeUnsupported));
+		assert_eq!(esplora_preset().serve_block_update(1).await, Err(Error::ChainServeUnsupported));
 	}
 
 	#[tokio::test]

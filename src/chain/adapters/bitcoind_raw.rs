@@ -180,6 +180,10 @@ pub(crate) struct SourceReadiness {
 	pub(crate) blocks: Option<u32>,
 	/// Headers bitcoind knows of.
 	pub(crate) headers: Option<u32>,
+	/// Whether bitcoind prunes old blocks.
+	pub(crate) pruned: Option<bool>,
+	/// bitcoind's version, as `31.1`.
+	pub(crate) version: Option<String>,
 }
 
 impl SourceReadiness {
@@ -210,6 +214,18 @@ impl SourceReadiness {
 		self.initial_block_download = info.get("initialblockdownload").and_then(Value::as_bool);
 		self.blocks = height("blocks");
 		self.headers = height("headers");
+		self.pruned = info.get("pruned").and_then(Value::as_bool);
+	}
+
+	/// Fold in a `getnetworkinfo` result: `version` is `MMmmpp`, so 310100 is 31.1.
+	pub(crate) fn apply_network_info(&mut self, info: &Value) {
+		self.version = info.get("version").and_then(Value::as_u64).filter(|v| *v > 0).map(|v| {
+			let (major, minor, patch) = (v / 10_000, v / 100 % 100, v % 100);
+			match patch {
+				0 => format!("{}.{}", major, minor),
+				_ => format!("{}.{}.{}", major, minor, patch),
+			}
+		});
 	}
 
 	/// Why the source cannot serve yet, or `None` when nothing says so. A
@@ -271,6 +287,14 @@ pub struct RawSourceStatus {
 	/// source at once rather than retrying this one. The raw tip is refused
 	/// outright while this is set: a tip read mid-sync is not the chain's.
 	pub not_ready: Option<String>,
+	/// bitcoind's version, as `31.1`. `None` until read.
+	pub version: Option<String>,
+	/// Whether it prunes old blocks. `None` until read.
+	pub pruned: Option<bool>,
+	/// Blocks it has validated. `None` until read.
+	pub blocks: Option<u32>,
+	/// Headers it knows of. `None` until read.
+	pub headers: Option<u32>,
 }
 
 /// The live [`RawSourceStatus`] a [`BitcoindRpcSource`] keeps up to date.
@@ -334,6 +358,14 @@ impl RawSourceHealth {
 			status.filter_index_height = readiness.filter_index_height;
 		}
 		status.not_ready = readiness.not_ready_reason();
+		if readiness.version.is_some() {
+			status.version.clone_from(&readiness.version);
+		}
+		if readiness.blocks.is_some() {
+			status.pruned = readiness.pruned;
+			status.blocks = readiness.blocks;
+			status.headers = readiness.headers;
+		}
 	}
 
 	/// Why the source cannot serve yet; see [`RawSourceStatus::not_ready`].
@@ -606,6 +638,12 @@ impl BitcoindRpcSource {
 		}
 		if let Ok(info) = self.call("getblockchaininfo", json!([]), timeout).await {
 			readiness.apply_chain_info(&info);
+		}
+		// A version does not change under a running process: once is enough.
+		if self.health.snapshot().version.is_none() {
+			if let Ok(info) = self.call("getnetworkinfo", json!([]), timeout).await {
+				readiness.apply_network_info(&info);
+			}
 		}
 		readiness
 	}
@@ -1699,6 +1737,32 @@ mod tests {
 			source.tip().await,
 			Err(SourceError::Unavailable { timed_out: false, .. })
 		));
+	}
+
+	#[test]
+	fn the_version_and_the_heights_reach_the_status_and_a_failed_read_keeps_them() {
+		let mut r = SourceReadiness::default();
+		r.apply_network_info(&json!({ "version": 310100, "subversion": "/Satoshi:31.1.0/" }));
+		assert_eq!(r.version.as_deref(), Some("31.1"));
+		r.apply_network_info(&json!({ "version": 280102 }));
+		assert_eq!(r.version.as_deref(), Some("28.1.2"));
+		r.apply_chain_info(&json!({
+			"blocks": 902118, "headers": 921436, "pruned": true, "initialblockdownload": true,
+		}));
+		let health = RawSourceHealth {
+			status: Mutex::new(RawSourceStatus { configured: true, ..Default::default() }),
+		};
+		health.record_readiness(&r);
+		let seen = health.snapshot();
+		assert_eq!(seen.version.as_deref(), Some("28.1.2"));
+		assert_eq!(seen.pruned, Some(true));
+		assert_eq!((seen.blocks, seen.headers), (Some(902118), Some(921436)));
+
+		// bitcoind went away: what is known stays known.
+		health.record_readiness(&SourceReadiness::default());
+		let seen = health.snapshot();
+		assert_eq!(seen.version.as_deref(), Some("28.1.2"));
+		assert_eq!((seen.pruned, seen.blocks), (Some(true), Some(902118)));
 	}
 
 	#[test]
