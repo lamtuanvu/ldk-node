@@ -93,6 +93,10 @@ pub(crate) enum ChainOp {
 	/// height is a true tip; the applicator judges stranded listeners against it and nothing
 	/// else.
 	Synced { tip_height: u32 },
+	/// A block already applied, or passed by filter, to be read again for what it holds of this
+	/// node's: what no filter is trusted for. Moves no tip and disconnects nothing, so a channel
+	/// funded at or above it stays confirmed. The permit is as on [`ChainOp::ConnectFull`].
+	ScanBlock { block: IndexedBlock, permit: OwnedSemaphorePermit },
 	/// A listener joined below the applied tip and the source is about to re-emit every
 	/// filter after `from_height`: expect the next block at `from_height + 1`. The listeners
 	/// already past it skip the replay block by block (the gated fan-out's
@@ -121,6 +125,9 @@ pub(crate) trait ChainFanout: Send + Sync {
 	fn connect_filtered(&self, header: &Header, height: u32);
 	/// One disconnected header, applied tip-first down to the fork point.
 	fn disconnect(&self, header: &Header, height: u32);
+	/// A block at or below every listener's tip, read again for what it holds. See
+	/// [`ChainOp::ScanBlock`].
+	fn scan_block(&self, block: &Block, height: u32);
 	/// The first divergence any listener recorded since the last drain.
 	fn take_divergence(&self) -> Option<String>;
 	/// Judge the replay batch against the tip it ended at; `true` if a listener is stranded.
@@ -142,6 +149,10 @@ impl ChainFanout for ChainListener {
 
 	fn disconnect(&self, header: &Header, height: u32) {
 		self.gated_block_disconnected(header, height)
+	}
+
+	fn scan_block(&self, block: &Block, height: u32) {
+		self.gated_block_scanned(block, height)
 	}
 
 	fn take_divergence(&self) -> Option<String> {
@@ -311,6 +322,20 @@ impl<F: ChainFanout> BlockApplicator<F> {
 					mark_syncing(&self.sync_state_tx);
 					self.watch_ledger
 						.note_connected(BlockId { height, hash: header.block_hash() }, []);
+				},
+				ChainOp::ScanBlock { block: ib, permit: _permit } => {
+					log_info!(self.logger, "CBF reading block {} at height {} again.", ib.block.block_hash(), ib.height);
+					self.fanout.scan_block(&ib.block, ib.height);
+					record_block_fee(
+						&self.block_fee_cache,
+						ib.height,
+						ib.block.block_hash(),
+						coinbase_fee_rate(&ib.block, ib.height),
+					);
+					self.watch_ledger.note_scanned(
+						BlockId { height: ib.height, hash: ib.block.block_hash() },
+						ib.block.txdata.iter().map(|tx| tx.compute_txid()),
+					);
 				},
 				ChainOp::Disconnect { headers } => {
 					let Some(fork_height) = self.disconnect(&headers) else {
@@ -555,6 +580,7 @@ mod tests {
 	/// a rewind is applied per monitor on its own tip. The start-of-replay snapshots in `gate`
 	/// are the real [`MonitorGate`].
 	struct FakeFanout {
+		scanned: Mutex<Vec<u32>>,
 		tip: Mutex<BestBlock>,
 		monitors: Mutex<BTreeMap<OutPoint, BestBlock>>,
 		gate: Mutex<MonitorGate>,
@@ -579,6 +605,7 @@ mod tests {
 		) -> Arc<Self> {
 			let monitors: BTreeMap<_, _> = monitors.into_iter().collect();
 			Arc::new(Self {
+				scanned: Mutex::new(Vec::new()),
 				tip: Mutex::new(tip),
 				gate: Mutex::new(MonitorGate::new(monitors.clone())),
 				monitors: Mutex::new(monitors),
@@ -700,6 +727,10 @@ mod tests {
 					},
 				}
 			}
+		}
+
+		fn scan_block(&self, _block: &Block, height: u32) {
+			self.scanned.lock().unwrap().push(height);
 		}
 
 		fn take_divergence(&self) -> Option<String> {

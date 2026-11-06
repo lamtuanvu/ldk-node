@@ -48,15 +48,29 @@
 //! that trust is acceptable — it should not be where the source gains from a missed
 //! transaction, such as on mainnet when the source node is also a channel counterparty.
 //!
-//! The filter headers are not persisted, so the first span after a resume, or after the loop
-//! starts over, takes its predecessor from the source: the same trust, not a further one.
+//! The filter headers of the last [`FILTER_HEADERS_SAVED`] blocks are saved, through the
+//! [`SyncObserver`], and held again on a resume: a filter header commits to every filter below it,
+//! so without them a restart would forget a lie told before it, for good. A source now saying
+//! otherwise of the blocks below the anchor is not proven wrong, as who gave the saved ones is not
+//! known; those blocks are read again ([`SourceSync::held_from_another`]), and a witness is asked
+//! soon. The anchor is the lowest of the listeners', so blocks above it are taken again, and a
+//! listener already past one skips it: where what is taken now differs from what was saved, what
+//! the filter matches there is handed over to read as well. Failing closed and starting over keeps every one held: a source is held to what it said
+//! ([`SourceSync::start_over`]). Another provider's chain that differs from what is held is not
+//! evidence against it, and the blocks where they differ are read again, off its filters.
+//!
+//! # Who hears of it
+//!
+//! Nothing here chooses a source. A [`SyncObserver`] hears a stale tip, a loop stuck, and whatever
+//! the source served that proves it wrong: all of it what a provider session needs to leave a Pro,
+//! none of it visible to it otherwise. Nothing a source says ends the loop: it fails closed and
+//! starts over, and if the loop does end the engine starts it again.
 //!
 //! # Memory
 //!
 //! Headers and filter headers are held in RAM from the resume anchor (see [`HeaderChain`]),
 //! pruned to the last [`SourceTuning::held_headers`]; filters and blocks are dropped once
-//! used. Nothing new is persisted: the resume point comes from the wallet and LDK stores, as it
-//! does for kyoto.
+//! used. The resume point comes from the wallet and LDK stores, as it does for kyoto.
 //!
 //! # Replays
 //!
@@ -76,7 +90,7 @@
 //!
 //! [`CbfSource::trusts_source_for_inclusion`]: crate::config::CbfSource::trusts_source_for_inclusion
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::future::Future;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -91,7 +105,7 @@ use bitcoin::block::Header;
 use bitcoin::hashes::Hash;
 use bitcoin::{Block, BlockHash, Network, ScriptBuf, Work};
 
-use tokio::sync::{mpsc, watch, Semaphore};
+use tokio::sync::{mpsc, watch, Notify, OwnedSemaphorePermit, Semaphore};
 
 use async_trait::async_trait;
 
@@ -104,6 +118,8 @@ use crate::chain::cbf::source::{
 	FilterSource, SourceError, MAX_FILTERS_PER_REQUEST, MAX_HEADERS_PER_REQUEST,
 };
 use crate::chain::cbf::{mark_syncing, CbfSyncState};
+use crate::chain::session::cross_check::{first_difference, HeldBlock, HeldChain};
+use crate::chain::session::machine::LieKind;
 use crate::logger::{log_debug, log_error, log_info, log_warn, LdkLogger, Logger};
 use crate::Error;
 
@@ -144,6 +160,57 @@ pub(crate) const HEADER_LOOKAHEAD: u32 = MAX_HEADERS_PER_REQUEST;
 /// The first window of a reorg walk-back, doubled on every miss.
 const REORG_WALK_FIRST_WINDOW: u32 = 16;
 
+/// How many blocks' filter headers are saved across a restart: a day of them, what a commitment's
+/// delay gives this node to act in at the shortest it is usually set. A lie told longer before a
+/// restart than this, with no check finding it first, is not found by this.
+pub(crate) const FILTER_HEADERS_SAVED: u32 = 144;
+
+/// With no step completed for this long, the loop tells whoever watches it that it is stuck. Well
+/// past what a slow Pro or a restart costs.
+pub(crate) const SYNC_STUCK_AFTER: Duration = Duration::from_secs(10 * 60);
+
+/// What a sync loop tells whoever watches it. See [`SyncObserver`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SyncEvent {
+	/// Steps complete again: anything said below no longer stands.
+	Healthy,
+	/// Caught up with the source, on a tip too old to believe.
+	StaleTip { height: u32, age_secs: u64 },
+	/// Nothing has completed for [`SYNC_STUCK_AFTER`].
+	Stuck,
+	/// It is reading blocks again on the source's word, as what it held differs.
+	ReadingAgain,
+	/// What the source served proves it wrong: enough to act on.
+	Evidence { kind: LieKind, height: u32 },
+	/// The loop ended, for this reason.
+	Ended { reason: String },
+	/// The engine started it again.
+	Restarted,
+}
+
+/// Who hears from a sync loop. An event is about the source at `epoch`
+/// ([`FilterSource::epoch`]): one from before a move says nothing about the next source.
+pub(crate) trait SyncObserver: Send + Sync {
+	/// See the trait docs.
+	fn sync_event(&self, epoch: u64, event: SyncEvent);
+	/// What an earlier run saved; see the module docs.
+	fn saved_filter_headers(&self) -> Vec<SavedFilterHeader> {
+		Vec::new()
+	}
+	/// Keep these across a restart, in place of what was kept.
+	fn save_filter_headers(&self, _headers: &[SavedFilterHeader]) {}
+	/// Everything up to `through` has passed every check here.
+	fn checked_through(&self, _through: u32) {}
+}
+
+/// The filter header taken for one block, as kept across a restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SavedFilterHeader {
+	pub(crate) height: u32,
+	pub(crate) hash: BlockHash,
+	pub(crate) filter_header: FilterHeader,
+}
+
 /// A contiguous run of verified headers, from the lowest held up to the tip, with the filter
 /// header of every block whose filter has been verified.
 #[derive(Clone, Default)]
@@ -152,13 +219,28 @@ pub(crate) struct HeaderChain {
 	headers: Vec<Header>,
 	hashes: Vec<BlockHash>,
 	filter_headers: Vec<Option<FilterHeader>>,
+	/// Under which source each was taken; `None` for one an earlier run saved.
+	taken_under: Vec<Option<u64>>,
+	/// Scan the blocks from this one up again: what was taken for them is not to be believed.
+	pending_rewind: Option<BlockId>,
+	/// Blocks to read again, in hand and checked, with their heights; see [`ChainOp::ScanBlock`].
+	pending_scans: Vec<(u32, Arc<Block>)>,
 }
 
 impl HeaderChain {
 	fn from_headers(base: u32, headers: Vec<Header>) -> Self {
 		let hashes = headers.iter().map(Header::block_hash).collect();
 		let filter_headers = vec![None; headers.len()];
-		Self { base, headers, hashes, filter_headers }
+		let taken_under = vec![None; headers.len()];
+		Self {
+			base,
+			headers,
+			hashes,
+			filter_headers,
+			taken_under,
+			pending_rewind: None,
+			pending_scans: Vec::new(),
+		}
 	}
 
 	fn index(&self, height: u32) -> Option<usize> {
@@ -173,7 +255,7 @@ impl HeaderChain {
 	}
 
 	/// The lowest height held.
-	fn base(&self) -> u32 {
+	pub(crate) fn base(&self) -> u32 {
 		self.base
 	}
 
@@ -202,6 +284,7 @@ impl HeaderChain {
 		self.headers.push(header);
 		self.hashes.push(hash);
 		self.filter_headers.push(None);
+		self.taken_under.push(None);
 	}
 
 	/// Drops everything above `height`.
@@ -210,6 +293,7 @@ impl HeaderChain {
 		self.headers.truncate(keep);
 		self.hashes.truncate(keep);
 		self.filter_headers.truncate(keep);
+		self.taken_under.truncate(keep);
 	}
 
 	/// Holds `headers`, the run just below the lowest held, the first of them at `base`.
@@ -219,9 +303,21 @@ impl HeaderChain {
 		hashes.append(&mut self.hashes);
 		let mut filter_headers = vec![None; headers.len()];
 		filter_headers.append(&mut self.filter_headers);
+		let mut taken_under = vec![None; headers.len()];
+		taken_under.append(&mut self.taken_under);
 		let mut held = headers;
 		held.append(&mut self.headers);
-		*self = Self { base, headers: held, hashes, filter_headers };
+		let pending_rewind = self.pending_rewind;
+		let pending_scans = std::mem::take(&mut self.pending_scans);
+		*self = Self {
+			base,
+			headers: held,
+			hashes,
+			filter_headers,
+			taken_under,
+			pending_rewind,
+			pending_scans,
+		};
 	}
 
 	/// Drops everything below `height`, keeping at least the tip.
@@ -234,6 +330,7 @@ impl HeaderChain {
 		self.headers.drain(..drop);
 		self.hashes.drain(..drop);
 		self.filter_headers.drain(..drop);
+		self.taken_under.drain(..drop);
 		self.base += drop as u32;
 	}
 
@@ -241,15 +338,93 @@ impl HeaderChain {
 		self.index(height).and_then(|i| self.filter_headers[i])
 	}
 
-	/// Forgets every filter header held.
-	fn clear_filter_headers(&mut self) {
-		self.filter_headers.iter_mut().for_each(|fh| *fh = None);
+	/// Asks the loop to scan the blocks from `from` up again; see [`SourceSync::serve_rewind`].
+	/// A second request keeps the lower of the two.
+	pub(crate) fn request_rewind(&mut self, from: BlockId) {
+		let lower = self.pending_rewind.map_or(true, |known| from.height < known.height);
+		if lower {
+			self.pending_rewind = Some(from);
+		}
 	}
 
-	fn set_filter_header(&mut self, height: u32, filter_header: FilterHeader) {
+	/// Asks the loop to hand `block`, checked against the header held at `height`, to the listeners
+	/// to read again.
+	pub(crate) fn request_scan(&mut self, height: u32, block: Block) {
+		self.pending_scans.push((height, Arc::new(block)));
+	}
+
+	/// The newest block at least `bury` below the tip with a filter header taken.
+	pub(crate) fn check_point(&self, bury: u32) -> Option<(BlockId, FilterHeader)> {
+		let top = self.tip()?.height.checked_sub(bury)?;
+		(self.base..=top).rev().find_map(|height| {
+			let filter_header = self.filter_header(height)?;
+			Some((BlockId { height, hash: self.hash(height)? }, filter_header))
+		})
+	}
+
+	/// How many blocks wait to be read again; see [`Self::request_scan`].
+	pub(crate) fn scans_waiting(&self) -> usize {
+		self.pending_scans.len()
+	}
+
+	/// The chain up to `through`, for a cross-check that found a difference.
+	pub(crate) fn held_chain(&self, through: u32) -> Option<HeldChain> {
+		let blocks: Vec<HeldBlock> = (self.base..=through)
+			.map(|height| {
+				let i = self.index(height)?;
+				Some(HeldBlock {
+					hash: self.hashes[i],
+					header: self.headers[i],
+					filter_header: self.filter_headers[i],
+					taken_under: self.taken_under[i],
+				})
+			})
+			.collect::<Option<_>>()?;
+		Some(HeldChain { base: self.base, blocks })
+	}
+
+	/// Forgets the filter headers from `height` up.
+	fn clear_filter_headers_from(&mut self, height: u32) {
+		let from = height.saturating_sub(self.base) as usize;
+		self.filter_headers.iter_mut().skip(from).for_each(|fh| *fh = None);
+		self.taken_under.iter_mut().skip(from).for_each(|under| *under = None);
+	}
+
+	fn set_filter_header(&mut self, height: u32, filter_header: FilterHeader, under: u64) {
 		if let Some(i) = self.index(height) {
 			self.filter_headers[i] = Some(filter_header);
+			self.taken_under[i] = Some(under);
 		}
+	}
+
+	/// Holds what an earlier run saved, up to `through`, for the blocks that are still these. Whose
+	/// word they were is not known any more.
+	fn hold_saved(&mut self, through: u32, saved: &[SavedFilterHeader]) {
+		for row in saved.iter().filter(|row| row.height <= through) {
+			if let (Some(i), true) = (self.index(row.height), self.hash(row.height) == Some(row.hash)) {
+				self.filter_headers[i] = Some(row.filter_header);
+				self.taken_under[i] = None;
+			}
+		}
+	}
+
+	/// What to keep across a restart: the newest [`FILTER_HEADERS_SAVED`] up to `through`.
+	fn to_save(&self, through: u32) -> Vec<SavedFilterHeader> {
+		let lowest = through.saturating_sub(FILTER_HEADERS_SAVED - 1).max(self.base);
+		(lowest..=through)
+			.filter_map(|height| {
+				Some(SavedFilterHeader {
+					height,
+					hash: self.hash(height)?,
+					filter_header: self.filter_header(height)?,
+				})
+			})
+			.collect()
+	}
+
+	/// Whether the filter header held at `height` was taken from the source at `epoch`.
+	fn taken_from(&self, height: u32, epoch: u64) -> bool {
+		self.index(height).map_or(false, |i| self.taken_under[i] == Some(epoch))
 	}
 
 	/// The total work of the held headers above `height`.
@@ -556,6 +731,49 @@ impl StepError {
 		matches!(self, Self::Source(SourceError::Invalid(_)) | Self::Verify(_))
 			&& !self.is_retry_later()
 	}
+
+	/// What this holds against the source, when it holds anything: what it was caught at, and at
+	/// which block. A resume anchor it does not hold is this node's own state against the chain,
+	/// and a source that did not answer has said nothing.
+	fn evidence(&self) -> Option<(LieKind, u32)> {
+		let failure = match self {
+			Self::ReorgTooDeep { held_from } => return Some((LieKind::WrongChain, *held_from)),
+			Self::Source(SourceError::Invalid(_)) => return Some((LieKind::InvalidReply, 0)),
+			Self::Verify(_) if self.is_retry_later() => return None,
+			Self::Verify(failure) => failure,
+			_ => return None,
+		};
+		match failure {
+			VerifyFailure::Anchor { .. } => None,
+			VerifyFailure::Header(check) => Some((LieKind::BadHeader, check.height())),
+			VerifyFailure::BatchLink { height } => Some((LieKind::BadHeader, *height)),
+			VerifyFailure::FilterHeaderCount { start, .. }
+			| VerifyFailure::FilterCount { start, .. } => Some((LieKind::InvalidFilterData, *start)),
+			VerifyFailure::FilterHeaderChain { height }
+			| VerifyFailure::FilterBlock { height }
+			| VerifyFailure::FilterHeader { height }
+			| VerifyFailure::FilterDecode { height } => Some((LieKind::InvalidFilterData, *height)),
+			VerifyFailure::BlockHeader { height }
+			| VerifyFailure::MerkleRoot { height }
+			| VerifyFailure::DuplicateTransactions { height }
+			| VerifyFailure::WitnessCommitment { height }
+			| VerifyFailure::Coinbase { height }
+			| VerifyFailure::SixtyFourByteTransaction { height } => {
+				Some((LieKind::InvalidBlock, *height))
+			},
+		}
+	}
+
+	/// Evidence with no need of a second look: no race and no restart makes a header that fails
+	/// proof of work or claims the wrong difficulty.
+	fn convicts_at_once(&self) -> bool {
+		matches!(
+			self,
+			Self::Verify(VerifyFailure::Header(
+				HeaderCheck::ProofOfWork { .. } | HeaderCheck::Difficulty { .. }
+			))
+		)
+	}
 }
 
 impl From<VerifyFailure> for StepError {
@@ -774,6 +992,9 @@ impl SourceRetryPolicy {
 				}
 				RetryDecision::Retry { backoff: self.next_backoff(), report: RetryReport::Invalid }
 			},
+			StepError::ReorgTooDeep { .. } if self.tuning.fallback_after.is_some() => {
+				RetryDecision::FallBack
+			},
 			StepError::ReorgTooDeep { .. }
 			| StepError::PermitsClosed
 			| StepError::ApplicatorGone => RetryDecision::Fail,
@@ -830,6 +1051,198 @@ fn extend_verified(
 	Ok(())
 }
 
+/// Whether `header` can be on a chain with real work behind it, before anything is decided on it:
+/// its hash meets its target, its target is within the network's limit and, where the network has
+/// no minimum-difficulty blocks, no easier than two retargets from the header held at that height.
+/// [`extend_verified`] then holds a branch to the exact rules, but it starts from the fork, and
+/// finding the fork comes first. A branch's first header below the rules' target needs two whole
+/// retarget periods of its own to get there, and the chain held is that long.
+pub(crate) fn check_fork_header(
+	network: Network, height: u32, header: &Header, held_at_height: Option<&Header>,
+) -> Result<(), VerifyFailure> {
+	let params = bitcoin::consensus::Params::new(network);
+	let target = header.target();
+	let within_limit = target <= params.max_attainable_target;
+	if !within_limit || header.validate_pow(target).is_err() {
+		return Err(VerifyFailure::Header(HeaderCheck::ProofOfWork { height }));
+	}
+	if let Some(held) = held_at_height.filter(|_| !params.allow_min_difficulty_blocks) {
+		let once = held.target().max_transition_threshold(&params);
+		if target > once.max_transition_threshold(&params) {
+			return Err(VerifyFailure::Header(HeaderCheck::Difficulty {
+				height,
+				expected: held.bits,
+				got: header.bits,
+			}));
+		}
+	}
+	Ok(())
+}
+
+/// The highest height where `source`'s chain and `chain` agree, walking down from `start` in
+/// growing windows, every header checked before it counts for anything ([`check_fork_header`]).
+/// Fails closed below the lowest header held.
+async fn find_fork<S: FilterSource + ?Sized>(
+	source: &S, chain: &SharedHeaderChain, network: Network, start: u32, call_timeout: Duration,
+) -> Result<u32, StepError> {
+	let base = lock_headers(chain).base();
+	let mut hi = start;
+	let mut window = REORG_WALK_FIRST_WINDOW;
+	loop {
+		if hi < base {
+			return Err(StepError::ReorgTooDeep { held_from: base });
+		}
+		let lo = hi.saturating_sub(window - 1).max(base);
+		let fetched = bounded(call_timeout, source.headers(lo, hi - lo + 1)).await?;
+		if fetched.is_empty() {
+			return Err(StepError::Source(SourceError::Invalid(format!(
+				"no headers from height {} though this sync holds the chain from {}",
+				lo, base
+			))));
+		}
+		let fetched = &fetched[..fetched.len().min((hi - lo + 1) as usize)];
+		check_batch_links(lo, fetched)?;
+		{
+			let held = lock_headers(chain);
+			for (i, header) in fetched.iter().enumerate() {
+				let height = lo + i as u32;
+				check_fork_header(network, height, header, held.header(height).as_ref())?;
+			}
+			for (i, header) in fetched.iter().enumerate().rev() {
+				let height = lo + i as u32;
+				if held.hash(height) == Some(header.block_hash()) {
+					return Ok(height);
+				}
+			}
+		}
+		if lo == base {
+			return Err(StepError::ReorgTooDeep { held_from: base });
+		}
+		hi = lo - 1;
+		window = window.saturating_mul(2).min(MAX_HEADERS_PER_REQUEST);
+	}
+}
+
+/// What a source's headers prove against the chain held.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BranchProof {
+	/// Its headers, every check passed, carry more work than the chain held, up to `height`.
+	Proven {
+		/// The highest verified.
+		height: u32,
+		/// They reached what it claimed.
+		reached_claim: bool,
+	},
+	/// It has shown nothing past what is held.
+	NotAhead,
+	/// A header it served failed proof of work or difficulty, at `height`.
+	Forged { height: u32 },
+	/// It did not answer.
+	Unanswered,
+}
+
+/// See [`BranchProof`]. `claim` is the tip `source` says it has. Only its headers count: each has
+/// to pass everything a header of this node's own chain does, on a copy of the chain held. With
+/// `to_the_claim` they are read as far as one request goes, otherwise until they outweigh the
+/// chain held, which is usually the first. Costs the source one or two calls.
+pub(crate) async fn prove_more_work<S: FilterSource + ?Sized>(
+	source: &S, chain: &SharedHeaderChain, network: Network, claim: BlockId,
+	call_timeout: Duration, to_the_claim: bool,
+) -> BranchProof {
+	let Some(ours) = lock_headers(chain).tip() else {
+		return BranchProof::NotAhead;
+	};
+	if claim.height <= ours.height {
+		return BranchProof::NotAhead;
+	}
+	let fail = |error: StepError| match error {
+		StepError::Verify(VerifyFailure::Header(check))
+			if matches!(
+				check,
+				HeaderCheck::ProofOfWork { .. } | HeaderCheck::Difficulty { .. }
+			) =>
+		{
+			BranchProof::Forged { height: check.height() }
+		},
+		StepError::Source(SourceError::Unavailable { .. }) => BranchProof::Unanswered,
+		_ => BranchProof::NotAhead,
+	};
+	let count = (claim.height - ours.height).min(MAX_HEADERS_PER_REQUEST);
+	let next = match bounded(call_timeout, source.headers(ours.height + 1, count)).await {
+		Ok(headers) => headers,
+		Err(error) => return fail(error),
+	};
+	let Some(first) = next.first() else { return BranchProof::NotAhead };
+	let (fork, above) = if first.prev_blockhash == ours.hash {
+		(ours.height, Some(next))
+	} else {
+		match find_fork(source, chain, network, ours.height, call_timeout).await {
+			Ok(fork) => (fork, None),
+			Err(error) => return fail(error),
+		}
+	};
+	let (mut branch, held_work) = {
+		let held = lock_headers(chain);
+		let mut branch = held.clone();
+		branch.truncate_to(fork);
+		(branch, held.work_above(fork))
+	};
+	let top = claim.height.min(fork + MAX_HEADERS_PER_REQUEST);
+	let mut height = fork + 1;
+	let mut pending = above;
+	while height <= top {
+		let batch = match pending.take() {
+			Some(batch) => batch,
+			None => {
+				let count = (top - height + 1).min(MAX_HEADERS_PER_REQUEST);
+				match bounded(call_timeout, source.headers(height, count)).await {
+					Ok(batch) => batch,
+					Err(error) => {
+						if branch.work_above(fork) > held_work {
+							break;
+						}
+						return fail(error);
+					},
+				}
+			},
+		};
+		if batch.is_empty() {
+			break;
+		}
+		let batch = &batch[..batch.len().min((top - height + 1) as usize)];
+		if let Err(failure) = extend_verified(&mut branch, network, height, batch, now_secs()) {
+			match failure {
+				// A header it may yet be right about, or this node's own gap: no more to read.
+				VerifyFailure::Header(
+					HeaderCheck::FutureTime { .. } | HeaderCheck::MissingAncestor { .. },
+				) => break,
+				failure => {
+					// What is forged from the top down still counts against it, whatever came first.
+					if matches!(
+						failure,
+						VerifyFailure::Header(
+							HeaderCheck::ProofOfWork { .. } | HeaderCheck::Difficulty { .. }
+						)
+					) {
+						return fail(StepError::Verify(failure));
+					}
+					return BranchProof::NotAhead;
+				},
+			}
+		}
+		height += batch.len() as u32;
+		if !to_the_claim && branch.work_above(fork) > held_work {
+			break;
+		}
+	}
+	let verified = branch.tip().map_or(fork, |tip| tip.height);
+	if branch.work_above(fork) <= held_work {
+		return BranchProof::NotAhead;
+	}
+	let reached_claim = branch.hash(claim.height) == Some(claim.hash);
+	BranchProof::Proven { height: verified, reached_claim }
+}
+
 /// The sync loop over a [`FilterSource`]. Owned by one task; see the module docs.
 pub(crate) struct SourceSync {
 	source: Arc<dyn FilterSource>,
@@ -855,11 +1268,34 @@ pub(crate) struct SourceSync {
 	replay_open: bool,
 	/// The replays asked for and not yet served.
 	pending_replays: Vec<BlockId>,
+	/// Rung by a pushed block or a new provider: neither waits for the next poll or retry.
+	wake: Arc<Notify>,
 	sync_state_tx: watch::Sender<CbfSyncState>,
 	full_block_permits: Arc<Semaphore>,
 	stop_rx: watch::Receiver<bool>,
 	tuning: SourceTuning,
 	logger: Arc<Logger>,
+	/// Whoever watches this loop; see [`SyncObserver`].
+	observer: Option<Arc<dyn SyncObserver>>,
+	/// The source this step is asking.
+	step_epoch: u64,
+	/// Blocks being read again, none of them disconnected; see [`Self::serve_rewind`].
+	rescan: Option<Rescan>,
+	/// What an earlier run took above where this run resumed; see the module docs.
+	saved_above_anchor: HashMap<u32, SavedFilterHeader>,
+	/// What is taken now has differed from what was saved: read what the filters match, as well.
+	differs_from_saved: bool,
+	/// Last told the observer something other than healthy.
+	told_unwell: bool,
+	/// When a step last completed.
+	last_completed: Instant,
+}
+
+/// The blocks left to read again, with `next <= through`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Rescan {
+	next: u32,
+	through: u32,
 }
 
 impl SourceSync {
@@ -867,7 +1303,8 @@ impl SourceSync {
 	pub(crate) fn new(
 		source: Arc<dyn FilterSource>, network: Network, anchor: BlockId, chain: SharedHeaderChain,
 		scripts: Arc<dyn WatchedScripts>, ops_tx: mpsc::Sender<ChainOp>, replay_rx: ReplayReceiver,
-		sync_state_tx: watch::Sender<CbfSyncState>, full_block_permits: Arc<Semaphore>,
+		wake: Arc<Notify>, sync_state_tx: watch::Sender<CbfSyncState>,
+		full_block_permits: Arc<Semaphore>,
 		stop_rx: watch::Receiver<bool>, tuning: SourceTuning, logger: Arc<Logger>,
 	) -> Self {
 		Self {
@@ -885,21 +1322,87 @@ impl SourceSync {
 			replay_rx,
 			replay_open: true,
 			pending_replays: Vec::new(),
+			wake,
 			sync_state_tx,
 			full_block_permits,
 			stop_rx,
 			tuning,
 			logger,
+			observer: None,
+			step_epoch: 0,
+			rescan: None,
+			saved_above_anchor: HashMap::new(),
+			differs_from_saved: false,
+			told_unwell: false,
+			last_completed: Instant::now(),
 		}
+	}
+
+	fn tell(&mut self, event: SyncEvent) {
+		if !matches!(event, SyncEvent::Healthy | SyncEvent::ReadingAgain) {
+			self.told_unwell = true;
+		}
+		if let Some(observer) = &self.observer {
+			observer.sync_event(self.step_epoch, event);
+		}
+	}
+
+	fn tell_healthy(&mut self) {
+		self.last_completed = Instant::now();
+		if std::mem::take(&mut self.told_unwell) {
+			self.tell(SyncEvent::Healthy);
+			self.told_unwell = false;
+		}
+	}
+
+	/// What a failed step tells: what it holds against the source once it has the weight to act
+	/// on, and that nothing is moving, or that the tip is old.
+	fn tell_failure(&mut self, error: &StepError, decision: &RetryDecision, now: Instant) {
+		let decided = matches!(decision, RetryDecision::Fail | RetryDecision::FallBack);
+		if decided || error.convicts_at_once() {
+			if let Some((kind, height)) = error.evidence() {
+				self.tell(SyncEvent::Evidence { kind, height });
+			}
+		}
+		if let StepError::StaleTip { height, age_secs } = error {
+			self.tell(SyncEvent::StaleTip { height: *height, age_secs: *age_secs });
+		} else if now.saturating_duration_since(self.last_completed) >= SYNC_STUCK_AFTER {
+			self.tell(SyncEvent::Stuck);
+		}
+	}
+
+	/// Waits `duration` out unless told to stop or the source moves; `false` when stopped.
+	async fn wait_or_move(&mut self, duration: Duration) -> bool {
+		let deadline = tokio::time::Instant::now() + duration;
+		loop {
+			let interrupted = tokio::select! {
+				biased;
+				_ = self.stop_rx.changed() => true,
+				_ = self.wake.notified() => false,
+				_ = tokio::time::sleep_until(deadline) => return !*self.stop_rx.borrow(),
+			};
+			if interrupted || *self.stop_rx.borrow() {
+				return false;
+			}
+			if self.source.epoch() != self.step_epoch {
+				return true;
+			}
+		}
+	}
+
+	/// Tells `observer` how the loop fares.
+	pub(crate) fn observed_by(mut self, observer: Arc<dyn SyncObserver>) -> Self {
+		self.observer = Some(observer);
+		self
 	}
 
 	/// Runs until stopped, until the applicator is gone, until the source is given up on, or —
 	/// on `node,p2p` — until it is time to fall back to kyoto.
 	///
-	/// With [`SourceTuning::restart_backoff`], failing closed on invalid data is not the end:
-	/// the failure is published and logged, and after the backoff the loop starts over with a
-	/// clean slate — no strikes, and no filter header taken as verified, so the next span's
-	/// predecessor is taken from the source again. The headers held stay: they verified.
+	/// With [`SourceTuning::restart_backoff`], failing closed on what a source served is not the
+	/// end: the failure is published and logged, and after the backoff, or as soon as the source
+	/// moves, the loop starts over with no strikes. Everything it verified stays, headers and
+	/// filter headers both.
 	///
 	/// Replay requests are served at the start of every step ([`Self::serve_replays`]); one
 	/// that arrives while the loop waits for the next tip poll cuts the wait short. Before
@@ -913,13 +1416,26 @@ impl SourceSync {
 				return SourceSyncEnd::Stopped;
 			}
 			let mut stop_rx = self.stop_rx.clone();
+			self.step_epoch = self.source.epoch();
 			let step = tokio::select! {
 				biased;
 				_ = stop_rx.changed() => return SourceSyncEnd::Stopped,
 				step = self.step() => step,
 			};
+			if self.source.epoch() != self.step_epoch {
+				// What came back came from another source, or half of it did. The new one owes
+				// nothing for it.
+				policy = SourceRetryPolicy::new(self.tuning.clone());
+				restart_backoff = self.tuning.restart_backoff.map(|(first, _)| first);
+				self.synced_at = None;
+				if matches!(step, Err(StepError::ApplicatorGone)) {
+					return SourceSyncEnd::ApplicatorGone;
+				}
+				continue;
+			}
 			match step {
 				Ok(progress) => {
+					self.tell_healthy();
 					if let Some(waited) = policy.succeeded() {
 						log_info!(
 							self.logger,
@@ -941,7 +1457,9 @@ impl SourceSync {
 					self.synced_at = None;
 					mark_syncing(&self.sync_state_tx);
 					let now = Instant::now();
-					match policy.decide(&error, now) {
+					let decision = policy.decide(&error, now);
+					self.tell_failure(&error, &decision, now);
+					match decision {
 						RetryDecision::Retry { backoff, report } => {
 							self.report_retry(
 								&error,
@@ -950,7 +1468,7 @@ impl SourceSync {
 								policy.waiting_for(now),
 								&policy,
 							);
-							if !self.sleep(backoff).await {
+							if !self.sleep(backoff, true).await {
 								return SourceSyncEnd::Stopped;
 							}
 						},
@@ -979,7 +1497,9 @@ impl SourceSync {
 							let reason = error.to_string();
 							self.sync_state_tx
 								.send_replace(CbfSyncState::Failed(Error::TxSyncFailed));
-							let restart = restart_backoff.filter(|_| error.is_invalid());
+							let on_the_source =
+								error.is_invalid() || matches!(error, StepError::ReorgTooDeep { .. });
+							let restart = restart_backoff.filter(|_| on_the_source);
 							let Some(wait) = restart else {
 								log_error!(
 									self.logger,
@@ -996,7 +1516,7 @@ impl SourceSync {
 								reason,
 								wait.as_secs()
 							);
-							if !self.sleep(wait).await {
+							if !self.wait_or_move(wait).await {
 								return SourceSyncEnd::Stopped;
 							}
 							restart_backoff = self
@@ -1012,10 +1532,11 @@ impl SourceSync {
 		}
 	}
 
-	/// After failing closed: forget every filter header taken as verified, and publish that
-	/// the sync is running again, from the blocks already queued.
+	/// After failing closed: publish that the sync is running again, from the blocks already
+	/// queued. Every filter header verified stays: a source is held to what it said, so a story
+	/// that only holds with those forgotten stays refused. A source that was repaired and differs
+	/// from what is held needs the owner to take it up again, which a move does.
 	fn start_over(&mut self) {
-		lock_headers(&self.chain).clear_filter_headers();
 		self.synced_at = None;
 		self.sync_state_tx.send_replace(CbfSyncState::Active {
 			applied_tip: Some(self.filters_through),
@@ -1069,19 +1590,23 @@ impl SourceSync {
 		}
 	}
 
-	/// Sleeps `duration` unless told to stop first; `false` when stopped.
-	async fn sleep(&mut self, duration: Duration) -> bool {
+	/// Sleeps `duration` unless told to stop first; `false` when stopped. With `wakeable`, the
+	/// wake cuts it short: a node given a provider or sent a block must not sit out a retry's
+	/// backoff from before that.
+	async fn sleep(&mut self, duration: Duration, wakeable: bool) -> bool {
 		// A dropped sender is a stop too.
 		let interrupted = tokio::select! {
 			biased;
 			_ = self.stop_rx.changed() => true,
+			_ = self.wake.notified(), if wakeable => false,
 			_ = tokio::time::sleep(duration) => false,
 		};
 		!interrupted && !*self.stop_rx.borrow()
 	}
 
 	/// Waits out the tip poll interval; `false` when told to stop. A replay request cuts the
-	/// wait short: a listener that joined must not wait a whole poll for its blocks.
+	/// wait short: a listener that joined must not wait a whole poll for its blocks. So does the
+	/// wake: a pushed block must not wait for the next poll either.
 	async fn idle(&mut self, duration: Duration) -> bool {
 		let deadline = tokio::time::Instant::now() + duration;
 		loop {
@@ -1097,6 +1622,7 @@ impl SourceSync {
 					// Every sender is gone: nobody can ask any more.
 					None => self.replay_open = false,
 				},
+				_ = self.wake.notified() => break,
 				_ = tokio::time::sleep_until(deadline) => break,
 			}
 		}
@@ -1279,6 +1805,8 @@ impl SourceSync {
 			self.resumed = true;
 			return Ok(Progress::Advanced);
 		}
+		self.serve_scans().await?;
+		self.serve_rewind();
 		self.serve_replays().await?;
 
 		// Re-read every step: after any failure, a stop hash taken from an older tip may no
@@ -1329,6 +1857,16 @@ impl SourceSync {
 				}
 				return Ok(Progress::Advanced);
 			}
+		}
+
+		if let Some(rescan) = self.rescan {
+			if let Err(error) = self.rescan_batch(rescan).await {
+				if !tip_on_our_chain && self.next_header_left(ours).await {
+					return self.reorg(tip, ours).await;
+				}
+				return Err(error);
+			}
+			return Ok(Progress::Advanced);
 		}
 
 		if self.filters_through < ours.height {
@@ -1416,7 +1954,17 @@ impl SourceSync {
 			.into());
 		}
 
-		*lock_headers(&self.chain) = HeaderChain::from_headers(lowest, headers);
+		let mut chain = HeaderChain::from_headers(lowest, headers);
+		if let Some(observer) = &self.observer {
+			let saved = observer.saved_filter_headers();
+			chain.hold_saved(anchor.height, &saved);
+			self.saved_above_anchor = saved
+				.into_iter()
+				.filter(|row| row.height > anchor.height)
+				.map(|row| (row.height, row))
+				.collect();
+		}
+		*lock_headers(&self.chain) = chain;
 		self.filters_through = anchor.height;
 		self.queued_through = anchor.height;
 		log_info!(
@@ -1461,10 +2009,127 @@ impl SourceSync {
 		}
 	}
 
+	/// Reads again from a block whose filter this node now knows it should not have believed: the
+	/// filter headers from it up are forgotten and taken again, and what the new filters match is
+	/// fetched and handed over with [`ChainOp::ScanBlock`]. **Nothing is disconnected:** these
+	/// headers remain the chain of most work, and disconnecting a block un-confirms what is in it,
+	/// which closes any channel funded there. Whoever asks for this, however wrongly, can make the
+	/// node read blocks and no more. A block no longer on the chain held is a reorg's business.
+	fn serve_rewind(&mut self) {
+		let top = self.filters_through;
+		let mut chain = lock_headers(&self.chain);
+		let Some(from) = chain.pending_rewind.take() else {
+			return;
+		};
+		if chain.hash(from.height) != Some(from.hash) {
+			return;
+		}
+		chain.clear_filter_headers_from(from.height);
+		drop(chain);
+		self.synced_at = None;
+		mark_syncing(&self.sync_state_tx);
+		if from.height <= top {
+			let next = self.rescan.map_or(from.height, |known| known.next.min(from.height));
+			self.rescan = Some(Rescan { next, through: top });
+		}
+	}
+
+	/// Hands over the blocks asked to be read again, while they are still on the chain.
+	async fn serve_scans(&mut self) -> Result<(), StepError> {
+		let scans = {
+			let mut chain = lock_headers(&self.chain);
+			let scans = std::mem::take(&mut chain.pending_scans);
+			scans
+				.into_iter()
+				.filter(|(height, block)| chain.hash(*height) == Some(block.block_hash()))
+				.collect::<Vec<_>>()
+		};
+		for (height, block) in scans {
+			let permit = Arc::clone(&self.full_block_permits)
+				.acquire_owned()
+				.await
+				.map_err(|_| StepError::PermitsClosed)?;
+			let block = Arc::try_unwrap(block).unwrap_or_else(|shared| (*shared).clone());
+			self.send(ChainOp::ScanBlock { block: IndexedBlock { height, block }, permit }).await?;
+		}
+		Ok(())
+	}
+
+	/// The next span of blocks being read again; see [`Self::serve_rewind`].
+	async fn rescan_batch(&mut self, rescan: Rescan) -> Result<(), StepError> {
+		let (lowest, top_held) = {
+			let chain = lock_headers(&self.chain);
+			(chain.base(), chain.tip().map_or(0, |tip| tip.height))
+		};
+		let next = rescan.next.max(lowest.max(1));
+		let through = rescan.through.min(top_held);
+		if next > through {
+			self.rescan = None;
+			return Ok(());
+		}
+		let planned = self.verified_span(next, through, false).await?;
+		let mut reached = next;
+		for (height, header, hash, filter_header, matched) in planned.into_iter().flatten() {
+			if matched {
+				let (block, permit) = self.fetch_block(height, header, hash).await?;
+				self.send(ChainOp::ScanBlock { block, permit }).await?;
+			}
+			lock_headers(&self.chain).set_filter_header(height, filter_header, self.step_epoch);
+			reached = height + 1;
+		}
+		self.rescan = (reached <= through).then_some(Rescan { next: reached, through });
+		if self.rescan.is_none() {
+			self.save_filter_headers();
+		}
+		Ok(())
+	}
+
+	/// What is held does not continue what the source says now, and what is held came from another
+	/// source. Neither is shown wrong. The lowest block where they differ is where to read again
+	/// from: asked of this source, and if it comes to that, everything held.
+	async fn held_from_another(&mut self, start: u32) -> Result<(), StepError> {
+		let top = start.saturating_sub(1);
+		let held = lock_headers(&self.chain).held_chain(top);
+		let mut differs = None;
+		if let Some(held) = held.filter(|held| !held.blocks.is_empty()) {
+			let call_timeout = self.tuning.call_timeout;
+			differs = first_difference(&held, &*self.source, call_timeout)
+				.await
+				.map_err(StepError::Source)?
+				.map(|from| from.height);
+		}
+		let height = differs.unwrap_or_else(|| lock_headers(&self.chain).base().max(1).min(top));
+		let asked = {
+			let mut chain = lock_headers(&self.chain);
+			let hash = chain.hash(height);
+			if let Some(hash) = hash {
+				chain.request_rewind(BlockId { height, hash });
+			}
+			hash.is_some()
+		};
+		if asked {
+			log_warn!(
+				self.logger,
+				"CBF filter source '{}' differs from what this node took from another source, from height {}; reading those blocks again.",
+				self.source.name(),
+				height
+			);
+			self.tell(SyncEvent::ReadingAgain);
+		}
+		Ok(())
+	}
+
 	/// Follows the source onto another branch: finds where it forks from ours, verifies the
 	/// branch, and — if it has more work — disconnects ours tip-first and holds the branch.
 	async fn reorg(&mut self, tip: BlockId, ours: BlockId) -> Result<Progress, StepError> {
-		let fork = self.find_fork(tip, ours).await?;
+		let fork = find_fork(
+			&*self.source,
+			&self.chain,
+			self.network,
+			ours.height.min(tip.height),
+			self.tuning.call_timeout,
+		)
+		.await?;
 
 		// The source's branch above the fork, verified onto a copy of ours cut at the fork.
 		let (mut branch, old_work) = {
@@ -1500,6 +2165,7 @@ impl SourceSync {
 				.rev()
 				.filter_map(|height| chain.header(height).map(|header| (header, height)))
 				.collect();
+			branch.pending_rewind = chain.pending_rewind.take();
 			*chain = branch;
 			abandoned
 		};
@@ -1514,48 +2180,13 @@ impl SourceSync {
 		self.filters_through = self.filters_through.min(fork);
 		self.queued_through = self.queued_through.min(fork);
 		self.synced_at = None;
+		self.rescan = self.rescan.and_then(|rescan| {
+			(rescan.next <= fork).then_some(Rescan { next: rescan.next, through: fork })
+		});
 		if !abandoned.is_empty() {
 			self.send(ChainOp::Disconnect { headers: abandoned }).await?;
 		}
 		Ok(Progress::Advanced)
-	}
-
-	/// The highest height where the source's chain and ours agree, walking down from the lower
-	/// of the two tips in growing windows. Fails closed below the lowest header held.
-	async fn find_fork(&self, tip: BlockId, ours: BlockId) -> Result<u32, StepError> {
-		let base = lock_headers(&self.chain).base();
-		let mut hi = ours.height.min(tip.height);
-		let mut window = REORG_WALK_FIRST_WINDOW;
-		loop {
-			if hi < base {
-				return Err(StepError::ReorgTooDeep { held_from: base });
-			}
-			let lo = hi.saturating_sub(window - 1).max(base);
-			let fetched =
-				bounded(self.tuning.call_timeout, self.source.headers(lo, hi - lo + 1)).await?;
-			if fetched.is_empty() {
-				return Err(StepError::Source(SourceError::Invalid(format!(
-					"no headers from height {} though its tip is at {}",
-					lo, tip.height
-				))));
-			}
-			let fetched = &fetched[..fetched.len().min((hi - lo + 1) as usize)];
-			check_batch_links(lo, fetched)?;
-			{
-				let chain = lock_headers(&self.chain);
-				for (i, header) in fetched.iter().enumerate().rev() {
-					let height = lo + i as u32;
-					if chain.hash(height) == Some(header.block_hash()) {
-						return Ok(height);
-					}
-				}
-			}
-			if lo == base {
-				return Err(StepError::ReorgTooDeep { held_from: base });
-			}
-			hi = lo - 1;
-			window = window.saturating_mul(2).min(MAX_HEADERS_PER_REQUEST);
-		}
 	}
 
 	/// Verifies the next span of filter headers and filters up to `top`, then queues one op per
@@ -1568,6 +2199,63 @@ impl SourceSync {
 	/// the wrong block or a filter header that does not match.
 	async fn filter_batch(&mut self, top: u32) -> Result<(), StepError> {
 		let start = self.filters_through + 1;
+		let Some(planned) = self.verified_span(start, top, true).await? else {
+			return Ok(());
+		};
+		for (height, header, hash, filter_header, matched) in planned {
+			// We are behind by this block until it is applied; see `mark_syncing`.
+			mark_syncing(&self.sync_state_tx);
+			let saved = self.saved_above_anchor.remove(&height);
+			if let Some(saved) = saved.filter(|saved| saved.hash == hash) {
+				if saved.filter_header != filter_header && !self.differs_from_saved {
+					self.differs_from_saved = true;
+					log_warn!(
+						self.logger,
+						"CBF filter source '{}' differs at height {} from what this node took before it restarted; reading what its filters match there again.",
+						self.source.name(),
+						height
+					);
+					self.tell(SyncEvent::ReadingAgain);
+				}
+				if self.differs_from_saved && matched {
+					let (block, permit) = self.fetch_block(height, header, hash).await?;
+					self.send(ChainOp::ScanBlock { block, permit }).await?;
+				}
+			}
+			let op = if matched {
+				let (block, permit) = self.fetch_block(height, header, hash).await?;
+				ChainOp::ConnectFull { block, permit }
+			} else {
+				ChainOp::ConnectFiltered { header, height }
+			};
+			self.send(op).await?;
+			lock_headers(&self.chain).set_filter_header(height, filter_header, self.step_epoch);
+			self.filters_through = height;
+			self.queued_through = self.queued_through.max(height);
+		}
+		self.save_filter_headers();
+		self.prune();
+		if let Some(observer) = &self.observer {
+			observer.checked_through(self.filters_through);
+		}
+		Ok(())
+	}
+
+	/// What a restart must not forget. Written once a batch: at the tip, once a block.
+	fn save_filter_headers(&self) {
+		if let Some(observer) = &self.observer {
+			let rows = lock_headers(&self.chain).to_save(self.filters_through);
+			observer.save_filter_headers(&rows);
+		}
+	}
+
+	/// The next span from `start` up to `top`, its filter headers and filters verified and matched
+	/// against the watched scripts, nothing queued. `None` when what is held came from another
+	/// source and differs: with `reconcile` a rewind is asked for and the caller comes back after
+	/// it, without it the span is taken on the source's word, as the first after a resume is.
+	async fn verified_span(
+		&mut self, start: u32, top: u32, reconcile: bool,
+	) -> Result<Option<Vec<(u32, Header, BlockHash, FilterHeader, bool)>>, StepError> {
 		let stop = top.min(start + MAX_FILTERS_PER_REQUEST - 1);
 		let asked = (stop - start + 1) as usize;
 		let (stop_hash, verified_previous) = {
@@ -1587,7 +2275,19 @@ impl SourceSync {
 		}
 		match verified_previous {
 			Some(previous) if previous != served.previous => {
-				return Err(VerifyFailure::FilterHeaderChain { height: start }.into());
+				if lock_headers(&self.chain).taken_from(start - 1, self.step_epoch) {
+					return Err(VerifyFailure::FilterHeaderChain { height: start }.into());
+				}
+				if reconcile {
+					self.held_from_another(start).await?;
+					return Ok(None);
+				}
+				log_warn!(
+					self.logger,
+					"CBF filter source '{}' continues from another filter header at height {} than an earlier source gave; taking it, as nothing shows either wrong.",
+					self.source.name(),
+					start
+				);
 			},
 			Some(_) => {},
 			None => log_debug!(
@@ -1658,30 +2358,14 @@ impl SourceSync {
 				planned.push((height, header, hash, computed, matched));
 			}
 		}
-		drop(filters);
-
-		for (height, header, hash, filter_header, matched) in planned {
-			// We are behind by this block until it is applied; see `mark_syncing`.
-			mark_syncing(&self.sync_state_tx);
-			let op = if matched {
-				self.fetch_block(height, header, hash).await?
-			} else {
-				ChainOp::ConnectFiltered { header, height }
-			};
-			self.send(op).await?;
-			lock_headers(&self.chain).set_filter_header(height, filter_header);
-			self.filters_through = height;
-			self.queued_through = self.queued_through.max(height);
-		}
-		self.prune();
-		Ok(())
+		Ok(Some(planned))
 	}
 
 	/// Fetches a matched block under one of the full-block permits and verifies it against our
 	/// header; the permit rides in the op until the applicator drops it.
 	async fn fetch_block(
 		&self, height: u32, header: Header, hash: BlockHash,
-	) -> Result<ChainOp, StepError> {
+	) -> Result<(IndexedBlock, OwnedSemaphorePermit), StepError> {
 		let permit = Arc::clone(&self.full_block_permits)
 			.acquire_owned()
 			.await
@@ -1689,7 +2373,7 @@ impl SourceSync {
 		let block = bounded(self.tuning.call_timeout, self.source.block(hash)).await?;
 		verify_block(&block, height, &header)?;
 		log_debug!(self.logger, "CBF fetched matched block {} at height {}", hash, height);
-		Ok(ChainOp::ConnectFull { block: IndexedBlock { height, block }, permit })
+		Ok((IndexedBlock { height, block }, permit))
 	}
 }
 
@@ -1806,7 +2490,15 @@ pub(crate) mod test_support {
 	pub(crate) fn mine(
 		prev: BlockHash, height: u32, time: u32, pay_to: ScriptBuf, salt: u8,
 	) -> Block {
-		let txdata = vec![coinbase(height, pay_to, salt)];
+		mine_with(prev, height, time, pay_to, salt, Vec::new())
+	}
+
+	/// [`mine`], with `txs` after the coinbase.
+	pub(crate) fn mine_with(
+		prev: BlockHash, height: u32, time: u32, pay_to: ScriptBuf, salt: u8, txs: Vec<Transaction>,
+	) -> Block {
+		let mut txdata = vec![coinbase(height, pay_to, salt)];
+		txdata.extend(txs);
 		let mut block = Block {
 			header: Header {
 				version: Version::TWO,
@@ -1842,6 +2534,57 @@ pub(crate) mod test_support {
 		FilterHeaderPrevious,
 		/// The block served at this height has a transaction the header does not commit to.
 		MerkleAt(u32),
+		/// Both of the above lies about filter headers: garbage here, and below every span.
+		FilterHeaderAndPreviousAt(u32),
+		/// From this height on the source serves a chain that holds together, built on a filter
+		/// that leaves out the block's outputs.
+		OmitOutputsFrom(u32),
+		/// The same, on a filter with everything in it and one element more: what cannot be told
+		/// apart from an honest filter with the block alone.
+		ExtraElementFrom(u32),
+		/// The filter of this one block leaves out the block's outputs, and the chain above it is
+		/// true filters on the filter headers that follow from that.
+		OmitOutputsOnlyAt(u32),
+		/// The tip it names is a block of another chain at its own height, and every header from
+		/// the given height up is made up: linked, and short of the proof of work they claim.
+		ForgedHeadersFrom(u32),
+		/// It stops at this height: says so for the tip, and has nothing above.
+		WithholdFrom(u32),
+	}
+
+	/// The filter `st` serves for the block at `height`, lies included.
+	fn served_filter(st: &FakeState, height: usize) -> BlockFilter {
+		let block = &st.blocks[height];
+		if st.differing_filters.contains(&(height as u32)) {
+			return filter_with_one_more(block, &ScriptBuf::from_bytes(vec![0x51, 0x51]));
+		}
+		if let Some(script) = st.includes.get(&(height as u32)) {
+			return filter_with_one_more(block, script);
+		}
+		match st.lie {
+			Lie::OmitOutputsFrom(from) if height == from as usize => BlockFilter::new(&[0x00]),
+			Lie::OmitOutputsOnlyAt(at) if height == at as usize => BlockFilter::new(&[0x00]),
+			Lie::ExtraElementFrom(from) if height == from as usize => {
+				filter_with_one_more(block, &ScriptBuf::from_bytes(vec![0x51, 0x51]))
+			},
+			_ => filter_of(block),
+		}
+	}
+
+	fn filter_with_one_more(block: &Block, script: &ScriptBuf) -> BlockFilter {
+		let mut scripts: Vec<ScriptBuf> = block
+			.txdata
+			.iter()
+			.flat_map(|tx| tx.output.iter().map(|out| out.script_pubkey.clone()))
+			.collect();
+		scripts.push(script.clone());
+		let mut content = Vec::new();
+		let mut writer = bitcoin::bip158::BlockFilterWriter::new(&mut content, block);
+		for script in &scripts {
+			writer.add_element(script.as_bytes());
+		}
+		writer.finish().expect("to a vec");
+		BlockFilter::new(&content)
 	}
 
 	pub(crate) struct FakeState {
@@ -1856,12 +2599,40 @@ pub(crate) mod test_support {
 		pub(crate) filter_headers_cap: Option<usize>,
 		/// Most filters one answer carries: a prefix of the span beyond.
 		pub(crate) filters_cap: Option<usize>,
+		/// Blocks whose filter carries one element more, whatever the lie.
+		pub(crate) differing_filters: Vec<u32>,
+		/// Blocks whose filter also carries these scripts, as one with a spent script in it does.
+		pub(crate) includes: HashMap<u32, ScriptBuf>,
 		/// `block` never answers.
 		pub(crate) hang_blocks: bool,
 		/// `block` answers once this is cleared again.
 		pub(crate) hold_blocks: bool,
 		/// `filter_headers` is down while this is set; headers still answer.
 		pub(crate) hold_filter_headers: bool,
+		pub(crate) epoch: u64,
+	}
+
+	/// Headers linked from `prev`, the first at `height`, each short of the proof of work it
+	/// claims. The regtest target passes every other hash, so the nonce is searched for a miss.
+	pub(crate) fn forged_headers(prev: BlockHash, height: u32, count: u32) -> Vec<Header> {
+		let mut out: Vec<Header> = Vec::with_capacity(count as usize);
+		let mut below = prev;
+		for i in 0..count {
+			let mut header = Header {
+				version: Version::TWO,
+				prev_blockhash: below,
+				merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+				time: BASE_TIME + (height + i) * 600,
+				bits: CompactTarget::from_consensus(REGTEST_BITS),
+				nonce: 7,
+			};
+			while header.validate_pow(header.target()).is_ok() {
+				header.nonce += 1;
+			}
+			below = header.block_hash();
+			out.push(header);
+		}
+		out
 	}
 
 	pub(crate) struct FakeSource {
@@ -1881,9 +2652,12 @@ pub(crate) mod test_support {
 					calls: HashMap::new(),
 					filter_headers_cap: None,
 					filters_cap: None,
+					differing_filters: Vec::new(),
+					includes: HashMap::new(),
 					hang_blocks: false,
 					hold_blocks: false,
 					hold_filter_headers: false,
+					epoch: 0,
 				}),
 			};
 			source.mine(len, matched, 0);
@@ -1946,6 +2720,16 @@ pub(crate) mod test_support {
 			self.st().blocks[height as usize].clone()
 		}
 
+		/// What an honest source says the filter header at `height` is.
+		pub(crate) fn true_filter_header(&self, height: u32) -> Option<FilterHeader> {
+			let st = self.st();
+			let mut previous = FilterHeader::all_zeros();
+			for block in st.blocks.iter().take(height as usize + 1) {
+				previous = filter_of(block).filter_header(&previous);
+			}
+			Some(previous)
+		}
+
 		pub(crate) fn tip_id(&self) -> BlockId {
 			let st = self.st();
 			let last = st.blocks.len() - 1;
@@ -1954,6 +2738,28 @@ pub(crate) mod test_support {
 
 		pub(crate) fn set_lie(&self, lie: Lie) {
 			self.st().lie = lie;
+		}
+
+		/// What each of `heights` serves as a filter has one element more.
+		/// The filter at `height` also holds `script`, whatever the block shows.
+		pub(crate) fn set_includes_at(&self, height: u32, script: ScriptBuf) {
+			self.st().includes.insert(height, script);
+		}
+
+		/// The filters at `heights` also hold `script`, whatever their blocks show.
+		pub(crate) fn set_includes_all(&self, heights: &[u32], script: ScriptBuf) {
+			for height in heights {
+				self.set_includes_at(*height, script.clone());
+			}
+		}
+
+		pub(crate) fn set_differing_filters(&self, heights: &[u32]) {
+			self.st().differing_filters = heights.to_vec();
+		}
+
+		/// As a session does on a move: what it says from here on is another Pro's.
+		pub(crate) fn next_epoch(&self) {
+			self.st().epoch += 1;
 		}
 
 		/// Answers at most `filter_headers` filter headers and `filters` filters at a time.
@@ -1994,9 +2800,9 @@ pub(crate) mod test_support {
 
 		fn filter_header_chain(st: &FakeState, through: usize) -> Vec<FilterHeader> {
 			let mut out: Vec<FilterHeader> = Vec::with_capacity(through + 1);
-			for block in &st.blocks[..=through] {
+			for height in 0..=through {
 				let previous = out.last().copied().unwrap_or_else(FilterHeader::all_zeros);
-				out.push(filter_of(block).filter_header(&previous));
+				out.push(served_filter(st, height).filter_header(&previous));
 			}
 			out
 		}
@@ -2008,10 +2814,26 @@ pub(crate) mod test_support {
 			"fake"
 		}
 
+		fn epoch(&self) -> u64 {
+			self.st().epoch
+		}
+
 		async fn tip(&self) -> Result<BlockId, SourceError> {
 			let st = self.enter("tip")?;
 			let last = st.blocks.len() - 1;
-			Ok(BlockId { height: last as u32, hash: st.blocks[last].block_hash() })
+			match st.lie {
+				Lie::ForgedHeadersFrom(from) => {
+					let below = st.blocks[from as usize - 1].block_hash();
+					let forged = forged_headers(below, from, last as u32 - from + 1);
+					let hash = forged.last().expect("at least one").block_hash();
+					Ok(BlockId { height: last as u32, hash })
+				},
+				Lie::WithholdFrom(from) => {
+					let top = (from as usize - 1).min(last);
+					Ok(BlockId { height: top as u32, hash: st.blocks[top].block_hash() })
+				},
+				_ => Ok(BlockId { height: last as u32, hash: st.blocks[last].block_hash() }),
+			}
 		}
 
 		async fn headers(&self, from_height: u32, count: u32) -> Result<Vec<Header>, SourceError> {
@@ -2019,6 +2841,27 @@ pub(crate) mod test_support {
 			let from = from_height as usize;
 			if from >= st.blocks.len() {
 				return Err(SourceError::NotFound("above tip".into()));
+			}
+			match st.lie {
+				Lie::ForgedHeadersFrom(forged_from) => {
+					let forged_from_at = forged_from as usize;
+					let below = st.blocks[forged_from_at - 1].block_hash();
+					let forged = forged_headers(
+						below,
+						forged_from,
+						(st.blocks.len() - forged_from_at) as u32,
+					);
+					let chain: Vec<Header> = st.blocks[..forged_from_at]
+						.iter()
+						.map(|b| b.header)
+						.chain(forged)
+						.collect();
+					return Ok(chain[from..].iter().take(count as usize).copied().collect());
+				},
+				Lie::WithholdFrom(withheld) if from >= withheld as usize => {
+					return Err(SourceError::NotFound("above tip".into()));
+				},
+				_ => {},
 			}
 			Ok(st.blocks[from..].iter().take(count as usize).map(|b| b.header).collect())
 		}
@@ -2040,6 +2883,12 @@ pub(crate) mod test_support {
 					headers[height as usize - start] = FilterHeader::from_byte_array([0x42; 32]);
 				},
 				Lie::FilterHeaderPrevious => previous = FilterHeader::from_byte_array([0x24; 32]),
+				Lie::FilterHeaderAndPreviousAt(height) => {
+					previous = FilterHeader::from_byte_array([0x24; 32]);
+					if (start..=stop).contains(&(height as usize)) {
+						headers[height as usize - start] = FilterHeader::from_byte_array([0x42; 32]);
+					}
+				},
 				_ => {},
 			}
 			if let Some(cap) = st.filter_headers_cap {
@@ -2059,7 +2908,7 @@ pub(crate) mod test_support {
 				.map(|h| IndexedFilter {
 					height: h as u32,
 					block_hash: st.blocks[h].block_hash(),
-					filter: filter_of(&st.blocks[h]),
+					filter: served_filter(&st, h),
 				})
 				.collect())
 		}
@@ -2143,6 +2992,7 @@ mod tests {
 		Synced(u32),
 		TipConfirmed(u32),
 		Rescan(u32),
+		Scan(u32),
 	}
 
 	struct Harness {
@@ -2163,14 +3013,79 @@ mod tests {
 		let source = Arc::new(source);
 		let filter_source = Arc::clone(&source) as Arc<dyn FilterSource>;
 		let chain = new_shared_header_chain();
-		start_over(source, filter_source, chain, anchor_height, tuning)
+		start_over(source, filter_source, chain, Arc::new(Notify::new()), anchor_height, tuning)
+	}
+
+	/// What a loop told its observer.
+	#[derive(Default)]
+	struct Heard {
+		events: Mutex<Vec<SyncEvent>>,
+	}
+
+	impl SyncObserver for Heard {
+		fn sync_event(&self, _epoch: u64, event: SyncEvent) {
+			self.events.lock().unwrap().push(event);
+		}
+	}
+
+	impl Heard {
+		async fn wait_for(&self, matching: impl Fn(&SyncEvent) -> bool) {
+			let looked = async {
+				while !self.events.lock().unwrap().iter().any(&matching) {
+					tokio::time::sleep(Duration::from_millis(5)).await;
+				}
+			};
+			tokio::time::timeout(WAIT, looked).await.expect("told in time");
+		}
+
+		fn evidence(&self) -> Vec<LieKind> {
+			let events = self.events.lock().unwrap();
+			events
+				.iter()
+				.filter_map(|event| match event {
+					SyncEvent::Evidence { kind, .. } => Some(*kind),
+					_ => None,
+				})
+				.collect()
+		}
+	}
+
+	fn start_observed(
+		source: Arc<FakeSource>, anchor_height: u32, tuning: SourceTuning, observer: Arc<Heard>,
+	) -> Harness {
+		start_observed_woken(source, anchor_height, tuning, observer, Arc::new(Notify::new()))
+	}
+
+	fn start_observed_woken(
+		source: Arc<FakeSource>, anchor_height: u32, tuning: SourceTuning, observer: Arc<Heard>,
+		wake: Arc<Notify>,
+	) -> Harness {
+		let filter_source = Arc::clone(&source) as Arc<dyn FilterSource>;
+		start_watched(
+			source,
+			filter_source,
+			new_shared_header_chain(),
+			wake,
+			anchor_height,
+			tuning,
+			Some(observer as Arc<dyn SyncObserver>),
+		)
 	}
 
 	/// The loop over `filter_source` — which reads `source`'s chain, a wrapper of it say —
-	/// verifying into `chain`.
+	/// verifying into `chain` and woken by `wake`.
 	fn start_over(
 		source: Arc<FakeSource>, filter_source: Arc<dyn FilterSource>, chain: SharedHeaderChain,
-		anchor_height: u32, tuning: SourceTuning,
+		wake: Arc<Notify>, anchor_height: u32, tuning: SourceTuning,
+	) -> Harness {
+		start_watched(source, filter_source, chain, wake, anchor_height, tuning, None)
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	fn start_watched(
+		source: Arc<FakeSource>, filter_source: Arc<dyn FilterSource>, chain: SharedHeaderChain,
+		wake: Arc<Notify>, anchor_height: u32, tuning: SourceTuning,
+		observer: Option<Arc<dyn SyncObserver>>,
 	) -> Harness {
 		let anchor =
 			BlockId { height: anchor_height, hash: source.block_at(anchor_height).block_hash() };
@@ -2190,12 +3105,17 @@ mod tests {
 			Arc::new(FixedScripts(vec![watched_script()])),
 			ops_tx,
 			replay_rx,
+			wake,
 			sync_state_tx.clone(),
 			Arc::clone(&permits),
 			stop_rx,
 			tuning,
 			Arc::new(Logger::new_log_facade()),
 		);
+		let sync = match observer {
+			Some(observer) => sync.observed_by(observer as Arc<dyn SyncObserver>),
+			None => sync,
+		};
 		let task = tokio::spawn(sync.run());
 		Harness {
 			source,
@@ -2243,6 +3163,7 @@ mod tests {
 					);
 					Op::Full(block.height)
 				},
+				ChainOp::ScanBlock { block, permit: _permit } => Op::Scan(block.height),
 				ChainOp::ConnectFiltered { header, height } => {
 					// The chain may have been pruned or moved on since; the source's best chain
 					// only changes when a test says so.
@@ -2405,15 +3326,122 @@ mod tests {
 		let pro = Arc::new(FakeSource::new(30, matched));
 		let transport = Arc::new(ServerTransport::new(Arc::clone(&pro) as Arc<dyn FilterSource>));
 		let chain = new_shared_header_chain();
+		let wake = Arc::new(Notify::new());
 		let bundles = Arc::new(BundleFilterSource::new(
 			Arc::clone(&node) as Arc<dyn FilterSource>,
 			Arc::clone(&transport) as Arc<dyn BundleTransport>,
 			Arc::clone(&chain),
+			Arc::clone(&wake),
 			bundle_tuning,
 			Arc::new(Logger::new_log_facade()),
 		));
-		let h = start_over(node, Arc::clone(&bundles) as Arc<dyn FilterSource>, chain, 10, tuning);
+		let h = start_over(
+			node,
+			Arc::clone(&bundles) as Arc<dyn FilterSource>,
+			chain,
+			wake,
+			10,
+			tuning,
+		);
 		(h, bundles, transport, pro)
+	}
+
+	use crate::chain::session::PushSink;
+
+	/// Catches up with the first pull, then starts being pushed to, as the session would.
+	async fn start_pushed(matched: &[u32], tuning: SourceTuning) -> (Harness, Arc<BundleFilterSource>, Arc<ServerTransport>, Arc<FakeSource>) {
+		let (mut h, bundles, transport, pro) = start_bundled(matched, tuning);
+		h.ops_until_synced().await;
+		bundles.note_tip(pro.tip_id());
+		bundles.set_push_trusted(true);
+		(h, bundles, transport, pro)
+	}
+
+	#[tokio::test]
+	async fn a_pushed_loop_follows_pushes_asking_no_tip_and_a_push_wakes_it() {
+		// A poll that would never come on its own: only the wake can explain the blocks.
+		let tuning = SourceTuning { poll_interval: Duration::from_secs(3600), ..fast_tuning() };
+		let (mut h, bundles, transport, pro) = start_pushed(&[], tuning).await;
+		h.source.mine(1, &[], 0);
+		pro.mine(1, &[], 0);
+		let polled = |source: &FakeSource| ["tip", "headers", "filter_headers", "filters"].map(|m| source.calls(m));
+		let before = polled(&h.source);
+		let since_before = transport.calls("since");
+
+		bundles.ingest(&transport.push(30..=30).await).unwrap();
+		assert_eq!(h.ops_until_synced().await, vec![Op::Filtered(30), Op::Synced(30)]);
+		assert_eq!(polled(&h.source), before, "nothing went to the raw routes, the tip included");
+		assert_eq!(transport.calls("since"), since_before, "nor to a pull");
+		assert_eq!(lock_headers(&h.chain).tip(), Some(h.source.tip_id()));
+		assert_eq!(h.stop().await, SourceSyncEnd::Stopped);
+	}
+
+	#[tokio::test]
+	async fn on_push_the_idle_loop_asks_no_tip_on_the_wire_however_often_it_looks() {
+		let (h, bundles, _transport, _pro) = start_pushed(&[], fast_tuning()).await;
+		let tips = h.source.calls("tip");
+		tokio::time::sleep(Duration::from_millis(100)).await;
+		assert_eq!(h.source.calls("tip"), tips, "fast_tuning polls many times in this wait");
+		// When the session stops trusting pushes, the poll is back at once.
+		bundles.set_push_trusted(false);
+		tokio::time::sleep(Duration::from_millis(100)).await;
+		assert!(h.source.calls("tip") > tips);
+		assert_eq!(h.stop().await, SourceSyncEnd::Stopped);
+	}
+
+	#[tokio::test]
+	async fn a_push_that_skips_a_block_is_filled_by_one_pull() {
+		let tuning = SourceTuning { poll_interval: Duration::from_secs(3600), ..fast_tuning() };
+		let (mut h, bundles, transport, pro) = start_pushed(&[], tuning).await;
+		h.source.mine(2, &[], 0);
+		pro.mine(2, &[], 0);
+		let since_before = transport.calls("since");
+		bundles.ingest(&transport.push(31..=31).await).unwrap();
+		assert_eq!(
+			h.ops_until_synced().await,
+			vec![Op::Filtered(30), Op::Filtered(31), Op::Synced(31)]
+		);
+		assert_eq!(transport.calls("since"), since_before + 1, "the gap's");
+		assert_eq!(h.source.calls("filters"), 0);
+		assert_eq!(h.source.calls("filter_headers"), 0);
+		assert_eq!(h.stop().await, SourceSyncEnd::Stopped);
+	}
+
+	#[tokio::test]
+	async fn a_push_on_another_branch_clears_what_is_held_and_the_loop_follows_the_reorg() {
+		let tuning = SourceTuning { poll_interval: Duration::from_secs(3600), ..fast_tuning() };
+		let (mut h, bundles, transport, pro) = start_pushed(&[], tuning).await;
+		h.source.reorg(2, 3);
+		pro.reorg(2, 3);
+		bundles.ingest(&transport.push(30..=30).await).unwrap();
+		assert_eq!(
+			h.ops_until_synced().await,
+			vec![
+				Op::Disconnect(vec![29, 28]),
+				Op::Filtered(28),
+				Op::Filtered(29),
+				Op::Filtered(30),
+				Op::Synced(30)
+			]
+		);
+		assert_eq!(lock_headers(&h.chain).tip(), Some(h.source.tip_id()));
+		assert_eq!(h.stop().await, SourceSyncEnd::Stopped);
+	}
+
+	#[tokio::test]
+	async fn a_new_provider_cuts_the_retry_backoff_short() {
+		// A backoff far longer than the test: only the wake can end it.
+		let tuning = SourceTuning {
+			initial_backoff: Duration::from_secs(3600),
+			max_backoff: Duration::from_secs(3600),
+			..fast_tuning()
+		};
+		let (mut h, bundles, _transport, _pro) = start_bundled(&[], tuning);
+		h.source.fail_next(1);
+		tokio::time::sleep(Duration::from_millis(50)).await;
+		bundles.target_changed();
+		assert_eq!(h.ops_until_synced().await.last(), Some(&Op::Synced(29)));
+		assert_eq!(h.stop().await, SourceSyncEnd::Stopped);
 	}
 
 	/// The raw reads of the data a bundle carries.
@@ -2914,6 +3942,407 @@ mod tests {
 		assert_eq!(h.permits.available_permits(), CBF_FULL_BLOCK_PERMITS, "no permit leaked");
 	}
 
+	/// H1: taking back what a filter hid must not un-confirm what stands. Headers still on the
+	/// chain of most work are not disconnected: a channel funded above `from` would be force closed.
+	#[tokio::test]
+	async fn a_rewind_disconnects_nothing_and_finds_what_a_lying_source_hid() {
+		let source = FakeSource::new(30, &[20, 25]);
+		source.set_lie(Lie::OmitOutputsOnlyAt(20));
+		let mut h = start(source, 0, fast_tuning());
+		let first = h.ops_until_synced().await;
+		assert!(first.contains(&Op::Filtered(20)), "the lie hid the matched block: {:?}", first);
+		assert!(first.contains(&Op::Full(25)), "a true filter above it matched: {:?}", first);
+
+		// The next source is honest; the loop would otherwise refuse its filter-header chain.
+		h.source.set_lie(Lie::None);
+		let hash = h.source.block_at(20).block_hash();
+		lock_headers(&h.chain).request_rewind(BlockId { height: 20, hash });
+		h.source.mine(1, &[], 0);
+		let ops = h.ops_until_synced().await;
+		assert!(
+			!ops.iter().any(|op| matches!(op, Op::Disconnect(_))),
+			"the headers stay on the chain of most work, so nothing is disconnected: {:?}",
+			ops
+		);
+		assert!(ops.contains(&Op::Scan(20)), "what the filter hid is read: {:?}", ops);
+		assert!(ops.contains(&Op::Scan(25)), "and all that the new filters match: {:?}", ops);
+		assert!(ops.contains(&Op::Filtered(30)), "and the chain carries on: {:?}", ops);
+		assert!(
+			!ops.iter().any(|op| matches!(op, Op::Filtered(h) | Op::Full(h) if *h <= 29)),
+			"nothing connects twice: {:?}",
+			ops
+		);
+		assert_eq!(lock_headers(&h.chain).filter_header(29), h.source.true_filter_header(29));
+		assert!(!matches!(*h.sync_state_tx.borrow(), CbfSyncState::Failed(_)));
+		assert_eq!(h.stop().await, SourceSyncEnd::Stopped);
+	}
+
+	/// A true reorg still follows the normal rules, even with a rewind in the air.
+	#[tokio::test]
+	async fn a_true_reorg_during_a_rewind_disconnects_only_what_left_the_chain() {
+		let source = FakeSource::new(30, &[]);
+		source.set_lie(Lie::OmitOutputsOnlyAt(20));
+		let mut h = start(source, 0, fast_tuning());
+		h.ops_until_synced().await;
+		h.source.set_lie(Lie::None);
+		let hash = h.source.block_at(20).block_hash();
+		lock_headers(&h.chain).request_rewind(BlockId { height: 20, hash });
+		h.source.reorg(2, 4);
+		let ops = h.ops_until_synced().await;
+		let disconnects: Vec<&Op> =
+			ops.iter().filter(|op| matches!(op, Op::Disconnect(_))).collect();
+		assert_eq!(disconnects, vec![&Op::Disconnect(vec![29, 28])], "{:?}", ops);
+		assert!(ops.contains(&Op::Filtered(31)), "the new branch connects: {:?}", ops);
+		assert_eq!(h.stop().await, SourceSyncEnd::Stopped);
+	}
+
+	/// B2: a forged tip and made-up headers cost the sender and never decide a reorg.
+	#[tokio::test]
+	async fn a_forged_tip_on_unproven_headers_convicts_the_sender_and_the_loop_lives() {
+		let tuning = SourceTuning {
+			restart_backoff: Some((Duration::from_millis(20), Duration::from_millis(40))),
+			..fast_tuning()
+		};
+		let source = Arc::new(FakeSource::new(30, &[]));
+		let observer = Arc::new(Heard::default());
+		let mut h = start_observed(Arc::clone(&source), 10, tuning, Arc::clone(&observer));
+		h.ops_until_synced().await;
+
+		source.set_lie(Lie::ForgedHeadersFrom(12));
+		observer.wait_for(|event| {
+			matches!(
+				event,
+				SyncEvent::Evidence { kind: LieKind::BadHeader, .. }
+			)
+		})
+		.await;
+		tokio::time::sleep(Duration::from_millis(200)).await;
+		assert!(!h.task.is_finished(), "a peer's word does not end the loop");
+		h.assert_quiet().await;
+
+		// Whoever answers next is followed, with no restart of anything.
+		source.set_lie(Lie::None);
+		source.mine(1, &[], 0);
+		let ops = h.ops_until_synced().await;
+		assert_eq!(ops, vec![Op::Filtered(30), Op::Synced(30)]);
+		assert_eq!(h.stop().await, SourceSyncEnd::Stopped);
+	}
+
+	/// B2 with real proof of work: a chain this node cannot follow is a reason to leave that Pro,
+	/// and no reason to stop following the chain.
+	#[tokio::test]
+	async fn a_fork_below_the_headers_held_does_not_end_a_supervised_loop() {
+		let tuning = SourceTuning {
+			held_headers: 5,
+			restart_backoff: Some((Duration::from_millis(20), Duration::from_millis(40))),
+			..fast_tuning()
+		};
+		let source = Arc::new(FakeSource::new(30, &[]));
+		let observer = Arc::new(Heard::default());
+		let mut h = start_observed(Arc::clone(&source), 10, tuning, Arc::clone(&observer));
+		h.ops_until_synced().await;
+		source.reorg(10, 12);
+		observer
+			.wait_for(|event| matches!(event, SyncEvent::Evidence { kind: LieKind::WrongChain, .. }))
+			.await;
+		tokio::time::sleep(Duration::from_millis(200)).await;
+		assert!(!h.task.is_finished());
+		h.assert_quiet().await;
+		assert_eq!(h.stop().await, SourceSyncEnd::Stopped);
+	}
+
+	/// H2: strikes are evidence against the source, and starting over keeps every check.
+	#[tokio::test]
+	async fn failing_closed_tells_the_session_and_starting_over_keeps_the_filter_headers() {
+		let tuning = SourceTuning {
+			restart_backoff: Some((Duration::from_millis(20), Duration::from_millis(40))),
+			..fast_tuning()
+		};
+		let source = Arc::new(FakeSource::new(30, &[]));
+		let observer = Arc::new(Heard::default());
+		let mut h = start_observed(Arc::clone(&source), 10, tuning, Arc::clone(&observer));
+		h.ops_until_synced().await;
+		let held = lock_headers(&h.chain).filter_header(29);
+		assert!(held.is_some());
+
+		// One Pro, the same Pro: first a span that does not hash.
+		source.set_lie(Lie::FilterHeaderAt(30));
+		source.mine(1, &[], 0);
+		observer
+			.wait_for(|event| matches!(event, SyncEvent::Evidence { kind: LieKind::InvalidFilterData, .. }))
+			.await;
+		let mut state = h.sync_state_tx.subscribe();
+		tokio::time::timeout(WAIT, state.wait_for(|s| matches!(s, CbfSyncState::Failed(_))))
+			.await
+			.expect("failed closed in time")
+			.expect("alive");
+		// Long enough for a start-over or two.
+		tokio::time::sleep(Duration::from_millis(150)).await;
+		assert_eq!(lock_headers(&h.chain).filter_header(29), held, "kept through the start-over");
+
+		// Then a story of its own from below: consistent with itself, not with what it said.
+		source.set_lie(Lie::OmitOutputsFrom(25));
+		h.assert_quiet().await;
+		tokio::time::sleep(Duration::from_millis(150)).await;
+		h.assert_quiet().await;
+		assert_eq!(lock_headers(&h.chain).tip().unwrap().height, 30);
+		assert_eq!(lock_headers(&h.chain).filter_header(30), None, "nothing of it was taken");
+		assert_eq!(h.stop().await, SourceSyncEnd::Stopped);
+	}
+
+	/// The Pro is one whose filter chain this node has not yet heard: another Pro's history may
+	/// disagree, and that is no evidence against this one. Those blocks are read again from it.
+	#[tokio::test]
+	async fn the_next_pros_filter_chain_is_not_held_against_it_and_what_differs_is_read_again() {
+		let source = Arc::new(FakeSource::new(30, &[22]));
+		source.set_lie(Lie::OmitOutputsOnlyAt(22));
+		let observer = Arc::new(Heard::default());
+		let mut h = start_observed(Arc::clone(&source), 10, fast_tuning(), Arc::clone(&observer));
+		let first = h.ops_until_synced().await;
+		assert!(first.contains(&Op::Filtered(22)));
+
+		// The session moved: the same chain, an honest Pro.
+		source.set_lie(Lie::None);
+		source.next_epoch();
+		source.mine(1, &[], 0);
+		let ops = h.ops_until_synced().await;
+		assert!(ops.contains(&Op::Scan(22)), "what the old Pro hid is read: {:?}", ops);
+		assert!(!ops.iter().any(|op| matches!(op, Op::Disconnect(_))), "{:?}", ops);
+		assert!(ops.contains(&Op::Filtered(30)), "{:?}", ops);
+		assert_eq!(observer.evidence(), Vec::<LieKind>::new(), "no evidence against the honest one");
+		assert_eq!(h.stop().await, SourceSyncEnd::Stopped);
+	}
+
+	/// What a loop keeps across a restart.
+	#[derive(Default)]
+	struct Remembering {
+		heard: Heard,
+		kept: Mutex<Vec<SavedFilterHeader>>,
+	}
+
+	impl SyncObserver for Remembering {
+		fn sync_event(&self, epoch: u64, event: SyncEvent) {
+			self.heard.sync_event(epoch, event);
+		}
+		fn saved_filter_headers(&self) -> Vec<SavedFilterHeader> {
+			self.kept.lock().unwrap().clone()
+		}
+		fn save_filter_headers(&self, headers: &[SavedFilterHeader]) {
+			*self.kept.lock().unwrap() = headers.to_vec();
+		}
+	}
+
+	fn start_remembering(
+		source: Arc<FakeSource>, anchor_height: u32, observer: Arc<Remembering>,
+	) -> Harness {
+		let filter_source = Arc::clone(&source) as Arc<dyn FilterSource>;
+		start_watched(
+			source,
+			filter_source,
+			new_shared_header_chain(),
+			Arc::new(Notify::new()),
+			anchor_height,
+			fast_tuning(),
+			Some(observer as Arc<dyn SyncObserver>),
+		)
+	}
+
+	/// N4. A Pro hides a spend at 22, and the node restarts above it before any check. Its listeners
+	/// resume at 29, and the Pro now serves the true chain: without what was saved, the block is
+	/// never read again and no check ever differs. With it, the first span does not continue what
+	/// this node saw, and the blocks where they part are read.
+	#[tokio::test]
+	async fn a_restart_does_not_forget_what_a_pro_said_before_it() {
+		let source = Arc::new(FakeSource::new(30, &[22]));
+		source.set_lie(Lie::OmitOutputsOnlyAt(22));
+		let memory = Arc::new(Remembering::default());
+		let mut h = start_remembering(Arc::clone(&source), 10, Arc::clone(&memory));
+		let first = h.ops_until_synced().await;
+		assert!(first.contains(&Op::Filtered(22)), "the lie worked: {:?}", first);
+		assert_eq!(h.stop().await, SourceSyncEnd::Stopped);
+		let kept = memory.kept.lock().unwrap().clone();
+		assert_eq!(kept.last().map(|row| row.height), Some(29));
+
+		// The restart. The listeners stand at 29. It says the truth now.
+		source.set_lie(Lie::None);
+		source.mine(1, &[], 0);
+		let mut h = start_remembering(Arc::clone(&source), 29, Arc::clone(&memory));
+		let ops = h.ops_until_synced().await;
+		assert!(ops.contains(&Op::Scan(22)), "what it hid is read: {:?}", ops);
+		assert!(!ops.iter().any(|op| matches!(op, Op::Disconnect(_))), "{:?}", ops);
+		assert_eq!(memory.heard.evidence(), Vec::<LieKind>::new(), "who said what is not known");
+		memory
+			.heard
+			.wait_for(|event| matches!(event, SyncEvent::ReadingAgain))
+			.await;
+		assert_eq!(lock_headers(&h.chain).filter_header(29), source.true_filter_header(29));
+		assert_eq!(h.stop().await, SourceSyncEnd::Stopped);
+	}
+
+	/// N4 as it went on the wire: the anchor is the lowest listener's, below the lie, and the listener
+	/// the money is for stands above it. The block comes again from the true chain, and the gate skips
+	/// it for that listener. Where what is taken differs from what was saved, it is read as well.
+	#[tokio::test]
+	async fn a_restart_anchored_below_the_lie_reads_the_block_a_listener_would_skip() {
+		let source = Arc::new(FakeSource::new(30, &[27]));
+		source.set_lie(Lie::OmitOutputsOnlyAt(27));
+		let memory = Arc::new(Remembering::default());
+		let mut h = start_remembering(Arc::clone(&source), 10, Arc::clone(&memory));
+		let first = h.ops_until_synced().await;
+		assert!(first.contains(&Op::Filtered(27)), "the lie worked: {:?}", first);
+		assert_eq!(h.stop().await, SourceSyncEnd::Stopped);
+
+		source.set_lie(Lie::None);
+		let mut h = start_remembering(Arc::clone(&source), 25, Arc::clone(&memory));
+		let ops = h.ops_until_synced().await;
+		assert!(ops.contains(&Op::Full(27)), "{:?}", ops);
+		assert!(ops.contains(&Op::Scan(27)), "read for whoever would skip it: {:?}", ops);
+		assert!(!ops.iter().any(|op| matches!(op, Op::Disconnect(_))), "{:?}", ops);
+		memory.heard.wait_for(|event| matches!(event, SyncEvent::ReadingAgain)).await;
+		assert_eq!(h.stop().await, SourceSyncEnd::Stopped);
+
+		// With nothing differing, nothing is read twice.
+		let mut h = start_remembering(Arc::clone(&source), 25, Arc::clone(&memory));
+		let ops = h.ops_until_synced().await;
+		assert!(!ops.contains(&Op::Scan(27)), "{:?}", ops);
+		assert_eq!(h.stop().await, SourceSyncEnd::Stopped);
+	}
+
+	/// What it saved is still held if it goes on with the same lie, so a witness can differ.
+	#[tokio::test]
+	async fn a_restart_holds_the_saved_filter_headers_for_a_check_to_compare() {
+		let source = Arc::new(FakeSource::new(30, &[22]));
+		source.set_lie(Lie::OmitOutputsOnlyAt(22));
+		let memory = Arc::new(Remembering::default());
+		let mut h = start_remembering(Arc::clone(&source), 10, Arc::clone(&memory));
+		h.ops_until_synced().await;
+		assert_eq!(h.stop().await, SourceSyncEnd::Stopped);
+		let lied = memory.kept.lock().unwrap().last().unwrap().filter_header;
+
+		let mut h = start_remembering(Arc::clone(&source), 29, Arc::clone(&memory));
+		let ops = h.ops_until_synced().await;
+		assert!(!ops.contains(&Op::Scan(22)), "it says what it said: {:?}", ops);
+		{
+			let chain = lock_headers(&h.chain);
+			assert_eq!(chain.filter_header(29), Some(lied));
+			let held = chain.held_chain(29).unwrap();
+			let at_29 = (29 - held.base) as usize;
+			assert_eq!(held.blocks[at_29].taken_under, None, "whose word is not known");
+		}
+		assert_eq!(h.stop().await, SourceSyncEnd::Stopped);
+	}
+
+	/// B1: the loop tells of a stale tip and of being stuck, and clears it.
+	#[tokio::test]
+	async fn a_stale_tip_is_told_to_the_observer_and_a_fresh_one_clears_it() {
+		let source = Arc::new(FakeSource::new(30, &[]));
+		let tuning = SourceTuning {
+			stale_tip_after: Some(Duration::from_secs(60)),
+			..fast_tuning()
+		};
+		let observer = Arc::new(Heard::default());
+		let h = start_observed(Arc::clone(&source), 10, tuning, Arc::clone(&observer));
+		observer.wait_for(|event| matches!(event, SyncEvent::StaleTip { height: 29, .. })).await;
+		source.mine_at(now_secs() as u32);
+		observer.wait_for(|event| matches!(event, SyncEvent::Healthy)).await;
+		assert_eq!(h.stop().await, SourceSyncEnd::Stopped);
+	}
+
+	/// What a move does to strikes: the old Pro's do not count against the new one.
+	#[tokio::test]
+	async fn a_move_clears_the_strikes_and_what_came_from_before_it_is_not_told() {
+		let tuning = SourceTuning {
+			max_invalid_strikes: 2,
+			restart_backoff: Some((Duration::from_secs(600), Duration::from_secs(600))),
+			..fast_tuning()
+		};
+		let source = Arc::new(FakeSource::new(30, &[]));
+		let observer = Arc::new(Heard::default());
+		let wake = Arc::new(Notify::new());
+		let mut h = start_observed_woken(
+			Arc::clone(&source),
+			10,
+			tuning,
+			Arc::clone(&observer),
+			Arc::clone(&wake),
+		);
+		h.ops_until_synced().await;
+		source.set_lie(Lie::FilterHeaderAt(30));
+		source.mine(1, &[], 0);
+		observer.wait_for(|e| matches!(e, SyncEvent::Evidence { .. })).await;
+
+		// In the long wait of a restart: the move must not wait it out.
+		source.set_lie(Lie::None);
+		source.next_epoch();
+		wake.notify_one();
+		let ops = tokio::time::timeout(Duration::from_secs(5), h.ops_until_synced())
+			.await
+			.expect("a new Pro does not sit out the old one's wait");
+		assert_eq!(ops, vec![Op::Filtered(30), Op::Synced(30)]);
+		assert_eq!(h.stop().await, SourceSyncEnd::Stopped);
+	}
+
+	/// B1, B3's seam: a claim counts only with the headers to back it, and bad ones convict.
+	#[tokio::test]
+	async fn more_work_is_proven_by_headers_or_not_at_all() {
+		let ours = Arc::new(FakeSource::new(30, &[]));
+		let chain = new_shared_header_chain();
+		let source_for_chain = Arc::clone(&ours) as Arc<dyn FilterSource>;
+		let mut h =
+			start_over(Arc::clone(&ours), source_for_chain, Arc::clone(&chain), Arc::new(Notify::new()), 10, fast_tuning());
+		h.ops_until_synced().await;
+		let _ = h.stop().await;
+
+		// The same chain and three blocks more: the fake mines the same blocks every time.
+		let witness = FakeSource::new(33, &[]);
+		let claim = witness.tip_id();
+		let proof = prove_more_work(&witness, &chain, Network::Regtest, claim, WAIT, true).await;
+		assert_eq!(proof, BranchProof::Proven { height: 32, reached_claim: true });
+
+		// A claim from nothing: tip high, no header to show for it.
+		let empty = FakeSource::new(30, &[]);
+		let false_claim = BlockId { height: 500, hash: BlockHash::all_zeros() };
+		let proof = prove_more_work(&empty, &chain, Network::Regtest, false_claim, WAIT, true).await;
+		assert_eq!(proof, BranchProof::NotAhead);
+
+		// Made-up headers, however high.
+		let forger = FakeSource::new(40, &[]);
+		forger.set_lie(Lie::ForgedHeadersFrom(30));
+		let claim = forger.tip().await.unwrap();
+		let proof = prove_more_work(&forger, &chain, Network::Regtest, claim, WAIT, true).await;
+		assert!(matches!(proof, BranchProof::Forged { height: 30 }), "{:?}", proof);
+
+		// A claim the same height as ours, or under it, proves nothing.
+		let tie = BlockId { height: 29, hash: BlockHash::all_zeros() };
+		let proof = prove_more_work(&empty, &chain, Network::Regtest, tie, WAIT, true).await;
+		assert_eq!(proof, BranchProof::NotAhead);
+	}
+
+	/// The checks a made-up header cannot pass, on the network's rules.
+	#[test]
+	fn a_header_at_an_easy_target_does_not_pass_on_mainnet() {
+		// Self-consistent at the regtest limit, as forged headers are cheap to be.
+		let easy = mine(BlockHash::all_zeros(), 800_000, BASE_TIME, other_script(1), 0).header;
+		let failure = check_fork_header(Network::Bitcoin, 800_000, &easy, None);
+		assert!(
+			matches!(failure, Err(VerifyFailure::Header(HeaderCheck::ProofOfWork { .. }))),
+			"{:?}",
+			failure
+		);
+		assert!(check_fork_header(Network::Regtest, 800_000, &easy, None).is_ok());
+	}
+
+	#[tokio::test]
+	async fn a_rewind_for_a_block_no_longer_on_the_chain_is_nothing() {
+		let mut h = start(FakeSource::new(30, &[]), 0, fast_tuning());
+		h.ops_until_synced().await;
+		lock_headers(&h.chain).request_rewind(BlockId { height: 20, hash: BlockHash::all_zeros() });
+		h.source.mine(1, &[], 0);
+		let ops = h.ops_until_synced().await;
+		assert_eq!(ops, vec![Op::Filtered(30), Op::Synced(30)]);
+		assert_eq!(h.stop().await, SourceSyncEnd::Stopped);
+	}
+
 	#[tokio::test]
 	async fn a_reorg_of_depth_two_disconnects_tip_first_and_connects_the_new_branch() {
 		let mut h = start(FakeSource::new(30, &[]), 10, fast_tuning());
@@ -3018,6 +4447,7 @@ mod tests {
 		fn connect_block(&self, _block: &Block, _height: u32) {}
 		fn connect_filtered(&self, _header: &Header, _height: u32) {}
 		fn disconnect(&self, _header: &Header, _height: u32) {}
+		fn scan_block(&self, _block: &Block, _height: u32) {}
 		fn take_divergence(&self) -> Option<String> {
 			None
 		}
@@ -3113,6 +4543,7 @@ mod tests {
 			Arc::new(FixedScripts(vec![watched_script()])),
 			ops_tx,
 			replay_rx,
+			Arc::new(Notify::new()),
 			sync_state_tx.clone(),
 			Arc::new(Semaphore::new(CBF_FULL_BLOCK_PERMITS)),
 			stop_rx,

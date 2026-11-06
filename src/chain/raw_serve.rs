@@ -557,6 +557,35 @@ impl RawChainServer {
 		})
 	}
 
+	/// One block's bundle, to push: built once and cached, as for a `since`.
+	pub(crate) async fn serve_block_update(&self, height: u32) -> Result<WireBlockUpdate, Error> {
+		self.deadline("block update", self.limits.small_timeout, async {
+			let _turn = self.turn().await?;
+			let headers = self
+				.source
+				.headers(height, 1)
+				.await
+				.map_err(|e| self.source_failed("block update", e))?;
+			let Some(header) = headers.into_iter().next() else {
+				return Err(self.source_failed(
+					"block update",
+					SourceError::NotFound(format!("no header at height {}", height)),
+				));
+			};
+			let hash = header.block_hash();
+			let cached = self.bundles.lock().unwrap().get(&hash);
+			let bundle = match cached {
+				Some(bundle) => bundle,
+				None => {
+					let mut read = self.read_bundles("block update", height, &[header]).await?;
+					read.swap_remove(0)
+				},
+			};
+			Ok(block_update_to_wire(&bundle, None))
+		})
+		.await
+	}
+
 	/// The bundles of the best-chain blocks above `req.from`, ascending: at
 	/// most `req.max_blocks` (capped at [`MAX_UPDATES_PER_SINCE`]), and no
 	/// more than fit in [`SINCE_REPLY_BYTES`]. `more` says the reply stopped
@@ -590,6 +619,7 @@ impl RawChainServer {
 				tip: block_id_to_wire(&tip),
 				updates,
 				more,
+				lease_until: None,
 			};
 			if from.height > tip.height {
 				return Ok(reply(Vec::new(), false));

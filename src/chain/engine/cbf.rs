@@ -20,7 +20,7 @@
 //! wallet APIs are synchronous, the runtime is the one [`SyncEngine::start`] hands over, and
 //! the fee/broadcast hooks became slot adapters.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
@@ -42,7 +42,7 @@ use bdk_chain::BlockId;
 
 use lightning::chain::{BestBlock, WatchedOutput};
 
-use tokio::sync::{mpsc, watch, Semaphore};
+use tokio::sync::{mpsc, watch, Notify, Semaphore};
 
 use crate::chain::bitcoind::ChainListener;
 use crate::chain::cbf::applicator::{
@@ -57,8 +57,13 @@ use crate::chain::cbf::fee_sampler::{
 use crate::chain::cbf::source::FilterSource;
 use crate::chain::cbf::source_sync::{
 	lock_headers, new_shared_header_chain, replay_channel, HeaderChain, ReplaySender,
-	SharedHeaderChain, SourceFeeSource, SourceSync, SourceSyncEnd, SourceTuning, WatchedScripts,
+	SharedHeaderChain, SourceFeeSource, SourceSync, SourceSyncEnd, SourceTuning, SyncEvent,
+	WatchedScripts,
 };
+#[cfg(feature = "swaps")]
+use crate::chain::cbf::source_sync::verify_block;
+#[cfg(feature = "swaps")]
+use crate::chain::engine::ProviderConfirmation;
 use crate::chain::cbf::{
 	mark_syncing, parse_trusted_peer, resume_checkpoint_for, simplify_sync_state, CbfSyncState,
 	ResumeRefusal, WatchLedger, CBF_BLOCK_FETCH_TIMEOUT_SECS, CBF_HEADER_LOOKUP_TIMEOUT_SECS,
@@ -67,7 +72,7 @@ use crate::chain::engine::SyncEngine;
 use crate::chain::provider::BundleTransport;
 use crate::chain::seam::ActionResult;
 use crate::chain::target::{SyncTarget, TargetId, TargetRegistry};
-use crate::chain::{BorrowedMempool, MempoolEvictions};
+use crate::chain::BorrowedMempool;
 use crate::fee_estimator::OnchainFeeEstimator;
 use crate::types::Broadcaster;
 use crate::chain::{CbfSyncStatus, ChainLayer, ElectrumRuntimeStatus};
@@ -470,6 +475,12 @@ impl ChainFanout for MultiListener {
 		}
 	}
 
+	fn scan_block(&self, block: &Block, height: u32) {
+		for listener in self.snapshot() {
+			listener.scan_block(block, height);
+		}
+	}
+
 	fn take_divergence(&self) -> Option<String> {
 		self.snapshot().iter().find_map(|l| l.take_divergence())
 	}
@@ -501,6 +512,12 @@ impl ChainFanout for MultiListener {
 	}
 }
 
+/// The first wait before a node-source sync that ended on its own is started again.
+const SOURCE_RELAUNCH_FIRST_WAIT: Duration = Duration::from_secs(30);
+
+/// The longest wait between two such starts.
+const SOURCE_RELAUNCH_MAX_WAIT: Duration = Duration::from_secs(10 * 60);
+
 pub(crate) struct CbfSyncEngine {
 	kyoto: KyotoParams,
 	/// Where the chain data comes from; see [`CbfSource`].
@@ -510,20 +527,31 @@ pub(crate) struct CbfSyncEngine {
 	/// The header chain the node-source sync verified; read by its fee source,
 	/// `is_on_chain` and the bundle source. Empty while kyoto runs.
 	source_headers: SharedHeaderChain,
+	/// Cuts the node-source sync's waits short: a pushed block, or a new provider.
+	source_wake: Arc<Notify>,
 	/// The bundle source wrapping `filter_source`, when one is set; see [`Self::with_bundles`].
 	bundles: Option<Arc<BundleFilterSource>>,
-	/// When the last mempool question was asked; see [`Self::mempool_pass_is_fresh`].
-	last_mempool_pass: Mutex<Option<std::time::Instant>>,
+	/// Whether a new block or a check-in makes a mempool question due.
+	mempool_cadence: Mutex<MempoolCadence>,
 	/// Which source feeds the applicator now: [`ACTIVE_P2P`] or [`ACTIVE_NODE`]. Moves from
 	/// node to P2P once, when `node,p2p` falls back.
 	active_source: Arc<AtomicU8>,
 	/// The node-source sync, while one runs.
 	source_run: Arc<Mutex<Option<SourceRun>>>,
+	/// Why the node-source sync ended, when nobody asked it to and it has not been started again.
+	source_ended: Arc<Mutex<Option<String>>>,
+	/// Rings when `source_ended` is set.
+	source_ended_wake: Arc<Notify>,
 	/// The node-source sync loop's knobs; its replay depth bounds a late target too.
 	source_tuning: SourceTuning,
 	/// Scripts LDK asked to watch. The wallet's own are pulled from the wallet, not kept here,
 	/// so nothing is tracked twice.
 	registered_scripts: Arc<Mutex<HashSet<ScriptBuf>>>,
+	/// The outputs LDK registered, with their scripts: what a cross-check holds a filter to.
+	/// The block each transaction a provider said confirmed was seen in; see
+	/// [`SyncEngine::check_provider_confirmation`].
+	#[cfg(feature = "swaps")]
+	confirmations_shown: Mutex<HashMap<Txid, (u32, BlockHash)>>,
 	/// Where watched transactions were seen confirmed, as the applicator saw them.
 	watch_ledger: Arc<WatchLedger>,
 	/// Coinbase-derived fee rates of the blocks the applicator downloaded.
@@ -620,19 +648,24 @@ impl CbfSyncEngine {
 			source_mode,
 			filter_source,
 			source_headers: new_shared_header_chain(),
+			source_wake: Arc::new(Notify::new()),
 			bundles: None,
-			last_mempool_pass: Mutex::new(None),
+			mempool_cadence: Mutex::new(MempoolCadence::default()),
 			active_source: Arc::new(AtomicU8::new(if source_mode.uses_node_source() {
 				ACTIVE_NODE
 			} else {
 				ACTIVE_P2P
 			})),
 			source_run: Arc::new(Mutex::new(None)),
+			source_ended: Arc::new(Mutex::new(None)),
+			source_ended_wake: Arc::new(Notify::new()),
 			source_tuning: SourceTuning::production(
 				source_mode == CbfSource::NodeThenP2p,
 				config.network,
 			),
 			registered_scripts: Arc::new(Mutex::new(HashSet::new())),
+			#[cfg(feature = "swaps")]
+			confirmations_shown: Mutex::new(HashMap::new()),
 			watch_ledger: Arc::new(WatchLedger::new()),
 			block_fee_cache: new_block_fee_cache(),
 			fee_demand: Arc::new(fee_demand),
@@ -667,7 +700,7 @@ impl CbfSyncEngine {
 		};
 		log_info!(
 			self.logger,
-			"CBF node source '{}' pulls per-block bundles through '{}' when its tip moves.",
+			"CBF node source '{}' takes per-block bundles through '{}': pushed under a lease, or pulled when its tip moves.",
 			inner.name(),
 			transport.name()
 		);
@@ -675,9 +708,11 @@ impl CbfSyncEngine {
 			inner,
 			transport,
 			Arc::clone(&self.source_headers),
+			Arc::clone(&self.source_wake),
 			BundleTuning::default(),
 			Arc::clone(&self.logger),
 		));
+		bundles.set_block_fees(Arc::clone(&self.block_fee_cache));
 		self.filter_source = Some(Arc::clone(&bundles) as Arc<dyn FilterSource>);
 		self.bundles = Some(bundles);
 		self
@@ -717,6 +752,12 @@ impl CbfSyncEngine {
 	/// fetched.
 	fn match_script(&self, script_pubkey: ScriptBuf) {
 		self.registered_scripts.lock().unwrap_or_else(|e| e.into_inner()).insert(script_pubkey);
+	}
+
+	fn tell_sync_observer(&self, event: SyncEvent) {
+		if let Some(observer) = self.bundles.as_ref().and_then(|bundles| bundles.sync_observer()) {
+			observer.sync_event(0, event);
+		}
 	}
 
 	/// Builds the gated fan-out over every target registered now, publishes it, and launches the
@@ -880,7 +921,7 @@ impl CbfSyncEngine {
 			Arc::clone(&self.targets),
 			Arc::clone(&self.logger),
 		);
-		handle.spawn(applicator.run());
+		let applicator = handle.spawn(applicator.run());
 
 		let fall_back = self.source_mode == CbfSource::NodeThenP2p;
 		let sync = SourceSync::new(
@@ -891,12 +932,20 @@ impl CbfSyncEngine {
 			self.engine_scripts(),
 			ops_tx.clone(),
 			replay_rx,
+			Arc::clone(&self.source_wake),
 			self.sync_state_tx.clone(),
 			Arc::clone(&self.full_block_permits),
 			stop_rx,
 			self.source_tuning.clone(),
 			Arc::clone(&self.logger),
 		);
+		if let Some(bundles) = &self.bundles {
+			bundles.set_watched(self.engine_scripts());
+		}
+		let sync = match self.bundles.as_ref().and_then(|bundles| bundles.sync_observer()) {
+			Some(observer) => sync.observed_by(observer),
+			None => sync,
+		};
 		log_info!(
 			self.logger,
 			"CBF chain source started: filters from the node source '{}'{}; no Bitcoin P2P connection.",
@@ -920,25 +969,44 @@ impl CbfSyncEngine {
 		let source_run = Arc::clone(&self.source_run);
 		let logger = Arc::clone(&self.logger);
 		let spawn_handle = handle.clone();
+		let ended = Arc::clone(&self.source_ended);
+		let ended_wake = Arc::clone(&self.source_ended_wake);
 		handle.spawn(async move {
-			match sync.run().await {
+			let end_reason = match sync.run().await {
 				SourceSyncEnd::FallBack => {
 					if let Some(fallback) = fallback {
 						fallback.start(&spawn_handle);
 						return;
 					}
 					log_error!(logger, "CBF node source asked for a P2P fallback it has not got.");
+					Some("the fallback it asked for is not there".to_string())
 				},
-				SourceSyncEnd::Stopped => log_debug!(logger, "CBF node-source sync stopped."),
+				SourceSyncEnd::Stopped => {
+					log_debug!(logger, "CBF node-source sync stopped.");
+					None
+				},
 				SourceSyncEnd::ApplicatorGone => {
-					log_debug!(logger, "CBF node-source sync ended: the applicator halted.")
+					log_debug!(logger, "CBF node-source sync ended: the applicator halted.");
+					Some("the block applicator halted".to_string())
 				},
 				// Logged, and published as failed, by the loop.
-				SourceSyncEnd::Failed(_) => {},
+				SourceSyncEnd::Failed(reason) => Some(reason),
+			};
+			// Only then is nothing left of this run to race the next: the applicator flushes as
+			// it goes.
+			drop(fallback);
+			if end_reason.is_some() {
+				let _ = applicator.await;
 			}
-			let mut run = source_run.lock().unwrap_or_else(|e| e.into_inner());
-			if run.as_ref().is_some_and(|r| r.generation == generation) {
-				*run = None;
+			{
+				let mut run = source_run.lock().unwrap_or_else(|e| e.into_inner());
+				if run.as_ref().is_some_and(|r| r.generation == generation) {
+					*run = None;
+				}
+			}
+			if let Some(reason) = end_reason {
+				*ended.lock().unwrap_or_else(|e| e.into_inner()) = Some(reason);
+				ended_wake.notify_one();
 			}
 		});
 	}
@@ -1005,25 +1073,21 @@ impl CbfSyncEngine {
 		}
 	}
 
-	/// Borrow one mempool view from the layer's MEMPOOL chain for every wallet at once — their
-	/// scripts and known unconfirmed transactions, and LDK's scripts — and apply each wallet's
-	/// share; see [`ChainLayer::borrow_mempool`]. Asks nothing unless
-	/// [`ChainLayer::mempool_wanted`]. `None` when nothing was asked.
-	async fn borrow_mempool(
-		&self, layer: &ChainLayer, evictions: MempoolEvictions,
-	) -> Option<ActionResult<BorrowedMempool>> {
-		if !layer.mempool_wanted(MEMPOOL_RECEIVE_WINDOW) {
+	/// Ask the layer's MEMPOOL chain about what the wallets hold unconfirmed, and apply the
+	/// answer ([`ChainLayer::borrow_mempool`]): only once synced, as a view above the applied tip
+	/// has nothing a wallet can act on, and at most once per new block or check-in
+	/// ([`MempoolCadence`]), whoever calls and how often. `None` when nothing was due.
+	async fn borrow_mempool(&self, layer: &ChainLayer) -> Option<ActionResult<BorrowedMempool>> {
+		if !layer.has_mempool_chain() || !self.is_synced() {
+			return None;
+		}
+		let tip = self.applied_tip_height();
+		if !self.mempool_cadence.lock().unwrap_or_else(|e| e.into_inner()).due(tip, Instant::now()) {
 			return None;
 		}
 		let targets = layer.targets().snapshot();
-		let registered =
-			self.registered_scripts.lock().unwrap_or_else(|e| e.into_inner()).clone();
 		let started = std::time::Instant::now();
-		let borrowed = layer
-			.borrow_mempool(&targets, &registered, self.applied_tip_height(), evictions)
-			.await;
-		*self.last_mempool_pass.lock().unwrap_or_else(|e| e.into_inner()) =
-			Some(std::time::Instant::now());
+		let borrowed = layer.borrow_mempool(&targets, tip).await;
 		if let Ok(borrowed) = &borrowed {
 			log_trace!(
 				self.logger,
@@ -1036,52 +1100,31 @@ impl CbfSyncEngine {
 		}
 		Some(borrowed)
 	}
-
-	/// Whether a foreground pass finds the background's view, or the pass of the wallet before
-	/// it, still fresh: a caller syncing every wallet in turn asks once.
-	fn mempool_pass_is_fresh(&self) -> bool {
-		self.last_mempool_pass
-			.lock()
-			.unwrap_or_else(|e| e.into_inner())
-			.map_or(false, |at| at.elapsed() < MEMPOOL_PASS_FRESH)
-	}
-
-	/// With which evictions the background loop borrows a mempool view on this tick: `None`
-	/// when there is no chain to borrow from.
-	///
-	/// A node catching up — kyoto still syncing, or waiting for peers after a cold boot whose
-	/// network came up late — borrows too. Gating the borrow on being synced stopped it for
-	/// exactly as long as the node was behind, which is when an incoming payment is most worth
-	/// seeing. The answer is still tip-checked: one anchored off this node's chain is refused,
-	/// and one above its applied tip cannot be placed and is accepted, as on a synced node.
-	///
-	/// What waits for the sync is the evictions. A view taken above the applied tip does not
-	/// have the transactions that confirmed in the blocks between; the wallet's known
-	/// unconfirmed ones among them would read as evicted, their inputs as spendable again and
-	/// the payments as gone from the balance, until the blocks arrive. So a node behind the tip
-	/// applies the unconfirmed half only ([`MempoolEvictions::Withhold`]) — nothing in it needs
-	/// a block of ours — and a synced node applies both.
-	fn mempool_borrow_due(&self, layer: &ChainLayer) -> Option<MempoolEvictions> {
-		mempool_borrow_plan(layer.has_mempool_chain(), self.is_synced())
-	}
-
-	/// Which evictions a borrow taken now may apply: all of them only once synced.
-	fn mempool_evictions(&self) -> MempoolEvictions {
-		mempool_evictions_when(self.is_synced())
-	}
 }
 
-/// [`CbfSyncEngine::mempool_borrow_due`], on its two inputs.
-fn mempool_borrow_plan(has_mempool_chain: bool, synced: bool) -> Option<MempoolEvictions> {
-	has_mempool_chain.then(|| mempool_evictions_when(synced))
+/// When a filter-following node may ask about its unconfirmed transactions: when the applied tip
+/// moved, or [`MEMPOOL_CHECK_IN`] after the last time. Nothing else changes the answer's worth: a
+/// confirmation comes by filters, and an eviction is worth noticing within a block.
+#[derive(Default)]
+struct MempoolCadence {
+	last: Option<(u32, Instant)>,
 }
 
-/// [`CbfSyncEngine::mempool_evictions`], on whether the engine is synced.
-fn mempool_evictions_when(synced: bool) -> MempoolEvictions {
-	if synced {
-		MempoolEvictions::Apply
-	} else {
-		MempoolEvictions::Withhold
+impl MempoolCadence {
+	/// Whether a question is due at `tip` and `now`. Taking it answers for this block, asked or
+	/// not: a transaction sent since has a question at the next block or check-in, soon enough
+	/// for something that has only just left.
+	fn due(&mut self, tip: u32, now: Instant) -> bool {
+		let due = match self.last {
+			Some((height, at)) => {
+				height != tip || now.saturating_duration_since(at) >= MEMPOOL_CHECK_IN
+			},
+			None => true,
+		};
+		if due {
+			self.last = Some((tip, now));
+		}
+		due
 	}
 }
 
@@ -1238,6 +1281,48 @@ impl FeeBlockSource for CbfFeeSource {
 
 /// The scripts a filter is matched against: every target's wallet and LDK's registrations,
 /// as both the kyoto event loop's `MatchSet` and the node-source sync read them.
+/// Most provider confirmations remembered as shown. Past it they are checked again.
+#[cfg(feature = "swaps")]
+const CONFIRMATIONS_SHOWN_KEPT: usize = 256;
+
+/// How far below the chain held a block is looked for. A resume holds from the start of the
+/// retarget period, so a swap's opening can be a period below that, and its 1008 block refund
+/// delay is over long before this.
+#[cfg(feature = "swaps")]
+const BELOW_HELD_AT_MOST: u32 = 2 * 2016;
+
+/// The header at `height`, below `lowest`, the lowest block this node holds. Whoever serves it, it
+/// must link up to that block, which no one can make up. `None` when it does not, or is not served.
+#[cfg(feature = "swaps")]
+async fn header_below_held(
+	source: &dyn FilterSource, height: u32, lowest: (u32, Header),
+) -> Option<Header> {
+	let (base, base_header) = lowest;
+	let wanted = base.checked_sub(height).filter(|wanted| *wanted <= BELOW_HELD_AT_MOST)?;
+	let mut headers: Vec<Header> = Vec::with_capacity(wanted as usize);
+	while (headers.len() as u32) < wanted {
+		let next = height + headers.len() as u32;
+		let count = (base - next).min(crate::chain::cbf::source::MAX_HEADERS_PER_REQUEST);
+		let asked = source.headers(next, count);
+		let batch = tokio::time::timeout(Duration::from_secs(CBF_BLOCK_FETCH_TIMEOUT_SECS), asked)
+			.await
+			.ok()?
+			.ok()?;
+		if batch.is_empty() {
+			return None;
+		}
+		headers.extend(batch.into_iter().take(count as usize));
+	}
+	let mut above = base_header.prev_blockhash;
+	for header in headers.iter().rev() {
+		if header.block_hash() != above {
+			return None;
+		}
+		above = header.prev_blockhash;
+	}
+	headers.first().copied()
+}
+
 struct EngineScripts {
 	targets: Arc<TargetRegistry>,
 	registered: Arc<Mutex<HashSet<ScriptBuf>>>,
@@ -1290,18 +1375,14 @@ async fn run_fee_sampler(
 	}
 }
 
-/// How long after a receive address is handed out the mempool is asked about it, so a payment
-/// to it shows before it confirms. After that an incoming payment shows at its first
-/// confirmation, which the filters see at no extra cost.
-pub(crate) const MEMPOOL_RECEIVE_WINDOW: Duration = Duration::from_secs(2 * 60 * 60);
+/// How long a filter-following node goes without asking about what it holds unconfirmed when no
+/// block comes: the Pro's check-in, ten minutes.
+const MEMPOOL_CHECK_IN: Duration = Duration::from_secs(10 * 60);
 
-/// How long a mempool pass stands for the foreground passes after it, so a caller syncing each
-/// wallet in turn asks once.
-const MEMPOOL_PASS_FRESH: Duration = Duration::from_secs(5);
-
-/// The interval on which the background loop borrows a mempool view: the on-chain wallet sync
-/// interval every other engine polls its chain source on. [`crate::config::CbfConfig`] carries
-/// no background-sync configuration, so this is the default one, floored like everywhere else.
+/// The interval on which the background loop looks whether a mempool question is due
+/// ([`MempoolCadence`]) and reaps dead fundings: the on-chain wallet sync interval every other
+/// engine polls its chain source on. [`crate::config::CbfConfig`] carries no background-sync
+/// configuration, so this is the default one, floored like everywhere else.
 fn mempool_borrow_interval() -> Duration {
 	Duration::from_secs(
 		BackgroundSyncConfig::default()
@@ -1538,27 +1619,23 @@ impl SyncEngine for CbfSyncEngine {
 		}
 	}
 
-	/// Wait — bounded by [`CBF_SYNC_WAIT_TIMEOUT`] — for the filters to catch up, then borrow a
-	/// mempool view if the layer has one to lend, then record the pass.
+	/// Wait — bounded by [`CBF_SYNC_WAIT_TIMEOUT`] — for the filters to catch up, ask about what
+	/// the wallets hold unconfirmed if that is due, then record the pass.
 	///
 	/// The mempool is supplementary: a filter-driven engine has none of its own, and a
 	/// provider that cannot answer this pass does not make the pass fail — the chain is
-	/// synced regardless. The background loop borrows on its own cadence too; this pass asks
-	/// again, when the mempool is wanted at all, so a caller of `sync_wallets` sees it as of
-	/// now.
+	/// synced regardless. A caller syncing often asks no more than the background loop does:
+	/// the question is per block or check-in ([`MempoolCadence`]).
 	async fn sync_once(&self, layer: &ChainLayer, target: &Arc<SyncTarget>) -> Result<(), Error> {
 		self.wait_until_synced_within(CBF_SYNC_WAIT_TIMEOUT).await?;
 
-		if layer.has_mempool_chain() && !self.mempool_pass_is_fresh() {
-			// Just waited for the sync, but a block may have landed since: ask again.
-			if let Some(Err(e)) = self.borrow_mempool(layer, self.mempool_evictions()).await {
-				log_error!(
-					self.logger,
-					"Could not borrow a mempool view this pass; the filter sync is complete \
-					 without it: {}",
-					e
-				);
-			}
+		if let Some(Err(e)) = self.borrow_mempool(layer).await {
+			log_error!(
+				self.logger,
+				"Could not borrow a mempool view this pass; the filter sync is complete \
+				 without it: {}",
+				e
+			);
 		}
 
 		let unix_time_secs_opt =
@@ -1579,8 +1656,8 @@ impl SyncEngine for CbfSyncEngine {
 	}
 
 	/// Launches kyoto and the applicator, then, until told to stop, keeps the fee cache fresh
-	/// through the FEE slot and — when the MEMPOOL chain has an adapter, synced or not — borrows
-	/// a mempool view on the on-chain wallet sync interval. Block application itself is
+	/// through the FEE slot and — when the MEMPOOL chain has an adapter — asks about what the
+	/// wallets hold unconfirmed when that is due. Block application itself is
 	/// event-driven and runs on the spawned tasks; this loop owns only the two ticks.
 	async fn run_background(
 		&self, layer: Arc<ChainLayer>, mut stop_sync_receiver: tokio::sync::watch::Receiver<()>,
@@ -1629,14 +1706,19 @@ impl SyncEngine for CbfSyncEngine {
 		let mut fee_cadence = FeeCadence::new(layer.fee_estimator().has_estimates());
 		fee_rate_update_interval.reset_after(fee_cadence.first_delay());
 
-		// The Dependent tier saw incoming unconfirmed payments and evictions on its own; a
-		// hybrid node must too, without waiting for someone to call `sync_wallets`.
+		// An own transaction that leaves the mempool cannot be seen from blocks: the node must
+		// notice without waiting for someone to call `sync_wallets`.
 		let mut mempool_interval = tokio::time::interval(mempool_borrow_interval());
 		mempool_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
 		// The fee refresh runs as its own task, one at a time: its chain may fall through to a
 		// provider that takes its whole budget, and the mempool tick must not wait on that.
 		let mut fee_refresh: Option<tokio::task::JoinHandle<bool>> = None;
+
+		// A sync loop that ended on its own is started again, on the state the listeners have
+		// now, as a restart of the process would. Each try waits longer.
+		let mut relaunch_at: Option<tokio::time::Instant> = None;
+		let mut relaunch_wait = SOURCE_RELAUNCH_FIRST_WAIT;
 
 		loop {
 			tokio::select! {
@@ -1646,6 +1728,32 @@ impl SyncEngine for CbfSyncEngine {
 						refresh.abort();
 					}
 					return;
+				}
+				_ = self.source_ended_wake.notified() => {
+					let reason = self.source_ended.lock().unwrap_or_else(|e| e.into_inner()).take();
+					let reason = reason.unwrap_or_else(|| "it ended".to_string());
+					log_error!(
+						self.logger,
+						"CBF node-source sync ended ({}); starting it again in {}s.",
+						reason,
+						relaunch_wait.as_secs()
+					);
+					self.tell_sync_observer(SyncEvent::Ended { reason });
+					relaunch_at = Some(tokio::time::Instant::now() + relaunch_wait);
+				}
+				_ = async { tokio::time::sleep_until(relaunch_at.expect("guarded")).await }, if relaunch_at.is_some() => {
+					relaunch_at = None;
+					let deps = (Arc::clone(layer.tx_broadcaster()), Arc::clone(layer.fee_estimator()));
+					self.launch_over(runtime.handle(), deps, layer.targets());
+					let running = self.source_run.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+					if running {
+						log_info!(self.logger, "CBF node-source sync started again.");
+						self.tell_sync_observer(SyncEvent::Restarted);
+					}
+					relaunch_wait = relaunch_wait.saturating_mul(2).min(SOURCE_RELAUNCH_MAX_WAIT);
+					if !running {
+						relaunch_at = Some(tokio::time::Instant::now() + relaunch_wait);
+					}
 				}
 				_ = fee_rate_update_interval.tick(), if fee_refresh.is_none() => {
 					let layer = Arc::clone(&layer);
@@ -1678,16 +1786,13 @@ impl SyncEngine for CbfSyncEngine {
 					// Blocks apply on the applicator's task; this tick is where the loop
 					// looks at what they left behind.
 					layer.reap_dead_fundings();
-					let Some(evictions) = self.mempool_borrow_due(&layer) else {
-						continue;
-					};
 					// A borrow runs up to its chain's budget; a stop must not wait it out.
 					tokio::select! {
 						_ = stop_sync_receiver.changed() => {
 							log_trace!(self.logger, "Stopping CBF background loop mid-borrow.");
 							return;
 						}
-						borrowed = self.borrow_mempool(&layer, evictions) => {
+						borrowed = self.borrow_mempool(&layer) => {
 							// Every tick asks again, so one that cannot answer is not news.
 							if let Some(Err(e)) = borrowed {
 								log_debug!(
@@ -1707,6 +1812,14 @@ impl SyncEngine for CbfSyncEngine {
 	/// wallet hears that the coins a just-sent transaction spent are gone.
 	fn tracks_own_broadcasts(&self) -> bool {
 		true
+	}
+
+	#[cfg(test)]
+	fn halt_the_applicator_for_test(&self, why: &str) {
+		let listeners = self.listeners.lock().unwrap_or_else(|e| e.into_inner());
+		for listener in listeners.as_ref().expect("launched").snapshot() {
+			*listener.divergence.lock().unwrap() = Some(why.to_string());
+		}
 	}
 
 	fn cbf_sync_status(&self) -> Option<CbfSyncStatus> {
@@ -1842,6 +1955,66 @@ impl SyncEngine for CbfSyncEngine {
 	/// kyoto is not running, when the lookup fails or times out, and when the height is
 	/// outside the header range kyoto holds (above its tip, or below the checkpoint it
 	/// resumed from): an answer this engine cannot check is not one it refutes.
+	/// A filter node's watch ledger only knows what it read since the watch began, and for the rest
+	/// a provider is asked. That word is not enough to pay on: the block is fetched, held to the
+	/// header this node verified, and the transaction looked for in it. A restart holds headers only
+	/// from the start of the retarget period, so below that the header is fetched too, and holds
+	/// by linking up to the lowest held. A block is fetched once per transaction; after that the
+	/// hash it was seen in is what is compared.
+	#[cfg(feature = "swaps")]
+	async fn check_provider_confirmation(
+		&self, txid: Txid, height: Option<u32>,
+	) -> ProviderConfirmation {
+		use ProviderConfirmation::{CannotTell, NoBlock, NotShown, Shown};
+		if !self.node_source_active() {
+			return CannotTell;
+		}
+		let Some(source) = self.filter_source.clone() else { return CannotTell };
+		let Some(height) = height else { return NotShown };
+		let (header, lowest, tip) = {
+			let chain = lock_headers(&self.source_headers);
+			let lowest = chain.header(chain.base()).map(|header| (chain.base(), header));
+			(chain.header(height), lowest, chain.tip())
+		};
+		let Some(tip) = tip.filter(|tip| height <= tip.height) else { return NoBlock };
+		let shown = Shown { height, confirmations: tip.height - height + 1, tip };
+		let seen = self.confirmations_shown.lock().unwrap_or_else(|e| e.into_inner()).get(&txid).copied();
+		let header = match header {
+			Some(header) => header,
+			// Below what is held nothing is reorged out from under what was seen.
+			None if seen.map_or(false, |(at, _)| at == height) => return shown,
+			None => match lowest {
+				Some(lowest) => match header_below_held(&*source, height, lowest).await {
+					Some(header) => header,
+					None => return NoBlock,
+				},
+				None => return NoBlock,
+			},
+		};
+		let hash = header.block_hash();
+		if seen == Some((height, hash)) {
+			return shown;
+		}
+		let fetched = tokio::time::timeout(
+			Duration::from_secs(CBF_BLOCK_FETCH_TIMEOUT_SECS),
+			source.block(hash),
+		)
+		.await;
+		let Ok(Ok(block)) = fetched else { return NoBlock };
+		if verify_block(&block, height, &header).is_err() {
+			return NoBlock;
+		}
+		if !block.txdata.iter().any(|tx| tx.compute_txid() == txid) {
+			return NotShown;
+		}
+		let mut seen = self.confirmations_shown.lock().unwrap_or_else(|e| e.into_inner());
+		if seen.len() >= CONFIRMATIONS_SHOWN_KEPT {
+			seen.clear();
+		}
+		seen.insert(txid, (height, hash));
+		shown
+	}
+
 	async fn is_on_chain(&self, block: &BlockId) -> Option<bool> {
 		if self.node_source_active() {
 			// The verified header chain; a height outside it is not one this engine refutes.
@@ -2914,14 +3087,19 @@ mod tests {
 		let _ = std::fs::remove_dir_all(data_dir);
 	}
 
-	/// The mempool is borrowed whenever there is a chain to borrow from; the evictions wait for
-	/// the sync, the unconfirmed half does not.
+	/// At most one question per new block or check-in, whoever asks how often.
 	#[test]
-	fn the_mempool_is_borrowed_while_catching_up_without_its_evictions() {
-		assert_eq!(mempool_borrow_plan(false, false), None);
-		assert_eq!(mempool_borrow_plan(false, true), None);
-		assert_eq!(mempool_borrow_plan(true, false), Some(MempoolEvictions::Withhold));
-		assert_eq!(mempool_borrow_plan(true, true), Some(MempoolEvictions::Apply));
+	fn a_mempool_question_is_due_per_new_block_or_check_in() {
+		let t0 = Instant::now();
+		let mut cadence = MempoolCadence::default();
+		assert!(cadence.due(100, t0), "the first look after a start");
+		assert!(!cadence.due(100, t0), "the same block");
+		assert!(!cadence.due(100, t0 + Duration::from_secs(80)), "the old 80 s tick asks nothing");
+		assert!(cadence.due(101, t0 + Duration::from_secs(90)), "a new block");
+		assert!(!cadence.due(101, t0 + Duration::from_secs(91)));
+		assert!(!cadence.due(101, t0 + Duration::from_secs(90) + MEMPOOL_CHECK_IN / 2));
+		assert!(cadence.due(101, t0 + Duration::from_secs(90) + MEMPOOL_CHECK_IN), "a check-in");
+		assert!(cadence.due(100, t0 + Duration::from_secs(91) + MEMPOOL_CHECK_IN), "a reorg moves it");
 	}
 
 	fn unlaunched_engine() -> CbfSyncEngine {
@@ -2971,6 +3149,7 @@ mod tests {
 		fn disconnect(&self, _header: &Header, height: u32) {
 			*self.tip.lock().unwrap() = height - 1;
 		}
+		fn scan_block(&self, _block: &bitcoin::Block, _height: u32) {}
 		fn take_divergence(&self) -> Option<String> {
 			None
 		}
@@ -3418,8 +3597,7 @@ mod tests {
 		engine
 			.sync_state_tx
 			.send_replace(CbfSyncState::Active { applied_tip: Some(100), synced_to_tip: true });
-		assert!(engine.is_synced(), "a borrow may apply evictions only now");
-		assert_eq!(engine.mempool_evictions(), MempoolEvictions::Apply);
+		assert!(engine.is_synced(), "a mempool question is asked only now");
 		assert_eq!(engine.wait_until_synced_within(Duration::from_millis(50)).await, Ok(()));
 
 		engine.sync_state_tx.send_replace(CbfSyncState::Failed(Error::TxSyncFailed));
@@ -3451,7 +3629,7 @@ mod tests {
 	}
 
 	#[test]
-	fn the_mempool_is_borrowed_on_the_onchain_wallet_sync_interval() {
+	fn a_due_mempool_question_is_looked_for_on_the_onchain_wallet_sync_interval() {
 		let expected = BackgroundSyncConfig::default()
 			.onchain_wallet_sync_interval_secs
 			.max(WALLET_SYNC_INTERVAL_MINIMUM_SECS);

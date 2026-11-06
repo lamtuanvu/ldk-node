@@ -1435,7 +1435,7 @@ impl LSPS1Liquidity {
 
 		log_info!(self.logger, "Connected to LSP {}@{}. ", lsp_node_id, lsp_address);
 
-		let refund_address = self.wallet.get_new_receive_address()?;
+		let refund_address = self.wallet.get_new_address()?;
 
 		let liquidity_source = Arc::clone(&liquidity_source);
 		let response = tokio::task::block_in_place(move || {

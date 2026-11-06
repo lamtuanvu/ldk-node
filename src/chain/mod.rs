@@ -27,12 +27,14 @@ mod layer;
 pub mod provider;
 pub(crate) mod raw_serve;
 pub(crate) mod seam;
+pub mod session;
+pub mod subscription;
 pub(crate) mod target;
 pub(crate) mod wire_convert;
 
 pub(crate) use layer::ChainLayer;
 #[cfg(feature = "cbf")]
-pub(crate) use layer::{BorrowedMempool, MempoolEvictions};
+pub(crate) use layer::BorrowedMempool;
 
 use crate::chain::electrum::ElectrumRuntimeClient;
 use crate::config::{Config, RESOLVED_CHANNEL_MONITOR_ARCHIVAL_INTERVAL};
@@ -350,6 +352,23 @@ impl ChainStatus {
 		}
 	}
 }
+
+/// What the block at a height on the chain this node verified itself says of a transaction.
+#[cfg(feature = "swaps")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SwapTxInBlock {
+	/// The block holds it.
+	Holds,
+	/// The block at that height, checked against its header, does not hold it. Nobody can make this
+	/// up: a real reorg is what it means.
+	Lacks,
+	/// There was no block to tell by: not served, or not the one the header commits to, or the
+	/// height is not on the chain this node can reach. This says nothing of the transaction.
+	NoBlock,
+	/// This node follows no chain of its own to tell by.
+	NoChainOfItsOwn,
+}
+
 
 /// Reorg-aware confirmation/eviction status of a watched transaction
 /// (Peerswap native primitive B5).

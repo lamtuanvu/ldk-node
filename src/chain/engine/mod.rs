@@ -145,6 +145,24 @@ pub(crate) async fn run_tx_based_sync_loop(
 	}
 }
 
+/// What an engine's own chain says of a confirmation a provider claims.
+#[cfg(feature = "swaps")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProviderConfirmation {
+	/// It has no chain of its own to hold it to.
+	CannotTell,
+	/// The block at that height on this node's verified chain holds the transaction, with this
+	/// depth on the same chain, whatever the provider said of depth.
+	Shown { height: u32, confirmations: u32, tip: BlockId },
+	/// The block at that height on this node's verified chain does not hold it. No Pro can make this
+	/// up: the block was checked against the header.
+	NotShown,
+	/// No block to tell by: not served, not the one the header commits to, or the height is not on
+	/// the chain this node can reach. This says nothing of the transaction, and nothing is taken
+	/// from the provider's word.
+	NoBlock,
+}
+
 /// Keeps the on-chain and Lightning wallets in step with the chain.
 #[async_trait]
 pub(crate) trait SyncEngine: Send + Sync {
@@ -254,6 +272,10 @@ pub(crate) trait SyncEngine: Send + Sync {
 		None
 	}
 
+	/// Has a filter-driven engine's applicator find its listeners diverged at the next block.
+	#[cfg(test)]
+	fn halt_the_applicator_for_test(&self, _why: &str) {}
+
 	/// Watch an arbitrary transaction — one the local wallet need not own —
 	/// for the TX_STATUS slot, with the output script it can be found by
 	/// (Peerswap B5, [`crate::Node::watch_txid`]).
@@ -285,6 +307,16 @@ pub(crate) trait SyncEngine: Send + Sync {
 	/// [`Anchored`]: crate::chain::seam::Anchored
 	async fn is_on_chain(&self, _block: &BlockId) -> Option<bool> {
 		None
+	}
+
+	/// What this engine's own chain says of a provider's word that `txid` confirmed at `height`:
+	/// see [`ProviderConfirmation`]. Defaults to [`ProviderConfirmation::CannotTell`]: an engine with
+	/// no chain of its own believes its provider, as a Dependent one does on everything.
+	#[cfg(feature = "swaps")]
+	async fn check_provider_confirmation(
+		&self, _txid: Txid, _height: Option<u32>,
+	) -> ProviderConfirmation {
+		ProviderConfirmation::CannotTell
 	}
 
 	/// `Filter` registration. Transaction-based engines must watch these;

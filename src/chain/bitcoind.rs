@@ -14,7 +14,7 @@ use base64::Engine;
 use bitcoin::block::Header;
 use bitcoin::{BlockHash, FeeRate, Transaction, Txid};
 use lightning::chain::transaction::{OutPoint, TransactionData};
-use lightning::chain::{BestBlock, Listen};
+use lightning::chain::{Confirm, BestBlock, Listen};
 use lightning_block_sync::gossip::UtxoSource;
 use lightning_block_sync::http::{HttpEndpoint, JsonResponse};
 use lightning_block_sync::poll::ValidatedBlockHeader;
@@ -476,7 +476,7 @@ impl BitcoindClient {
 		let mempool_txids = self.get_raw_mempool().await?;
 
 		let mut mempool_entries_cache = mempool_entries_cache.lock().await;
-		mempool_entries_cache.retain(|txid, _| mempool_txids.contains(txid));
+		keep_only_entries_of(&mut mempool_entries_cache, &mempool_txids);
 
 		if let Some(difference) = mempool_txids.len().checked_sub(mempool_entries_cache.capacity())
 		{
@@ -589,6 +589,21 @@ impl BitcoindClient {
 		};
 		let mempool_entries_cache = mempool_entries_cache.lock().await;
 		txids_missing_from(&mempool_entries_cache, txids)
+	}
+
+	/// Which of `txids` the mempool does not hold, asked of bitcoind one by one: no cache, so
+	/// neither its last refresh nor a refresh holding its lock on a large mempool stands in the
+	/// way. A failed call is no answer, never an absence.
+	pub(crate) async fn txids_absent_from_mempool(
+		&self, txids: &[Txid],
+	) -> std::io::Result<Vec<Txid>> {
+		let mut absent = Vec::new();
+		for txid in txids {
+			if self.get_mempool_entry(*txid).await?.is_none() {
+				absent.push(*txid);
+			}
+		}
+		Ok(absent)
 	}
 
 	/// Get mempool transactions, alongside their first-seen unix timestamps.
@@ -722,6 +737,15 @@ impl BitcoindClient {
 			.collect();
 		Ok(evicted_txids)
 	}
+}
+
+/// Drops from the entries cache what `mempool_txids` no longer lists. One hash lookup per entry:
+/// this runs every poll, two seconds apart, under the cache's lock, on a runtime worker, and a
+/// scan of the list per entry took a Pro with 20k transactions a core and up to a few seconds of
+/// every answer that waited for that worker.
+fn keep_only_entries_of(mempool_entries: &mut HashMap<Txid, MempoolEntry>, mempool_txids: &[Txid]) {
+	let listed: std::collections::HashSet<&Txid> = mempool_txids.iter().collect();
+	mempool_entries.retain(|txid, _| listed.contains(txid));
 }
 
 /// Which of `txids` `mempool_entries` — the entries cache, as of its last
@@ -1653,6 +1677,31 @@ impl ChainListener {
 		}
 	}
 
+	/// A block at or below this node's tip, read again for what it holds: see
+	/// [`crate::chain::cbf::applicator::ChainOp::ScanBlock`].
+	///
+	/// [`Confirm`] is LDK's way in for a transaction found late, the one the transaction-based
+	/// engines use on every restart: it moves no tip, takes what is relevant to each listener, and
+	/// passes over what that listener already saw. [`Listen::block_connected`] would not do: on a
+	/// monitor it overwrites the tip with the block's. A listener not there yet has nothing to
+	/// add it to and is left out; it reads the block when it gets there. The wallet takes the block
+	/// as a duplicate of one it holds, which does not move its tip either.
+	pub(crate) fn gated_block_scanned(&self, block: &bitcoin::Block, height: u32) {
+		if self.onchain_wallet.current_best_block().height >= height {
+			self.onchain_wallet.block_connected(block, height);
+		}
+		let txdata: Vec<_> = block.txdata.iter().enumerate().collect();
+		if self.channel_manager.current_best_block().height >= height {
+			self.channel_manager.transactions_confirmed(&block.header, &txdata, height);
+		}
+		if self.min_monitor_best_block().map_or(false, |best| best.height >= height) {
+			self.chain_monitor.transactions_confirmed(&block.header, &txdata, height);
+		}
+		if self.output_sweeper.current_best_block().height >= height {
+			self.output_sweeper.transactions_confirmed(&block.header, &txdata, height);
+		}
+	}
+
 	/// Gated fan-out of one disconnected header, applied tip-first down to the fork point.
 	///
 	/// `ChannelManager` and `OutputSweeper` assert that the disconnected header IS their current
@@ -1809,6 +1858,27 @@ impl std::fmt::Display for HttpError {
 
 #[cfg(test)]
 mod tests {
+	/// A full mempool's refresh stays far under the poll's two seconds, and keeps what is listed.
+	#[test]
+	fn dropping_gone_entries_does_not_scan_the_list_per_entry() {
+		use bitcoin::hashes::Hash;
+
+		let txid = |i: u32| {
+			let mut bytes = [0u8; 32];
+			bytes[..4].copy_from_slice(&i.to_le_bytes());
+			super::Txid::from_byte_array(bytes)
+		};
+		let listed: Vec<super::Txid> = (0..60_000).map(txid).collect();
+		let mut entries: std::collections::HashMap<super::Txid, super::MempoolEntry> = (0..60_001)
+			.map(|i| (txid(i), super::MempoolEntry { txid: txid(i), time: 0, height: 0 }))
+			.collect();
+		let started = std::time::Instant::now();
+		super::keep_only_entries_of(&mut entries, &listed);
+		assert!(started.elapsed() < std::time::Duration::from_secs(2), "{:?}", started.elapsed());
+		assert_eq!(entries.len(), 60_000);
+		assert!(!entries.contains_key(&txid(60_000)));
+	}
+
 	use super::*;
 
 	use bitcoin::hashes::Hash;

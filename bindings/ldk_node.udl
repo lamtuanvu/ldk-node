@@ -269,6 +269,7 @@ enum NodeError {
 	"InvalidCustomTlvs",
 	"ProbeSendingFailed",
 	"ChannelCreationFailed",
+	"ChainProviderUnavailable",
 	"ChannelClosingFailed",
 	"ChannelConfigUpdateFailed",
 	"PersistenceFailed",

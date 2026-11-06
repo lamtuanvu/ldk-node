@@ -36,7 +36,9 @@ use bitcoin::Network;
 use tokio::sync::watch;
 
 use crate::builder::{BuildError, ChainDataSourceConfig, RawChainSourceConfig};
-use crate::chain::provider::ChainDataProvider;
+use crate::chain::provider::{ChainDataProvider, WireBlockUpdateAck, WireBlockUpdates};
+use crate::chain::session::trace::{SessionObserver, TraceOrigin};
+use crate::chain::session::{ChainProviderSession, ChainSessionStatus};
 use crate::chain::target::{SyncTargetSpec, TargetId};
 use crate::chain::{CbfSyncStatus, ChainLayer, ChainSlotStatus, DEFAULT_ESPLORA_SERVER_URL};
 #[cfg(feature = "cbf")]
@@ -74,6 +76,7 @@ pub struct ChainHostBuilder {
 	cbf_bundle_transport: Option<Arc<dyn BundleTransport>>,
 	raw_chain_source_config: Option<RawChainSourceConfig>,
 	raw_chain_source_allow_insecure_http: bool,
+	provider_session: Option<Arc<ChainProviderSession>>,
 	logger: Option<Arc<Logger>>,
 }
 
@@ -97,6 +100,7 @@ impl ChainHostBuilder {
 			cbf_bundle_transport: None,
 			raw_chain_source_config: None,
 			raw_chain_source_allow_insecure_http: false,
+			provider_session: None,
 			logger: None,
 		}
 	}
@@ -190,8 +194,9 @@ impl ChainHostBuilder {
 	/// Reads the node filter source through per-block bundles: when its tip moves, one
 	/// `chain.since` over `transport` answers the new blocks' headers, filter headers and
 	/// filters, and carries the Pro's fee estimates, which then lead the FEE slot after an
-	/// external fee server. The tip is polled as before, and everything a bundle carries is
-	/// verified as raw data is.
+	/// external fee server. The tip is polled as before, unless a provider session
+	/// ([`Self::set_chain_source_cbf_with_session`]) holds a lease, and everything a bundle
+	/// carries is verified as raw data is.
 	///
 	/// Wraps the source given to [`Self::set_cbf_filter_source`]; with a P2P CBF source there
 	/// is nothing to bundle and the transport is ignored. A Pro that does not know the route
@@ -199,6 +204,35 @@ impl ChainHostBuilder {
 	#[cfg(feature = "cbf")]
 	pub fn set_cbf_bundle_transport(&mut self, transport: Arc<dyn BundleTransport>) -> &mut Self {
 		self.cbf_bundle_transport = Some(transport);
+		self
+	}
+
+	/// The Dependent tier over a provider session: every chain slot asks whichever Pro `session`
+	/// follows, which it can change while the node runs, and the node starts fine following none.
+	/// Delivery stays pull: this sync does not read bundles.
+	pub fn set_chain_source_dependent_with_session(
+		&mut self, session: Arc<ChainProviderSession>, sync_config: Option<EsploraSyncConfig>,
+	) -> &mut Self {
+		self.chain_data_source_config = Some(ChainDataSourceConfig::Dependent {
+			provider: session.as_chain_provider(),
+			sync_config,
+		});
+		self.provider_session = Some(session);
+		self
+	}
+
+	/// A filter-following node over a provider session: the fallback provider, the filter source
+	/// and the bundle transport of [`Self::set_chain_source_cbf`] all ask whichever Pro `session`
+	/// follows, which it can change while the node runs, and the node starts fine following none.
+	#[cfg(feature = "cbf")]
+	pub fn set_chain_source_cbf_with_session(
+		&mut self, peers: Vec<String>, config: CbfConfig, session: Arc<ChainProviderSession>,
+	) -> &mut Self {
+		self.chain_data_source_config = Some(ChainDataSourceConfig::Cbf { peers, config });
+		self.chain_provider_fallback = Some(session.as_chain_provider());
+		self.cbf_filter_source = Some(session.as_filter_source());
+		self.cbf_bundle_transport = Some(session.as_bundle_transport());
+		self.provider_session = Some(session);
 		self
 	}
 
@@ -245,6 +279,7 @@ impl ChainHostBuilder {
 			cbf_bundle_transport: None,
 			raw_chain_source_config,
 			raw_chain_source_allow_insecure_http,
+			provider_session: None,
 			logger: Some(logger),
 		}
 	}
@@ -414,12 +449,18 @@ impl ChainHostBuilder {
 			);
 		}
 
-		Ok(Arc::new(ChainHost::from_layer(
+		let session = self.provider_session;
+		if let (Some(session), Some(sink)) = (&session, layer.push_sink()) {
+			session.attach_sink(sink);
+		}
+		let mut host = ChainHost::from_layer(
 			Arc::new(layer),
 			logger,
 			#[cfg(feature = "cbf")]
 			wallet_birthday_height,
-		)))
+		);
+		host.session = session;
+		Ok(Arc::new(host))
 	}
 }
 
@@ -447,6 +488,9 @@ pub struct ChainHost {
 	run: Mutex<HostRun>,
 	#[cfg(feature = "cbf")]
 	wallet_birthday_height: Option<u32>,
+	/// The Pro node this host follows, when it can move; driven from the first attach to the last
+	/// detach.
+	session: Option<Arc<ChainProviderSession>>,
 	logger: Arc<Logger>,
 }
 
@@ -477,8 +521,14 @@ impl ChainHost {
 			run: Mutex::new(HostRun { attached: 0, runtime: None, stop_sender: None }),
 			#[cfg(feature = "cbf")]
 			wallet_birthday_height,
+			session: None,
 			logger,
 		}
+	}
+
+	#[cfg(test)]
+	pub(crate) fn halt_the_applicator_for_test(&self, why: &str) {
+		self.layer.halt_the_applicator_for_test(why)
 	}
 
 	pub(crate) fn layer(&self) -> &Arc<ChainLayer> {
@@ -510,6 +560,100 @@ impl ChainHost {
 			cbf_sync_status: self.layer.cbf_sync_status(),
 			fee_cache_updated_at: self.layer.fee_cache_updated_at(),
 		}
+	}
+
+	/// The ordered Pro nodes this host's provider session walks; see
+	/// [`ChainProviderSession::set_candidates`]. For local callers only: a peer must never choose
+	/// a node's source. [`Error::ChainServeUnsupported`] on a host built without a session.
+	pub fn chain_set_candidates(&self, candidates: Vec<String>) -> Result<(), Error> {
+		self.session()?.set_candidates(candidates);
+		Ok(())
+	}
+
+	/// Who on the list is known longest; see [`ChainProviderSession::set_longest_known`].
+	pub fn chain_set_longest_known(&self, known: Vec<String>) -> Result<(), Error> {
+		self.session()?.set_longest_known(known);
+		Ok(())
+	}
+
+	/// Whether a tip `node_id` claims is backed by headers it will show, on this node's own checks;
+	/// see [`ChainProviderSession::verify_tip_claim`]. [`Error::ChainServeUnsupported`] on a host
+	/// built without a session.
+	pub async fn chain_verify_tip_claim(
+		&self, node_id: &str, claim: crate::chain::provider::WireBlockId,
+	) -> Result<crate::chain::session::TipClaimCheck, Error> {
+		Ok(self.session()?.verify_tip_claim(node_id, claim).await)
+	}
+
+	/// Whether the node may take a source off the list by itself; see
+	/// [`ChainProviderSession::set_auto_source`]. For the owner only.
+	pub fn chain_set_auto_source(&self, allowed: Option<bool>) -> Result<(), Error> {
+		self.session()?.set_auto_source(allowed);
+		Ok(())
+	}
+
+	/// The owner's pinned source, or `None` to clear it; see
+	/// [`ChainProviderSession::set_source`]. For local callers only.
+	/// [`Error::ChainServeUnsupported`] on a host built without a session.
+	pub fn chain_set_source(&self, node_id: Option<String>) -> Result<(), Error> {
+		self.session()?.set_source(node_id);
+		Ok(())
+	}
+
+	/// [`Self::chain_set_source`] as part of a trace; see [`ChainProviderSession::set_source_traced`].
+	pub fn chain_set_source_traced(
+		&self, node_id: Option<String>, origin: Option<TraceOrigin>,
+	) -> Result<bool, Error> {
+		Ok(self.session()?.set_source_traced(node_id, origin))
+	}
+
+	/// The owner's choice of a source for now; see [`ChainProviderSession::use_source_traced`].
+	pub fn chain_use_source_traced(
+		&self, node_id: String, origin: Option<TraceOrigin>,
+	) -> Result<Option<bool>, Error> {
+		Ok(self.session()?.use_source_traced(node_id, origin))
+	}
+
+	/// Where the provider session tells what it does. Nothing on a host without a session.
+	pub fn chain_set_observer(&self, observer: Arc<dyn SessionObserver>) {
+		if let Some(session) = &self.session {
+			session.set_observer(observer);
+		}
+	}
+
+	/// Where the provider session stands; `None` on a host built without one. Never blocks on
+	/// the chain.
+	pub fn chain_session_status(&self) -> Option<ChainSessionStatus> {
+		self.session.as_ref().map(|session| session.status())
+	}
+
+	/// The gossip card of `node_id` was last seen `age_secs` ago. Can only bring a probe forward;
+	/// nothing on a host without a session.
+	pub fn chain_note_card_age(&self, node_id: &str, age_secs: u64) {
+		if let Some(session) = &self.session {
+			session.note_card_age(node_id, Duration::from_secs(age_secs));
+		}
+	}
+
+	/// Takes a block update from `caller_node_id`, as the transport verified it; see
+	/// [`ChainProviderSession::receive_block_update`]. [`Error::ChainServeUnsupported`] on a host
+	/// built without a session.
+	pub fn chain_receive_block_update(
+		&self, caller_node_id: &str, push: &WireBlockUpdates,
+	) -> Result<WireBlockUpdateAck, Error> {
+		self.session()?.receive_block_update(caller_node_id, push)
+	}
+
+	/// [`Self::chain_receive_block_update`], with what it does under `inbound`.
+	pub fn chain_receive_block_update_traced(
+		&self, caller_node_id: &str, push: &WireBlockUpdates,
+		inbound: Option<&crate::chain::session::trace::InboundSpan>,
+	) -> Result<WireBlockUpdateAck, Error> {
+		self.session()?.receive_block_update_traced(caller_node_id, push, inbound)
+	}
+
+	fn session(&self) -> Result<&Arc<ChainProviderSession>, Error> {
+		self.session.as_ref().ok_or(Error::ChainServeUnsupported)
 	}
 
 	/// A node joins: its target is registered, and if it is the first node the chain source
@@ -610,6 +754,10 @@ impl ChainHost {
 			}
 
 			let (stop_sender, _) = watch::channel(());
+
+			if let Some(session) = &self.session {
+				runtime.spawn(Arc::clone(session).run(stop_sender.subscribe()));
+			}
 
 			// Spawn background task continuously syncing onchain, lightning, and fee rate cache.
 			let stop_sync_receiver = stop_sender.subscribe();

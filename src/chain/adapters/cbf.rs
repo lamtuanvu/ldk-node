@@ -63,7 +63,7 @@ use crate::logger::{log_debug, log_error, log_info, LdkLogger, Logger};
 #[cfg(feature = "swaps")]
 use crate::chain::cbf::WatchLedger;
 #[cfg(feature = "swaps")]
-use crate::chain::seam::{Anchored, TxStatusAction};
+use crate::chain::seam::{Anchored, TxStatusAction, CBF_WATCH_ADAPTER};
 #[cfg(feature = "swaps")]
 use crate::chain::RawTxObservation;
 #[cfg(feature = "swaps")]
@@ -170,7 +170,7 @@ impl FeeAction for CbfBundleFee {
 			.bundles
 			.fresh_fee_estimates()
 			.ok_or_else(|| ChainActionError::unavailable("no fresh bundle fee estimates"))?;
-		fee_update_from_wire(&estimates, &self.logger)
+		fee_update_from_wire(&estimates, &self.bundles.fee_reference(), &self.logger)
 	}
 }
 
@@ -469,7 +469,7 @@ impl CbfWatchTxStatus {
 #[async_trait]
 impl TxStatusAction for CbfWatchTxStatus {
 	fn name(&self) -> &'static str {
-		"cbf_watch"
+		CBF_WATCH_ADAPTER
 	}
 
 	/// Answered from memory; the slot default is more than enough.

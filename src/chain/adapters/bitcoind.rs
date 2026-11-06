@@ -435,7 +435,11 @@ impl MempoolAction for BitcoindChainAdapter {
 	/// asking wallet keeps what is its own on apply, exactly as it did when
 	/// the engine called the client directly. `Complete` is the snapshot the
 	/// serving path asks for, filtered by the query and leaving the poll's
-	/// watermark alone.
+	/// watermark alone. A `Complete` question with no script is what a filter-following node
+	/// asks about its own transactions: bitcoind's word on each, with no walk of the mempool and
+	/// no wait on its caches, and only the missing ones come back. Nothing in it needs the
+	/// transactions: the asker holds them, and a replacement by someone else shows when it
+	/// confirms.
 	///
 	/// Either answer is anchored to the tip the engine has synced up to,
 	/// read after the mempool is so the anchor is never behind the data it
@@ -456,6 +460,19 @@ impl MempoolAction for BitcoindChainAdapter {
 					.await
 					.map_err(mempool_poll_error)?;
 				MempoolAnswer { unconfirmed, evicted }
+			},
+			MempoolScope::Complete if query.scripts.is_empty() => {
+				let now =
+					SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+				let evicted = self
+					.api_client
+					.txids_absent_from_mempool(&query.known_unconfirmed)
+					.await
+					.map_err(mempool_poll_error)?
+					.into_iter()
+					.map(|txid| (txid, now))
+					.collect();
+				MempoolAnswer { unconfirmed: Vec::new(), evicted }
 			},
 			MempoolScope::Complete => {
 				let relevance = query.relevance();
