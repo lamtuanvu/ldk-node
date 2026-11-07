@@ -2564,6 +2564,37 @@ impl Node {
 		}
 	}
 
+	/// The channels whose funding output is spent by a transaction in this node's on-chain
+	/// wallet view: confirmed, or unconfirmed and neither evicted nor replaced.
+	///
+	/// A cooperative close pays our side to this wallet's shutdown script. From the moment the
+	/// wallet sees the closing transaction (in the mempool, on a chain source that has one, or in
+	/// a block) [`BalanceDetails::total_onchain_balance_sats`] counts that coin, while the
+	/// channel's monitor still reports it in [`BalanceDetails::lightning_balances`] and
+	/// [`BalanceDetails::total_lightning_balance_sats`]: as
+	/// [`LightningBalance::ClaimableOnChannelClose`] until the close confirms, then as
+	/// [`LightningBalance::ClaimableAwaitingConfirmations`] until it is
+	/// [`ANTI_REORG_DELAY`] blocks deep. A caller that adds the two totals leaves the balances of
+	/// these channels out of one of them.
+	///
+	/// A force close is never listed: a commitment transaction pays none of the wallet's
+	/// scripts. Read-only; [`Node::list_balances`] is unchanged.
+	///
+	/// [`ANTI_REORG_DELAY`]: lightning::chain::channelmonitor::ANTI_REORG_DELAY
+	pub fn channels_closed_into_onchain_wallet(&self) -> Vec<lightning::ln::types::ChannelId> {
+		let monitors = self.chain_monitor.list_monitors();
+		let fundings: Vec<bitcoin::OutPoint> =
+			monitors.iter().map(|(funding_txo, _)| funding_txo.into_bitcoin_outpoint()).collect();
+		let spent = self.wallet.outpoints_spent_in_view(&fundings);
+		let mut closed: Vec<lightning::ln::types::ChannelId> = monitors
+			.into_iter()
+			.filter(|(funding_txo, _)| spent.contains(&funding_txo.into_bitcoin_outpoint()))
+			.map(|(_, channel_id)| channel_id)
+			.collect();
+		closed.sort();
+		closed
+	}
+
 	/// Retrieves all payments that match the given predicate.
 	///
 	/// For example, you could retrieve all stored outbound payments as follows:

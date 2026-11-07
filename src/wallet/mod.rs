@@ -691,6 +691,42 @@ where
 		})
 	}
 
+	/// Which of `outpoints` a transaction in the wallet's view spends: one the wallet counts in
+	/// its balance, i.e. canonical (confirmed, or unconfirmed and neither evicted nor replaced by
+	/// a conflict) and relevant (it pays one of the wallet's scripts or spends one of its coins).
+	///
+	/// [`crate::Node::channels_closed_into_onchain_wallet`] asks this about the funding outpoints
+	/// of its channel monitors. A cooperative close pays this wallet's shutdown script, so from
+	/// the moment its closing transaction is in the view the wallet's balance holds the coin the
+	/// monitor still reports. A commitment transaction pays none of the wallet's scripts and is
+	/// never relevant, even if a chain source put it in the graph.
+	pub(crate) fn outpoints_spent_in_view(
+		&self, outpoints: &[bitcoin::OutPoint],
+	) -> HashSet<bitcoin::OutPoint> {
+		let locked_wallet = self.inner.lock().unwrap();
+		let graph = locked_wallet.tx_graph();
+		// The graph's spend index names every spender it holds, canonical or not. An outpoint
+		// with none is spent in no view, which spares the canonical walk while nothing closes.
+		let spent_in_graph: Vec<(bitcoin::OutPoint, Vec<Txid>)> = outpoints
+			.iter()
+			.filter_map(|outpoint| {
+				let spenders = graph.outspends(*outpoint);
+				(!spenders.is_empty()).then(|| (*outpoint, spenders.iter().copied().collect()))
+			})
+			.collect();
+		if spent_in_graph.is_empty() {
+			return HashSet::new();
+		}
+		// `transactions()` is BDK's canonical and relevant set, the one `balance()` counts.
+		let in_view: HashSet<Txid> =
+			locked_wallet.transactions().map(|wallet_tx| wallet_tx.tx_node.txid).collect();
+		spent_in_graph
+			.into_iter()
+			.filter(|(_, spenders)| spenders.iter().any(|txid| in_view.contains(txid)))
+			.map(|(outpoint, _)| outpoint)
+			.collect()
+	}
+
 	/// Builds a fully-signed funding transaction paying `amount` to an arbitrary `output_script`
 	/// (e.g. a P2WSH submarine-swap HTLC output) at the fee rate implied by `confirmation_target`,
 	/// with the supplied `locktime`. The returned [`Transaction`] is signed and persisted but **not**
@@ -2044,6 +2080,113 @@ mod chain_listen_tests {
 			None,
 			"a confirmed tx does not conflict itself"
 		);
+	}
+
+	// ── Funding outpoints spent in the wallet's view (`outpoints_spent_in_view`) ──
+
+	/// A channel's funding outpoint: a 2-of-2 output the wallet does not own.
+	fn funding_outpoint(seed: u8) -> bitcoin::OutPoint {
+		bitcoin::OutPoint { txid: bitcoin::Txid::from_byte_array([seed; 32]), vout: 0 }
+	}
+
+	/// A transaction spending `funding` and paying `sats` to `script_pubkey`.
+	fn spend_of(funding: bitcoin::OutPoint, sats: u64, script_pubkey: ScriptBuf) -> Transaction {
+		Transaction {
+			version: transaction::Version::TWO,
+			lock_time: absolute::LockTime::ZERO,
+			input: vec![TxIn {
+				previous_output: funding,
+				script_sig: ScriptBuf::new(),
+				sequence: Sequence::MAX,
+				witness: Witness::new(),
+			}],
+			output: vec![TxOut { value: Amount::from_sat(sats), script_pubkey }],
+		}
+	}
+
+	/// A cooperative close of `funding`: our side paid to the wallet's shutdown script.
+	fn coop_close_into(wallet: &Wallet, funding: bitcoin::OutPoint, sats: u64) -> Transaction {
+		let shutdown = wallet.get_new_address().expect("address").script_pubkey();
+		spend_of(funding, sats, shutdown)
+	}
+
+	/// A commitment transaction of `funding`: it pays none of the wallet's scripts.
+	fn commitment_of(funding: bitcoin::OutPoint, seed: u8) -> Transaction {
+		spend_of(funding, 39_000, channel_output(seed))
+	}
+
+	/// What a chain source hands over when it reports `tx` in the mempool at `seen_at`,
+	/// relevant or not: the graph takes every transaction an update carries.
+	fn seen_in_mempool(wallet: &Wallet, tx: &Transaction, seen_at: u64) {
+		let mut update = Update::default();
+		update.tx_update.txs.push(Arc::new(tx.clone()));
+		update.tx_update.seen_ats.insert((tx.compute_txid(), seen_at));
+		wallet.apply_update(update).expect("an update applies");
+	}
+
+	#[test]
+	fn a_coop_close_into_the_wallet_spends_its_funding_in_view_from_mempool_to_block() {
+		let (wallet, _store) = fresh_wallet();
+		let funding = funding_outpoint(0x21);
+		let open_elsewhere = funding_outpoint(0x22);
+		assert!(wallet.outpoints_spent_in_view(&[funding, open_elsewhere]).is_empty());
+
+		let close = coop_close_into(&wallet, funding, 40_000);
+		wallet
+			.apply_mempool_txs(vec![(close.clone(), unix_now_secs())], Vec::new())
+			.expect("apply");
+		let expected: HashSet<bitcoin::OutPoint> = [funding].into_iter().collect();
+		assert_eq!(wallet.outpoints_spent_in_view(&[funding, open_elsewhere]), expected);
+		assert_eq!(
+			wallet.get_balances(0).expect("balances").0,
+			40_000,
+			"the wallet already counts the coin the monitor still reports"
+		);
+
+		mine(&wallet, Some(&close), 31);
+		assert_eq!(wallet.outpoints_spent_in_view(&[funding, open_elsewhere]), expected);
+	}
+
+	#[test]
+	fn an_evicted_close_spends_nothing_in_view() {
+		let (wallet, _store) = fresh_wallet();
+		let funding = funding_outpoint(0x23);
+		let close = coop_close_into(&wallet, funding, 40_000);
+		let seen = unix_now_secs();
+		wallet.apply_mempool_txs(vec![(close.clone(), seen)], Vec::new()).expect("apply");
+		assert_eq!(wallet.outpoints_spent_in_view(&[funding]).len(), 1);
+
+		// BDK: a transaction whose `last_evicted >= last_seen` is not canonical.
+		wallet.apply_mempool_txs(Vec::new(), vec![(close.compute_txid(), seen)]).expect("evict");
+		assert!(wallet.outpoints_spent_in_view(&[funding]).is_empty());
+		assert_eq!(wallet.get_balances(0).expect("balances").0, 0);
+	}
+
+	#[test]
+	fn a_close_displaced_by_the_commitment_spends_nothing_in_view() {
+		let (wallet, _store) = fresh_wallet();
+		let funding = funding_outpoint(0x24);
+		let close = coop_close_into(&wallet, funding, 40_000);
+		let seen = unix_now_secs();
+		wallet.apply_mempool_txs(vec![(close, seen)], Vec::new()).expect("apply");
+
+		// The counterparty's commitment, seen later, replaces the close: the close is no longer
+		// canonical, and the commitment pays none of the wallet's scripts.
+		seen_in_mempool(&wallet, &commitment_of(funding, 9), seen + 10);
+		assert!(wallet.outpoints_spent_in_view(&[funding]).is_empty());
+		assert_eq!(wallet.get_balances(0).expect("balances").0, 0);
+	}
+
+	#[test]
+	fn a_commitment_in_the_graph_is_not_a_close_into_the_wallet() {
+		let (wallet, _store) = fresh_wallet();
+		let funding = funding_outpoint(0x25);
+		let commitment = commitment_of(funding, 7);
+		seen_in_mempool(&wallet, &commitment, unix_now_secs());
+		assert!(wallet.outpoints_spent_in_view(&[funding]).is_empty(), "unconfirmed");
+
+		mine(&wallet, Some(&commitment), 32);
+		assert!(wallet.outpoints_spent_in_view(&[funding]).is_empty(), "confirmed");
 	}
 
 	#[test]

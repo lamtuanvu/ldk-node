@@ -1,5 +1,15 @@
 # Unreleased (fork)
 
+## Feature and API updates
+- `Node::channels_closed_into_onchain_wallet` lists the channels whose funding output is
+  spent by a transaction in the node's on-chain wallet view (confirmed, or unconfirmed and
+  neither evicted nor replaced). A cooperative close pays the wallet's own shutdown script, so
+  `BalanceDetails::total_onchain_balance_sats` counts the closing output from the moment the
+  wallet sees the closing transaction, while the channel's monitor keeps reporting it as
+  `ClaimableOnChannelClose` and then `ClaimableAwaitingConfirmations` until it is
+  `ANTI_REORG_DELAY` deep. A caller adding both totals leaves these channels' balances out of
+  one of them. Read-only: `list_balances` is unchanged. Not exposed in bindings.
+
 ## Bug Fixes and Improvements
 - A channel whose funding transaction can never confirm — the coin it spends went to
   another transaction that confirmed, or it spends the change of such a transaction — is
