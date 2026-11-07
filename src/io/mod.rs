@@ -7,6 +7,7 @@
 
 //! Objects and traits for data persistence.
 
+pub(crate) mod no_graph_persister;
 pub mod sqlite_store;
 #[cfg(test)]
 pub(crate) mod test_utils;
@@ -78,3 +79,18 @@ pub(crate) const BDK_WALLET_TX_GRAPH_KEY: &str = "tx_graph";
 pub(crate) const BDK_WALLET_INDEXER_PRIMARY_NAMESPACE: &str = "bdk_wallet";
 pub(crate) const BDK_WALLET_INDEXER_SECONDARY_NAMESPACE: &str = "";
 pub(crate) const BDK_WALLET_INDEXER_KEY: &str = "indexer";
+
+/// The funding outpoints of channels proven dead by the chain will be persisted under this key.
+///
+/// See [`crate::dead_funding`].
+pub(crate) const DEAD_FUNDING_PERSISTENCE_PRIMARY_NAMESPACE: &str = "";
+pub(crate) const DEAD_FUNDING_PERSISTENCE_SECONDARY_NAMESPACE: &str = "";
+pub(crate) const DEAD_FUNDING_PERSISTENCE_KEY: &str = "dead_fundings";
+
+/// The broadcast queue — per-transaction broadcast policies, the transactions held for a
+/// rebroadcast and the ones given up — will be persisted under this key.
+///
+/// See [`crate::broadcast_queue`].
+pub(crate) const BROADCAST_QUEUE_PERSISTENCE_PRIMARY_NAMESPACE: &str = "";
+pub(crate) const BROADCAST_QUEUE_PERSISTENCE_SECONDARY_NAMESPACE: &str = "";
+pub(crate) const BROADCAST_QUEUE_PERSISTENCE_KEY: &str = "broadcast_queue";

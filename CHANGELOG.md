@@ -1,3 +1,28 @@
+# Unreleased (fork)
+
+## Feature and API updates
+- `Node::channels_closed_into_onchain_wallet` lists the channels whose funding output is
+  spent by a transaction in the node's on-chain wallet view (confirmed, or unconfirmed and
+  neither evicted nor replaced). A cooperative close pays the wallet's own shutdown script, so
+  `BalanceDetails::total_onchain_balance_sats` counts the closing output from the moment the
+  wallet sees the closing transaction, while the channel's monitor keeps reporting it as
+  `ClaimableOnChannelClose` and then `ClaimableAwaitingConfirmations` until it is
+  `ANTI_REORG_DELAY` deep. A caller adding both totals leaves these channels' balances out of
+  one of them. Read-only: `list_balances` is unchanged. Not exposed in bindings.
+
+## Bug Fixes and Improvements
+- A channel whose funding transaction can never confirm — the coin it spends went to
+  another transaction that confirmed, or it spends the change of such a transaction — is
+  now proven dead from the on-chain wallet's own chain view after every successful
+  wallet sync. The channel is force-closed without broadcasting, its funding outpoint is
+  recorded, its balances are left out of `BalanceDetails::total_lightning_balance_sats`
+  and reported in the new `BalanceDetails::dead_funding_balance_sats` field, and its
+  `ChannelMonitor` is archived at the next start instead of rebroadcasting a commitment
+  the network rejects every 30 seconds forever.
+
+## Compatibility Notes
+- `BalanceDetails` gained the `dead_funding_balance_sats` field (also in bindings).
+
 # 0.6.1 - Jun. 19, 2025
 This patch release fixes minor issues with the recently-exposed `Bolt11Invoice`
 type in bindings.

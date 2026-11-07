@@ -96,3 +96,41 @@ jobs:
         if: "matrix.platform != 'windows-latest' && matrix.build-uniffi"
         run: |
           RUSTFLAGS="--cfg no_download" cargo test --features uniffi
+
+  # Everything under `cbf` and `swaps`: `default = []`, so the job above compiles none of it, and the
+  # chain session, the cross-check and the filter-node tests never run there.
+  chain-features:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v3
+      - name: Install Rust stable toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile=minimal --default-toolchain stable
+          rustup override set stable
+      - name: Install bitcoind and electrs
+        run: |
+          source ./scripts/download_bitcoind_electrs.sh
+          mkdir bin
+          mv "$BITCOIND_EXE" bin/bitcoind
+          mv "$ELECTRS_EXE" bin/electrs
+          echo "BITCOIND_EXE=$PWD/bin/bitcoind" >> "$GITHUB_ENV"
+          echo "ELECTRS_EXE=$PWD/bin/electrs" >> "$GITHUB_ENV"
+      - name: Build without the chain features
+        run: cargo check --no-default-features --features swaps,cycles
+      - name: Test the library with the chain features, real-size and regtest attack tests included
+        run: RUSTFLAGS="--cfg no_download" cargo test --lib --features swaps,cycles,cbf
+      - name: Test filter nodes against a real bitcoind
+        run: |
+          RUSTFLAGS="--cfg no_download" cargo test --features swaps,cycles,cbf \
+            --test integration_tests_cbf_node_source \
+            --test integration_tests_dependent_on_bitcoind \
+            -- --test-threads=2
+      - name: Test the full cycles with the chain features
+        run: |
+          RUSTFLAGS="--cfg no_download" cargo test --features swaps,cycles,cbf \
+            --test integration_tests_broadcast_queue \
+            --test integration_tests_broadcast_queue_race \
+            --test integration_tests_rust \
+            -- --test-threads=2

@@ -60,6 +60,22 @@ pub enum Error {
 	TxSyncFailed,
 	/// A transaction sync operation timed out.
 	TxSyncTimeout,
+	/// This node's chain source cannot serve chain data to other nodes.
+	///
+	/// Serving requires a chain source that can answer arbitrary transaction,
+	/// output and script queries. Not every backend can, and a node that has
+	/// no chain source of its own certainly cannot — it would be relaying
+	/// answers it did not verify.
+	ChainServeUnsupported,
+	/// A request from another node for chain data could not be answered.
+	ChainServeFailed,
+	/// Another node asked for chain data from a block that is not on this
+	/// node's best chain: it is on a stale branch, and must find the fork
+	/// through the raw routes before asking again.
+	ChainServeNotOnBestChain,
+	/// A new channel was refused because no Pro node answers this node's chain questions, so it
+	/// could not watch the channel. Goes away when a chain source does.
+	ChainProviderUnavailable,
 	/// A gossip updating operation failed.
 	GossipUpdateFailed,
 	/// A gossip updating operation timed out.
@@ -120,6 +136,14 @@ pub enum Error {
 	LiquiditySourceUnavailable,
 	/// The given operation failed due to the LSP's required opening fee being too high.
 	LiquidityFeeTooHigh,
+	/// Stopping the node's event handling failed: the background processor ended without
+	/// signalling, so the node may not have quiesced. Returned by [`crate::Node::stop`]
+	/// where it used to panic, so an application exporting the node's data can refuse to.
+	EventHandlingStopFailed,
+	/// None of the listening addresses could be bound — something else listens there.
+	ListenFailed,
+	/// The given script is not one a channel may close to (BOLT 2 `shutdown`).
+	InvalidShutdownScript,
 }
 
 impl fmt::Display for Error {
@@ -127,6 +151,15 @@ impl fmt::Display for Error {
 		match *self {
 			Self::AlreadyRunning => write!(f, "Node is already running."),
 			Self::NotRunning => write!(f, "Node is not running."),
+			Self::EventHandlingStopFailed => {
+				write!(f, "Stopping event handling failed; the node may not have quiesced.")
+			},
+			Self::InvalidShutdownScript => {
+				write!(f, "The given script is not a standard channel shutdown script.")
+			},
+			Self::ListenFailed => {
+				write!(f, "Failed to bind to the listening addresses.")
+			},
 			Self::OnchainTxCreationFailed => {
 				write!(f, "On-chain transaction could not be created.")
 			},
@@ -153,6 +186,18 @@ impl fmt::Display for Error {
 			Self::OnchainTxSigningFailed => write!(f, "Failed to sign given transaction."),
 			Self::TxSyncFailed => write!(f, "Failed to sync transactions."),
 			Self::TxSyncTimeout => write!(f, "Syncing transactions timed out."),
+			Self::ChainServeUnsupported => {
+				write!(f, "This node's chain source cannot serve chain data to other nodes.")
+			},
+			Self::ChainProviderUnavailable => {
+				write!(f, "No chain provider answers, so no new channel can be opened for now.")
+			},
+			Self::ChainServeFailed => {
+				write!(f, "Failed to answer another node's request for chain data.")
+			},
+			Self::ChainServeNotOnBestChain => {
+				write!(f, "The block another node asked from is not on this node's best chain.")
+			},
 			Self::GossipUpdateFailed => write!(f, "Failed to update gossip data."),
 			Self::GossipUpdateTimeout => write!(f, "Updating gossip data timed out."),
 			Self::LiquidityRequestFailed => write!(f, "Failed to request inbound liquidity."),

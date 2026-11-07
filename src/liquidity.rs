@@ -7,7 +7,7 @@
 
 //! Objects related to liquidity management.
 
-use crate::chain::ChainSource;
+use crate::chain::ChainLayer;
 use crate::connection::ConnectionManager;
 use crate::logger::{log_debug, log_error, log_info, LdkLogger, Logger};
 use crate::types::{ChannelManager, KeysManager, LiquidityManager, PeerManager, Wallet};
@@ -143,7 +143,7 @@ where
 	wallet: Arc<Wallet>,
 	channel_manager: Arc<ChannelManager>,
 	keys_manager: Arc<KeysManager>,
-	chain_source: Arc<ChainSource>,
+	chain_source: Arc<ChainLayer>,
 	config: Arc<Config>,
 	logger: L,
 }
@@ -154,7 +154,7 @@ where
 {
 	pub(crate) fn new(
 		wallet: Arc<Wallet>, channel_manager: Arc<ChannelManager>, keys_manager: Arc<KeysManager>,
-		chain_source: Arc<ChainSource>, config: Arc<Config>, logger: L,
+		chain_source: Arc<ChainLayer>, config: Arc<Config>, logger: L,
 	) -> Self {
 		let lsps1_client = None;
 		let lsps2_client = None;
@@ -657,7 +657,7 @@ where
 						if init_features.requires_anchors_zero_fee_htlc_tx()
 							&& !c.trusted_peers_no_reserve.contains(&their_network_key)
 						{
-							c.per_channel_reserve_sats
+							c.reserve_for_new_channel_sats(cur_anchor_reserve_sats)
 						} else {
 							0
 						}
@@ -1041,7 +1041,7 @@ where
 			expiry_secs,
 		)?;
 
-		log_info!(self.logger, "JIT-channel invoice created: {}", invoice);
+		log_info!(self.logger, "JIT-channel invoice created: payment hash {}", invoice.payment_hash());
 		Ok((invoice, min_total_fee_msat))
 	}
 
@@ -1084,7 +1084,7 @@ where
 		let invoice =
 			self.lsps2_create_jit_invoice(buy_response, None, description, expiry_secs)?;
 
-		log_info!(self.logger, "JIT-channel invoice created: {}", invoice);
+		log_info!(self.logger, "JIT-channel invoice created: payment hash {}", invoice.payment_hash());
 		Ok((invoice, min_prop_fee_ppm_msat))
 	}
 

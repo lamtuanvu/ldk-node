@@ -16,6 +16,7 @@ use crate::config::{may_announce_channel, Config};
 use crate::connection::ConnectionManager;
 use crate::data_store::DataStoreUpdateResult;
 use crate::fee_estimator::ConfirmationTarget;
+use crate::funding::{ExternalFundings, FundingRequest, FundingSource};
 use crate::liquidity::LiquiditySource;
 use crate::logger::Logger;
 
@@ -27,10 +28,12 @@ use crate::io::{
 	EVENT_QUEUE_PERSISTENCE_KEY, EVENT_QUEUE_PERSISTENCE_PRIMARY_NAMESPACE,
 	EVENT_QUEUE_PERSISTENCE_SECONDARY_NAMESPACE,
 };
+use crate::journal::JournalQueue;
 use crate::logger::{log_debug, log_error, log_info, LdkLogger};
+use crate::path_failure::{attribute_path_failure, PathFailureInfo, PathFailureStore};
 
 use lightning::events::bump_transaction::BumpTransactionEvent;
-use lightning::events::{ClosureReason, PaymentPurpose, ReplayEvent};
+use lightning::events::{ClosureReason, FundingInfo, PaymentPurpose, ReplayEvent};
 use lightning::events::{Event as LdkEvent, PaymentFailureReason};
 use lightning::impl_writeable_tlv_based_enum;
 use lightning::ln::channelmanager::PaymentId;
@@ -54,7 +57,7 @@ use core::task::{Poll, Waker};
 use std::collections::VecDeque;
 use std::ops::Deref;
 use std::sync::{Arc, Condvar, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// An event emitted by [`Node`], which should be handled by the user.
 ///
@@ -325,6 +328,11 @@ where
 		locked_queue.front().cloned()
 	}
 
+	/// How many events wait to be handled — the persisted queue's length.
+	pub(crate) fn len(&self) -> usize {
+		self.queue.lock().unwrap_or_else(|e| e.into_inner()).len()
+	}
+
 	pub(crate) async fn next_event_async(&self) -> Event {
 		EventFuture { event_queue: Arc::clone(&self.queue), waker: Arc::clone(&self.waker) }.await
 	}
@@ -442,6 +450,7 @@ where
 	L::Target: LdkLogger,
 {
 	event_queue: Arc<EventQueue<L>>,
+	journal: Arc<JournalQueue>,
 	wallet: Arc<Wallet>,
 	bump_tx_event_handler: Arc<BumpTransactionEventHandler>,
 	channel_manager: Arc<ChannelManager>,
@@ -451,6 +460,9 @@ where
 	liquidity_source: Option<Arc<LiquiditySource<Arc<Logger>>>>,
 	payment_store: Arc<PaymentStore>,
 	peer_store: Arc<PeerStore<L>>,
+	path_failures: Arc<PathFailureStore>,
+	/// Opens funded by a [`FundingSource`] instead of `wallet`.
+	external_fundings: Arc<ExternalFundings>,
 	runtime: Arc<RwLock<Option<Arc<tokio::runtime::Runtime>>>>,
 	logger: L,
 	config: Arc<Config>,
@@ -467,10 +479,13 @@ where
 		output_sweeper: Arc<Sweeper>, network_graph: Arc<Graph>,
 		liquidity_source: Option<Arc<LiquiditySource<Arc<Logger>>>>,
 		payment_store: Arc<PaymentStore>, peer_store: Arc<PeerStore<L>>,
+		path_failures: Arc<PathFailureStore>, external_fundings: Arc<ExternalFundings>,
+		journal: Arc<JournalQueue>,
 		runtime: Arc<RwLock<Option<Arc<tokio::runtime::Runtime>>>>, logger: L, config: Arc<Config>,
 	) -> Self {
 		Self {
 			event_queue,
+			journal,
 			wallet,
 			bump_tx_event_handler,
 			channel_manager,
@@ -480,9 +495,91 @@ where
 			liquidity_source,
 			payment_store,
 			peer_store,
+			path_failures,
+			external_fundings,
 			logger,
 			runtime,
 			config,
+		}
+	}
+
+	fn release_unbroadcast_funding(&self, funding_txid: bitcoin::Txid) {
+		if let Err(e) = self.wallet.release_funding_transaction(funding_txid) {
+			log_error!(
+				self.logger,
+				"Failed to release the inputs of funding transaction {}: {}",
+				funding_txid,
+				e
+			);
+		}
+	}
+
+	/// Closes a channel whose funding could not be built, broadcasting nothing.
+	fn force_close_unfunded(
+		&self, temporary_channel_id: &ChannelId, counterparty_node_id: &PublicKey,
+	) {
+		self.channel_manager
+			.force_close_without_broadcasting_txn(
+				temporary_channel_id,
+				counterparty_node_id,
+				"Failed to create funding transaction".to_string(),
+			)
+			.unwrap_or_else(|e| {
+				log_error!(
+					self.logger,
+					"Failed to force close channel after funding generation failed: {:?}",
+					e
+				);
+				panic!("Failed to force close channel after funding generation failed");
+			});
+	}
+
+	/// `FundingGenerationReady` for an open funded by `source`. Every way this fails ends with
+	/// the channel closed unbroadcast and the source released. Unlike the node's own wallet, a
+	/// source's transaction LDK refuses (`APIMisuseError`: wrong output, unsigned input) is the
+	/// source's error, not ours: LDK has already closed the channel, so it is a failed open,
+	/// not a panic.
+	fn fund_externally(
+		&self, source: Arc<dyn FundingSource>, request: FundingRequest, user_channel_id: u128,
+		broadcast_policy: crate::BroadcastPolicy,
+	) {
+		let temporary_channel_id = request.temporary_channel_id;
+		let counterparty_node_id = request.counterparty_node_id;
+		match source.create_funding_transaction(request) {
+			Ok(final_tx) => {
+				let funding_txid = final_tx.compute_txid();
+				// The funding wallet built it, so its broadcast queue holds the policy: a
+				// funding refused for a missing input is held and rebroadcast there.
+				source.register_broadcast_policy(funding_txid, broadcast_policy);
+				match self.channel_manager.funding_transaction_generated(
+					temporary_channel_id,
+					counterparty_node_id,
+					final_tx,
+				) {
+					Ok(()) => {
+						log_info!(
+							self.logger,
+							"Channel {} is funded by external transaction {}",
+							temporary_channel_id,
+							funding_txid
+						);
+					},
+					Err(err) => {
+						log_error!(
+							self.logger,
+							"Failed to process externally built funding transaction {}: {:?}",
+							funding_txid,
+							err
+						);
+						self.external_fundings.release(user_channel_id, temporary_channel_id);
+					},
+				}
+			},
+			Err(err) => {
+				log_error!(self.logger, "Failed to create external funding transaction: {}", err);
+				self.force_close_unfunded(&temporary_channel_id, &counterparty_node_id);
+				self.external_fundings.release(user_channel_id, temporary_channel_id);
+			},
 		}
 	}
 
@@ -493,8 +590,12 @@ where
 				counterparty_node_id,
 				channel_value_satoshis,
 				output_script,
-				..
+				user_channel_id,
 			} => {
+				// What the open asked the broadcast to do with this funding; LDK hands it to
+				// the broadcaster later, when the peer answers `funding_signed`.
+				let broadcast_policy =
+					self.wallet.broadcast_queue().take_pending_open(user_channel_id);
 				// Construct the raw transaction with the output that is paid the amount of the
 				// channel.
 				let confirmation_target = ConfirmationTarget::ChannelFunding;
@@ -502,6 +603,23 @@ where
 				// We set nLockTime to the current height to discourage fee sniping.
 				let cur_height = self.channel_manager.current_best_block().height;
 				let locktime = LockTime::from_height(cur_height).unwrap_or(LockTime::ZERO);
+
+				// An open funded by another wallet goes to its own arm: that wallet builds the
+				// transaction, and what it hands back is checked by LDK, not trusted.
+				if let Some(source) = self.external_fundings.source(user_channel_id) {
+					let fee_rate = self.wallet.funding_fee_rate(confirmation_target);
+					let request = FundingRequest {
+						temporary_channel_id,
+						counterparty_node_id,
+						output_script,
+						amount_sats: channel_value_satoshis,
+						confirmation_target_sat_per_kw: u32::try_from(fee_rate.to_sat_per_kwu())
+							.unwrap_or(u32::MAX),
+						locktime,
+					};
+					self.fund_externally(source, request, user_channel_id, broadcast_policy);
+					return Ok(());
+				}
 
 				// Sign the final funding transaction and broadcast it.
 				let channel_amount = Amount::from_sat(channel_value_satoshis);
@@ -512,6 +630,15 @@ where
 					locktime,
 				) {
 					Ok(final_tx) => {
+						let funding_txid = final_tx.compute_txid();
+						self.wallet.broadcast_queue().register(
+							funding_txid,
+							broadcast_policy,
+							SystemTime::now()
+								.duration_since(UNIX_EPOCH)
+								.map(|d| d.as_secs())
+								.unwrap_or(0),
+						);
 						// Give the funding transaction back to LDK for opening the channel.
 						match self.channel_manager.funding_transaction_generated(
 							temporary_channel_id,
@@ -528,31 +655,22 @@ where
 									self.logger,
 									"Failed to process funding transaction as channel went away before we could fund it: {}",
 									err
-								)
+								);
+								self.release_unbroadcast_funding(funding_txid);
 							},
 							Err(err) => {
 								log_error!(
 									self.logger,
 									"Failed to process funding transaction: {:?}",
 									err
-								)
+								);
+								self.release_unbroadcast_funding(funding_txid);
 							},
 						}
 					},
 					Err(err) => {
 						log_error!(self.logger, "Failed to create funding transaction: {}", err);
-						self.channel_manager
-							.force_close_without_broadcasting_txn(
-								&temporary_channel_id,
-								&counterparty_node_id,
-								"Failed to create funding transaction".to_string(),
-							)
-							.unwrap_or_else(|e| {
-								log_error!(self.logger, "Failed to force close channel after funding generation failed: {:?}", e);
-								panic!(
-									"Failed to force close channel after funding generation failed"
-								);
-							});
+						self.force_close_unfunded(&temporary_channel_id, &counterparty_node_id);
 					},
 				}
 			},
@@ -1027,16 +1145,14 @@ where
 				self.payment_store.get(&payment_id).map(|payment| {
 					log_info!(
 						self.logger,
-						"Successfully sent payment of {}msat{} from \
-						payment hash {:?} with preimage {:?}",
+						"Successfully sent payment of {}msat{} from payment hash {:?}",
 						payment.amount_msat.unwrap(),
 						if let Some(fee) = fee_paid_msat {
 							format!(" (fee {} msat)", fee)
 						} else {
 							"".to_string()
 						},
-						hex_utils::to_string(&payment_hash.0),
-						hex_utils::to_string(&payment_preimage.0)
+						hex_utils::to_string(&payment_hash.0)
 					);
 				});
 				let event = Event::PaymentSuccessful {
@@ -1086,11 +1202,86 @@ where
 				};
 			},
 
-			LdkEvent::PaymentPathSuccessful { .. } => {},
-			LdkEvent::PaymentPathFailed { .. } => {},
+			LdkEvent::PaymentPathSuccessful { payment_id, payment_hash, path, .. } => {
+				self.journal.path_successful(payment_id, payment_hash, &path);
+			},
+			LdkEvent::PaymentPathFailed {
+				payment_id,
+				payment_hash,
+				payment_failed_permanently,
+				failure,
+				path,
+				short_channel_id,
+				..
+			} => {
+				// No user-facing event is emitted for a single failed path (the terminal
+				// `PaymentFailed` still follows); we remember the per-hop detail so
+				// route-driving callers can ask `Node::path_failure` which leg broke, and
+				// record an in-memory journal observation.
+				let our_node_id = self.channel_manager.get_our_node_id();
+				let attribution = attribute_path_failure(
+					&path,
+					short_channel_id,
+					&failure,
+					payment_failed_permanently,
+					&our_node_id,
+				);
+
+				if let Some(payment_id) = payment_id {
+					// The background processor applies the event's `network_update` to the
+					// graph before awaiting this handler, so this reads the graph after that
+					// update: a permanently failed channel is already gone here
+					// (see `PathFailureInfo::graph_pruned`).
+					let graph_pruned =
+						match (attribution.graph_lookup_meaningful, attribution.short_channel_id) {
+							(true, Some(scid)) => {
+								self.network_graph.read_only().channel(scid).is_none()
+							},
+							_ => false,
+						};
+
+					let at_unix_secs = SystemTime::now()
+						.duration_since(UNIX_EPOCH)
+						.map(|d| d.as_secs())
+						.unwrap_or(0);
+
+					let info = PathFailureInfo {
+						short_channel_id: attribution.short_channel_id,
+						failing_node_id: attribution.failing_node_id,
+						hop_index: attribution.hop_index,
+						failure_class: attribution.failure_class,
+						payment_failed_permanently,
+						graph_pruned,
+						at_unix_secs,
+					};
+
+					log_debug!(
+						self.logger,
+						"Payment path failed for payment {}: class={} scid={:?} hop_index={:?} failing_node={:?} graph_pruned={} permanent={}",
+						payment_id,
+						info.failure_class.as_str(),
+						info.short_channel_id,
+						info.hop_index,
+						info.failing_node_id,
+						info.graph_pruned,
+						info.payment_failed_permanently,
+					);
+
+					self.path_failures.insert(payment_id, info);
+				}
+
+				self.journal.path_failed(
+					payment_id,
+					payment_hash,
+					payment_failed_permanently,
+					&attribution,
+					&path,
+				);
+			},
 			LdkEvent::ProbeSuccessful { .. } => {},
 			LdkEvent::ProbeFailed { .. } => {},
-			LdkEvent::HTLCHandlingFailed { failed_next_destination, .. } => {
+			LdkEvent::HTLCHandlingFailed { prev_channel_id, failed_next_destination } => {
+				self.journal.htlc_handling_failed(prev_channel_id, &failed_next_destination);
 				if let Some(liquidity_source) = self.liquidity_source.as_ref() {
 					liquidity_source.handle_htlc_handling_failed(failed_next_destination);
 				}
@@ -1166,7 +1357,8 @@ where
 						{
 							0
 						} else {
-							anchor_channels_config.per_channel_reserve_sats
+							anchor_channels_config
+								.reserve_for_new_channel_sats(cur_anchor_reserve_sats)
 						};
 
 						if spendable_amount_sats < required_amount_sats {
@@ -1347,6 +1539,7 @@ where
 					channel_id,
 					counterparty_node_id,
 				);
+				self.external_fundings.funded(user_channel_id, former_temporary_channel_id);
 
 				let event = Event::ChannelPending {
 					channel_id,
@@ -1434,6 +1627,12 @@ where
 				..
 			} => {
 				log_info!(self.logger, "Channel {} closed due to: {}", channel_id, reason);
+				// An externally funded open that ends here never broadcast its funding (a
+				// broadcast one was forgotten at `ChannelPending`): hand the inputs back.
+				self.external_fundings.release(user_channel_id, channel_id);
+				// An open the peer refused, or that failed, before LDK asked for its funding
+				// leaves the policy it asked for behind; nothing would ever take it.
+				self.wallet.broadcast_queue().forget_pending_open(user_channel_id);
 
 				let event = Event::ChannelClosed {
 					channel_id,
@@ -1450,7 +1649,19 @@ where
 					},
 				};
 			},
-			LdkEvent::DiscardFunding { .. } => {},
+			LdkEvent::DiscardFunding { channel_id, funding_info } => {
+				// LDK will never broadcast this funding: hand its inputs back to the wallet, which
+				// reserved them when it built the transaction.
+				if let FundingInfo::Tx { transaction } = funding_info {
+					log_info!(
+						self.logger,
+						"Discarding funding transaction {} of channel {}",
+						transaction.compute_txid(),
+						channel_id
+					);
+					self.release_unbroadcast_funding(transaction.compute_txid());
+				}
+			},
 			LdkEvent::HTLCIntercepted {
 				requested_next_hop_scid,
 				intercept_id,

@@ -26,7 +26,7 @@ use std::time::Duration;
 const DEFAULT_NETWORK: Network = Network::Bitcoin;
 const DEFAULT_BDK_WALLET_SYNC_INTERVAL_SECS: u64 = 80;
 const DEFAULT_LDK_WALLET_SYNC_INTERVAL_SECS: u64 = 30;
-const DEFAULT_FEE_RATE_CACHE_UPDATE_INTERVAL_SECS: u64 = 60 * 10;
+pub(crate) const DEFAULT_FEE_RATE_CACHE_UPDATE_INTERVAL_SECS: u64 = 60 * 10;
 const DEFAULT_PROBING_LIQUIDITY_LIMIT_MULTIPLIER: u64 = 3;
 const DEFAULT_ANCHOR_PER_CHANNEL_RESERVE_SATS: u64 = 25_000;
 
@@ -103,9 +103,10 @@ pub const WALLET_KEYS_SEED_LEN: usize = 64;
 /// | `log_level`                            | Debug              |
 /// | `anchor_channels_config`               | Some(..)           |
 /// | `sending_parameters`                   | None               |
+/// | `announce_policy`                      | announce: true     |
 ///
-/// See [`AnchorChannelsConfig`] and [`SendingParameters`] for more information regarding their
-/// respective default values.
+/// See [`AnchorChannelsConfig`], [`SendingParameters`] and [`AnnouncePolicy`] for more
+/// information regarding their respective default values.
 ///
 /// [`Node`]: crate::Node
 pub struct Config {
@@ -167,6 +168,30 @@ pub struct Config {
 	/// **Note:** If unset, default parameters will be used, and you will be able to override the
 	/// parameters on a per-payment basis in the corresponding method calls.
 	pub sending_parameters: Option<SendingParameters>,
+	/// Whether this node may make itself and its channels public at all; see
+	/// [`AnnouncePolicy`]. Defaults to announcing, i.e. today's behaviour.
+	pub announce_policy: AnnouncePolicy,
+}
+
+/// Whether a node takes part in the public graph.
+///
+/// A node configured to announce (alias and listening addresses set) does so by default. A
+/// wallet that should stay out of the graph — a secondary wallet in a multi-wallet process,
+/// dialing out only — sets `announce: false`: it then refuses to open or accept announced
+/// channels ([`Node::open_announced_channel`] errors) and never broadcasts a node
+/// announcement, whatever its alias and addresses say.
+///
+/// [`Node::open_announced_channel`]: crate::Node::open_announced_channel
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnnouncePolicy {
+	/// Whether the node may announce itself and its channels. Default: `true`.
+	pub announce: bool,
+}
+
+impl Default for AnnouncePolicy {
+	fn default() -> Self {
+		Self { announce: true }
+	}
 }
 
 impl Default for Config {
@@ -181,8 +206,159 @@ impl Default for Config {
 			anchor_channels_config: Some(AnchorChannelsConfig::default()),
 			sending_parameters: None,
 			node_alias: None,
+			announce_policy: AnnouncePolicy::default(),
 		}
 	}
+}
+
+/// Configuration of the compact-block-filter (BIP157/158) chain source.
+///
+/// ### Defaults
+///
+/// | Parameter                 | Value  |
+/// |---------------------------|--------|
+/// | `wallet_birthday_height`  | None   |
+/// | `external_fee`            | None   |
+/// | `utxo_source`             | false  |
+/// | `required_peers`          | 1      |
+/// | `source`                  | P2p    |
+#[cfg(feature = "cbf")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CbfConfig {
+	/// The lowest height whose block may hold a transaction of this wallet: the wallet
+	/// birthday. Rounded *down* to the nearest checkpoint compiled into the crate (mainnet
+	/// only), which seeds a fresh wallet — unless the node is given a birthday block of its
+	/// own (`NodeBuilder::set_wallet_birthday`), which wins — and floors the height the
+	/// filter sync resumes from.
+	///
+	/// A filter scan never starts from genesis: a wallet whose persisted chain offers no
+	/// usable checkpoint resumes from this birthday, and refuses to sync at all when none is
+	/// configured. Set it for every wallet handed over from another chain source.
+	pub wallet_birthday_height: Option<u32>,
+	/// An external, mempool-aware server asked for fee estimates first, ahead of the provider
+	/// (when one is set) and the node's own coinbase-derived rates. Without either, the FEE
+	/// slot has only the blocks the node downloads.
+	pub external_fee: Option<CbfExternalFee>,
+	/// Whether to verify BOLT-7 channel announcements against the filters: existence-only,
+	/// since a block filter can say an output was created and not yet spent, but not what it
+	/// holds. Off by default; announcements are then accepted unverified.
+	pub utxo_source: bool,
+	/// Number of peers that must agree on filter headers before they are accepted.
+	pub required_peers: u8,
+	/// Where the headers, filter headers, filters and blocks come from: the Bitcoin P2P
+	/// network (the default), a node source supplied through
+	/// [`NodeBuilder::set_cbf_filter_source`], or the node source with P2P as its fallback.
+	///
+	/// [`NodeBuilder::set_cbf_filter_source`]: crate::NodeBuilder::set_cbf_filter_source
+	pub source: CbfSource,
+}
+
+#[cfg(feature = "cbf")]
+impl Default for CbfConfig {
+	fn default() -> Self {
+		Self {
+			wallet_birthday_height: None,
+			external_fee: None,
+			utxo_source: false,
+			required_peers: DEFAULT_CBF_REQUIRED_PEERS,
+			source: CbfSource::default(),
+		}
+	}
+}
+
+/// Where a compact-block-filter node gets its raw chain data from.
+///
+/// Whatever the source, every header, filter header, filter and block is checked by this
+/// node before it is applied: a source cannot make the node accept a header, a chain or a
+/// block that is not valid. What a single node source *can* do is leave a transaction out of
+/// its filters — see [`CbfSource::trusts_source_for_inclusion`].
+#[cfg(feature = "cbf")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CbfSource {
+	/// The Bitcoin P2P network, through kyoto: the trusted peers configured with the chain
+	/// source, or the DNS seeds.
+	#[default]
+	P2p,
+	/// Only the filter source given to [`NodeBuilder::set_cbf_filter_source`] — typically
+	/// another Node device serving raw BIP157 data. Kyoto is never built and the node opens no
+	/// Bitcoin P2P connection. Building without a filter source fails.
+	///
+	/// **Trusts the source for inclusion.** Headers (proof of work, difficulty), block
+	/// contents, and the agreement of filters with filter headers are verified; that the
+	/// filters leave no transaction out is not, and cannot be with one source. A source that
+	/// omits a transaction — a revoked commitment spending a channel's funding outpoint, say —
+	/// hides it from this node. See [`CbfSource::trusts_source_for_inclusion`].
+	///
+	/// A source that keeps sending data that fails verification fails the sync closed; it is
+	/// tried again from scratch after a backoff of up to ten minutes. A tip more than three
+	/// hours old by this node's clock is reported as syncing, not synced (regtest aside).
+	///
+	/// [`NodeBuilder::set_cbf_filter_source`]: crate::NodeBuilder::set_cbf_filter_source
+	Node,
+	/// The filter source first. The node falls back to the P2P network for the rest of the run
+	/// when the source stays unavailable for five minutes, keeps sending data that fails
+	/// verification, or serves a tip more than three hours old (regtest aside). Building without
+	/// a filter source fails.
+	///
+	/// **Trusts the source for inclusion** while it is used, as [`CbfSource::Node`] does: an
+	/// omission is not something the node can detect, so it is no reason to fall back.
+	NodeThenP2p,
+}
+
+#[cfg(feature = "cbf")]
+impl CbfSource {
+	/// Whether this source needs the filter source given to
+	/// [`NodeBuilder::set_cbf_filter_source`].
+	///
+	/// [`NodeBuilder::set_cbf_filter_source`]: crate::NodeBuilder::set_cbf_filter_source
+	pub fn uses_node_source(&self) -> bool {
+		matches!(self, Self::Node | Self::NodeThenP2p)
+	}
+
+	/// What a node filter source is trusted with, in words an app can show its operator.
+	pub const NODE_SOURCE_TRUST_NOTE: &'static str =
+		"Compact-block-filter sync through a single node source: headers (proof of work, \
+		 difficulty), block contents and filter/filter-header consistency are verified, but \
+		 the source is trusted not to leave transactions out of its filters. A source that \
+		 omits one (for example a revoked commitment spending a channel's funding output) \
+		 hides it from this node. Do not use a source that could gain from that, such as a \
+		 channel counterparty on mainnet.";
+
+	/// Whether this source trusts the node source not to leave transactions out of its
+	/// filters: `true` for [`CbfSource::Node`] and [`CbfSource::NodeThenP2p`], `false` for
+	/// [`CbfSource::P2p`], whose peers are compared.
+	///
+	/// This crate does not know who runs the source; the app does. An app should refuse a node
+	/// source where it would pay to hide a transaction — on mainnet, when the source node is
+	/// also one of this node's channel counterparties.
+	pub fn trusts_source_for_inclusion(&self) -> bool {
+		self.uses_node_source()
+	}
+
+	/// [`CbfSource::NODE_SOURCE_TRUST_NOTE`] when this source
+	/// [trusts the node source for inclusion](CbfSource::trusts_source_for_inclusion), for the
+	/// app to surface; `None` otherwise.
+	pub fn trust_note(&self) -> Option<&'static str> {
+		self.trusts_source_for_inclusion().then_some(Self::NODE_SOURCE_TRUST_NOTE)
+	}
+}
+
+/// Number of peers that must agree on filter headers before they are accepted.
+#[cfg(feature = "cbf")]
+pub(crate) const DEFAULT_CBF_REQUIRED_PEERS: u8 = 1;
+
+/// An external fee-estimation server for a compact-block-filter node.
+///
+/// By default CBF derives fee rates from recent blocks' coinbase outputs. An external source
+/// provides more accurate, per-target estimates from a mempool-aware server; it is asked
+/// first, and the coinbase-derived rates stand in when it cannot answer.
+#[cfg(feature = "cbf")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CbfExternalFee {
+	/// An Esplora HTTP server, by URL.
+	Esplora(String),
+	/// An Electrum server, by URL.
+	Electrum(String),
 }
 
 /// Configuration options pertaining to 'Anchor' channels, i.e., channels for which the
@@ -209,6 +385,7 @@ impl Default for Config {
 /// |----------------------------|--------|
 /// | `trusted_peers_no_reserve` | []     |
 /// | `per_channel_reserve_sats` | 25000  |
+/// | `max_total_reserve_sats`   | None   |
 ///
 ///
 /// [BOLT 3]: https://github.com/lightning/bolts/blob/master/03-transactions.md#htlc-timeout-and-htlc-success-transactions
@@ -243,6 +420,38 @@ pub struct AnchorChannelsConfig {
 	/// might not suffice to successfully spend the Anchor output and have the HTLC transactions
 	/// confirmed on-chain, i.e., you may want to adjust this value accordingly.
 	pub per_channel_reserve_sats: u64,
+	/// An upper bound on the total emergency reserve across all channels, if any.
+	///
+	/// Without it the reserve grows linearly with the channel count. With it, the first channels
+	/// each add [`AnchorChannelsConfig::per_channel_reserve_sats`] until the total reaches this
+	/// cap, and further channels add nothing: the reserve is pooled for the whole node.
+	///
+	/// This trades safety for capital. Closures are paid for from *any* on-chain funds, so the
+	/// pool only matters when the wallet holds nothing else, and then it covers as many
+	/// simultaneous closures as it can afford at the fee rate of the day; the rest wait for
+	/// more funds, which LDK picks up on its next per-block bump attempt. Set it above the
+	/// dust limit (546 sats), or the reserve cannot be kept as a change output.
+	pub max_total_reserve_sats: Option<u64>,
+}
+
+impl AnchorChannelsConfig {
+	/// The reserve a new untrusted Anchor channel adds on top of `cur_total_reserve_sats`, the
+	/// reserve already retained for the existing channels.
+	pub(crate) fn reserve_for_new_channel_sats(&self, cur_total_reserve_sats: u64) -> u64 {
+		match self.max_total_reserve_sats {
+			None => self.per_channel_reserve_sats,
+			Some(cap) => cur_total_reserve_sats
+				.saturating_add(self.per_channel_reserve_sats)
+				.min(cap)
+				.saturating_sub(cur_total_reserve_sats),
+		}
+	}
+
+	/// The total reserve to retain for `channel_count` untrusted Anchor channels.
+	pub(crate) fn total_reserve_sats(&self, channel_count: u64) -> u64 {
+		let total = channel_count.saturating_mul(self.per_channel_reserve_sats);
+		self.max_total_reserve_sats.map_or(total, |cap| total.min(cap))
+	}
 }
 
 impl Default for AnchorChannelsConfig {
@@ -250,6 +459,7 @@ impl Default for AnchorChannelsConfig {
 		Self {
 			trusted_peers_no_reserve: Vec::new(),
 			per_channel_reserve_sats: DEFAULT_ANCHOR_PER_CHANNEL_RESERVE_SATS,
+			max_total_reserve_sats: None,
 		}
 	}
 }
@@ -269,6 +479,7 @@ pub(crate) enum AnnounceError {
 	MissingNodeAlias,
 	MissingListeningAddresses,
 	MissingAliasAndAddresses,
+	DisabledByPolicy,
 }
 
 impl fmt::Display for AnnounceError {
@@ -281,11 +492,26 @@ impl fmt::Display for AnnounceError {
 			AnnounceError::MissingAliasAndAddresses => {
 				write!(f, "Node alias and listening addresses are not configured")
 			},
+			AnnounceError::DisabledByPolicy => {
+				write!(f, "The node's announce policy forbids announcing")
+			},
 		}
 	}
 }
 
+/// Whether the node may announce itself and its channels: configured for it (alias and
+/// listening addresses) and allowed to by its [`AnnouncePolicy`].
 pub(crate) fn may_announce_channel(config: &Config) -> Result<(), AnnounceError> {
+	check_announce_configuration(config)?;
+	if !config.announce_policy.announce {
+		return Err(AnnounceError::DisabledByPolicy);
+	}
+	Ok(())
+}
+
+/// Whether the configuration has what announcing takes, regardless of the policy — what the
+/// builder checks an alias or announcement addresses against.
+pub(crate) fn check_announce_configuration(config: &Config) -> Result<(), AnnounceError> {
 	let has_listening_addresses =
 		config.listening_addresses.as_ref().map_or(false, |addrs| !addrs.is_empty());
 
@@ -550,10 +776,55 @@ mod tests {
 	use std::str::FromStr;
 
 	use super::may_announce_channel;
+	use super::AnchorChannelsConfig;
 	use super::AnnounceError;
 	use super::Config;
 	use super::NodeAlias;
 	use super::SocketAddress;
+
+	#[cfg(feature = "cbf")]
+	#[test]
+	fn node_sources_say_they_trust_the_source_for_inclusion() {
+		use super::CbfSource;
+		assert!(!CbfSource::P2p.trusts_source_for_inclusion());
+		assert_eq!(CbfSource::P2p.trust_note(), None);
+		for source in [CbfSource::Node, CbfSource::NodeThenP2p] {
+			assert!(source.trusts_source_for_inclusion());
+			let note = source.trust_note().expect("a note to surface");
+			assert!(note.contains("trusted not to leave transactions out"), "{}", note);
+		}
+	}
+
+	fn anchors(per_channel: u64, cap: Option<u64>) -> AnchorChannelsConfig {
+		AnchorChannelsConfig {
+			trusted_peers_no_reserve: Vec::new(),
+			per_channel_reserve_sats: per_channel,
+			max_total_reserve_sats: cap,
+		}
+	}
+
+	#[test]
+	fn uncapped_anchor_reserve_grows_per_channel() {
+		let c = anchors(1_000, None);
+		assert_eq!(c.total_reserve_sats(5), 5_000);
+		assert_eq!(c.reserve_for_new_channel_sats(5_000), 1_000);
+	}
+
+	#[test]
+	fn capped_anchor_reserve_is_pooled_for_the_node() {
+		let c = anchors(1_000, Some(2_000));
+		assert_eq!(c.total_reserve_sats(0), 0);
+		assert_eq!(c.total_reserve_sats(1), 1_000);
+		assert_eq!(c.total_reserve_sats(2), 2_000);
+		assert_eq!(c.total_reserve_sats(5), 2_000);
+		// The first two channels each add their share, the third and later add nothing.
+		assert_eq!(c.reserve_for_new_channel_sats(0), 1_000);
+		assert_eq!(c.reserve_for_new_channel_sats(1_000), 1_000);
+		assert_eq!(c.reserve_for_new_channel_sats(2_000), 0);
+		// A cap that is not a multiple of the per-channel share tops the pool up exactly.
+		let c = anchors(1_000, Some(1_500));
+		assert_eq!(c.reserve_for_new_channel_sats(1_000), 500);
+	}
 
 	#[test]
 	fn node_announce_channel() {
@@ -599,5 +870,31 @@ mod tests {
 			addresses.push(socket_address);
 		}
 		assert!(may_announce_channel(&node_config).is_ok());
+
+		// A complete configuration with the policy off still may not announce.
+		node_config.announce_policy.announce = false;
+		assert_eq!(may_announce_channel(&node_config), Err(AnnounceError::DisabledByPolicy));
+		assert!(super::check_announce_configuration(&node_config).is_ok());
+	}
+
+	#[test]
+	fn announcing_is_the_default_policy() {
+		assert!(Config::default().announce_policy.announce);
+		assert_eq!(super::AnnouncePolicy::default(), super::AnnouncePolicy { announce: true });
+	}
+
+	#[test]
+	fn an_unannounced_node_neither_offers_nor_accepts_announced_channels() {
+		let mut node_config = Config::default();
+		node_config.node_alias = Some(NodeAlias([1u8; 32]));
+		node_config.listening_addresses =
+			Some(vec![SocketAddress::from_str("127.0.0.1:9735").unwrap()]);
+		let announcing = super::default_user_config(&node_config);
+		assert!(!announcing.channel_handshake_limits.force_announced_channel_preference);
+
+		node_config.announce_policy.announce = false;
+		let quiet = super::default_user_config(&node_config);
+		assert!(!quiet.channel_handshake_config.announce_for_forwarding);
+		assert!(quiet.channel_handshake_limits.force_announced_channel_preference);
 	}
 }

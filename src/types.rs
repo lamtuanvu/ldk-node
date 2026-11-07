@@ -5,7 +5,7 @@
 // http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
 // accordance with one or both of these licenses.
 
-use crate::chain::ChainSource;
+use crate::chain::ChainLayer;
 use crate::config::ChannelConfig;
 use crate::data_store::DataStore;
 use crate::fee_estimator::OnchainFeeEstimator;
@@ -42,7 +42,7 @@ pub(crate) type DynStore = dyn KVStore + Sync + Send;
 
 pub(crate) type ChainMonitor = chainmonitor::ChainMonitor<
 	InMemorySigner,
-	Arc<ChainSource>,
+	Arc<ChainLayer>,
 	Arc<Broadcaster>,
 	Arc<OnchainFeeEstimator>,
 	Arc<Logger>,
@@ -60,7 +60,7 @@ pub(crate) type PeerManager = lightning::ln::peer_handler::PeerManager<
 >;
 
 pub(crate) type LiquidityManager =
-	lightning_liquidity::LiquidityManager<Arc<KeysManager>, Arc<ChannelManager>, Arc<ChainSource>>;
+	lightning_liquidity::LiquidityManager<Arc<KeysManager>, Arc<ChannelManager>, Arc<ChainLayer>>;
 
 pub(crate) type ChannelManager = lightning::ln::channelmanager::ChannelManager<
 	Arc<ChainMonitor>,
@@ -90,9 +90,19 @@ pub(crate) type Router = DefaultRouter<
 	ProbabilisticScoringFeeParameters,
 	Scorer,
 >;
-pub(crate) type Scorer = ProbabilisticScorer<Arc<Graph>, Arc<Logger>>;
+/// The pathfinding scorer over a [`Graph`], as [`Node::scorer_handle`] hands it out and
+/// [`Builder::set_shared_graph`] takes it.
+///
+/// [`Node::scorer_handle`]: crate::Node::scorer_handle
+/// [`Builder::set_shared_graph`]: crate::Builder::set_shared_graph
+pub type Scorer = ProbabilisticScorer<Arc<Graph>, Arc<Logger>>;
 
-pub(crate) type Graph = gossip::NetworkGraph<Arc<Logger>>;
+/// The routing graph, as [`Node::network_graph_handle`] hands it out and
+/// [`Builder::set_shared_graph`] takes it.
+///
+/// [`Node::network_graph_handle`]: crate::Node::network_graph_handle
+/// [`Builder::set_shared_graph`]: crate::Builder::set_shared_graph
+pub type Graph = gossip::NetworkGraph<Arc<Logger>>;
 
 pub(crate) type UtxoLookup = GossipVerifier<RuntimeSpawner, Arc<dyn UtxoSource>, Arc<Logger>>;
 
@@ -131,7 +141,7 @@ pub(crate) type Sweeper = OutputSweeper<
 	Arc<Broadcaster>,
 	Arc<KeysManager>,
 	Arc<OnchainFeeEstimator>,
-	Arc<ChainSource>,
+	Arc<ChainLayer>,
 	Arc<DynStore>,
 	Arc<Logger>,
 	Arc<KeysManager>,
@@ -268,6 +278,11 @@ pub struct ChannelDetails {
 	pub is_usable: bool,
 	/// Returns `true` if this channel is (or will be) publicly-announced
 	pub is_announced: bool,
+	/// The number of HTLCs pending in either direction.
+	///
+	/// A force close with pending HTLCs has to confirm before they time out, so LDK bumps it at
+	/// the urgent fee rate; without any, it bumps at the output-spending rate.
+	pub pending_htlc_count: u64,
 	/// The difference in the CLTV value between incoming HTLCs and an outbound HTLC forwarded over
 	/// the channel.
 	pub cltv_expiry_delta: Option<u16>,
@@ -345,6 +360,8 @@ impl From<LdkChannelDetails> for ChannelDetails {
 			is_channel_ready: value.is_channel_ready,
 			is_usable: value.is_usable,
 			is_announced: value.is_announced,
+			pending_htlc_count: (value.pending_inbound_htlcs.len()
+				+ value.pending_outbound_htlcs.len()) as u64,
 			cltv_expiry_delta: value.config.map(|c| c.cltv_expiry_delta),
 			counterparty_unspendable_punishment_reserve: value
 				.counterparty
